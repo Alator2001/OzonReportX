@@ -156,6 +156,7 @@ def main():
             sys.exit(1)
     elif choice == "2":
         print("Выбран ABC&XYZ-анализ.")
+        print("Пока в разработке. Но скоро появится")
         return
     if choice == "3":
         print("Выход из программы.")
