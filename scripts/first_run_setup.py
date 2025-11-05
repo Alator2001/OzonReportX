@@ -117,29 +117,50 @@ def run_report(venv_python: Path, repo_root: Path):
     main_script = repo_root / "scripts" / "Monthly_sales_report.py"
     run([str(venv_python), str(main_script)], cwd=repo_root)
 
+def select_menu_option():
+    print_step("Меню выбора отчёта")
+    print("1. Месячный отчёт по продажам")
+    print("2. ABC&XYZ-анализ")
+    print("3. Выход")   
+    while True:
+        choice = input("Выберите опцию (1-3): ").strip()
+        if choice in ("1", "2", "3"):
+            return choice
+        print("Пожалуйста, выберите корректную опцию (1, 2 или 3).")
+
 
 def main():
-    repo_root = Path(__file__).resolve().parent.parent
-    print("Мастер первой настройки и запуска отчёта Ozon")
-    try:
-        venv_python, venv_created = ensure_venv(repo_root)
-        ensure_deps(venv_python, repo_root)
-        env_created = ensure_env(repo_root)
-        costs_created = ensure_costs(repo_root)
-        ensure_reports_dir(repo_root)
-        # Спрашиваем разрешение на запуск только при самом первом конфигурировании
-        if venv_created or env_created or costs_created:
-            if prompt_yes_no("Можно начинать формирование отчёта?", default_yes=True):
-                run_report(venv_python, repo_root)
+    choice = select_menu_option()
+    if choice == "1":
+        print_step("Выбран Месячный отчёт по продажам.")
+        repo_root = Path(__file__).resolve().parent.parent
+        print_step("Мастер первой настройки и запуска отчёта Ozon")
+        try:
+            venv_python, venv_created = ensure_venv(repo_root)
+            ensure_deps(venv_python, repo_root)
+            env_created = ensure_env(repo_root)
+            costs_created = ensure_costs(repo_root)
+            ensure_reports_dir(repo_root)
+            # Спрашиваем разрешение на запуск только при самом первом конфигурировании
+            if venv_created or env_created or costs_created:
+                if prompt_yes_no("Можно начинать формирование отчёта?", default_yes=True):
+                    run_report(venv_python, repo_root)
+                else:
+                    print("Окей, запуск отчёта отменён. Вы можете запустить позже: run.bat или python config/first_run_setup.py")
             else:
-                print("Окей, запуск отчёта отменён. Вы можете запустить позже: run.bat или python config/first_run_setup.py")
-        else:
-            run_report(venv_python, repo_root)
-    except KeyboardInterrupt:
-        print("\nОперация прервана пользователем.")
-    except Exception as e:
-        print(f"\nОшибка: {e}")
-        sys.exit(1)
+                run_report(venv_python, repo_root)
+        except KeyboardInterrupt:
+            print("\nОперация прервана пользователем.")
+        except Exception as e:
+            print(f"\nОшибка: {e}")
+            sys.exit(1)
+    elif choice == "2":
+        print("Выбран ABC&XYZ-анализ.")
+        return
+    if choice == "3":
+        print("Выход из программы.")
+        return
+    
 
 
 if __name__ == "__main__":
