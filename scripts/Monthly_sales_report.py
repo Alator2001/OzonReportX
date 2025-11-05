@@ -22,17 +22,29 @@ HEADERS = {
     'Content-Type': 'application/json'
 }
 
-# 📅 Получаем диапазон дат за прошлый месяц
-def get_last_month_date_range():
-    today = datetime.now()
-    first_day_current_month = today.replace(day=1)
-    last_day_last_month = first_day_current_month - timedelta(days=1)
-    first_day_last_month = last_day_last_month.replace(day=1)
-    
-    date_from = first_day_last_month.strftime('%Y-%m-%dT00:00:00Z')
-    date_to = last_day_last_month.strftime('%Y-%m-%dT23:59:59Z')
-    
-    return date_from, date_to
+def get_custom_date_range():
+    while True:
+        try:
+            month = int(input("Введите номер месяца (1–12): ").strip())
+            year = int(input("Введите год (например, 2025): ").strip())
+
+            if 1 <= month <= 12 and 2000 <= year <= 2100:
+                break
+            else:
+                print("⚠️ Введите корректный месяц (1–12) и год (2000–2100).")
+        except ValueError:
+            print("❌ Некорректный ввод. Попробуйте снова.")
+
+    from datetime import datetime, timedelta
+    from calendar import monthrange
+
+    first_day = datetime(year, month, 1)
+    last_day = datetime(year, month, monthrange(year, month)[1])
+    date_from = first_day.strftime('%Y-%m-%dT00:00:00Z')
+    date_to = last_day.strftime('%Y-%m-%dT23:59:59Z')
+    return date_from, date_to, month, year
+
+
 
 # 📄 Загрузка карты себестоимости из внешнего файла
 def load_cost_map():
@@ -91,11 +103,7 @@ def load_cost_map():
     return {}
 
 # 📥 Получаем список заказов FBS (Fulfillment by Seller)
-def get_orders():
-    # now = datetime.now()
-    # date_from = now.replace(day=1).strftime('%Y-%m-%dT00:00:00Z')
-    # date_to = now.strftime('%Y-%m-%dT23:59:59Z')
-    date_from, date_to = get_last_month_date_range()
+def get_orders(date_from, date_to):
     url = 'https://api-seller.ozon.ru/v3/posting/fbs/list'
     result = []
     limit = 100
@@ -138,11 +146,7 @@ def get_orders():
     return result
 
 # 📥 Получаем список заказов FBO (Fulfillment by Ozon)
-def get_fbo_orders():
-    # now = datetime.now()
-    # date_from = now.replace(day=1).strftime('%Y-%m-%dT00:00:00Z')
-    # date_to = now.strftime('%Y-%m-%dT23:59:59Z')
-    date_from, date_to = get_last_month_date_range()
+def get_fbo_orders(date_from, date_to):
 
     url = 'https://api-seller.ozon.ru/v2/posting/fbo/list'
     result = []
@@ -234,29 +238,19 @@ def get_transactions(posting_number, date_from, date_to):
     return all_operations
 
 # 📊 Преобразуем данные в Excel
-def to_excel(postings, output_file=None):
+def to_excel(postings, date_from, date_to, month, year, output_file=None):
     from datetime import datetime
     import pandas as pd
 
-    date_from, date_to = get_last_month_date_range()
     rows = []
     total_posts = max(len(postings or []), 1)
-
-# Получаем прошлый месяц и год
-    now = datetime.now()
-    if now.month == 1:
-        month = 12
-        year = now.year - 1
-    else:
-        month = now.month - 1
-        year = now.year
 
     # Название месяца на русском в родительном падеже (Сентябрь → сентября)
     months = [
         "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
         "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
     ]
-    month_name = months[month - 1]
+    month_name = months[month-1]
 
     # Формируем путь и имя файла в папке ../reports относительно этого скрипта
     if not output_file:
@@ -423,16 +417,17 @@ def calc_business_indicators(filename):
 
 # 🚀 Точка входа
 def main():
-    print("📦 Получаем список заказов за текущий месяц...")
+    date_from, date_to, month, year = get_custom_date_range()
+    print("📦 Получаем список заказов за месяц...")
 
-    fbs_orders = get_orders()
-    fbo_orders = get_fbo_orders()
+    fbs_orders = get_orders(date_from, date_to)
+    fbo_orders = get_fbo_orders(date_from, date_to)
 
     all_orders = fbs_orders + fbo_orders
     print(f"🔢 Найдено заказов: {len(all_orders)}")
     
     # Имя файла формируется внутри to_excel как "<Месяц> <Год>.xlsx"
-    output_file = to_excel(all_orders)
+    output_file = to_excel(all_orders, date_from, date_to, month, year)
     
     calc_business_indicators(output_file)
 
