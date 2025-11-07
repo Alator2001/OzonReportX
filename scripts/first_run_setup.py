@@ -61,7 +61,6 @@ def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
 def ensure_env(repo_root: Path) -> bool:
     env_path = repo_root / ".env"
     if env_path.exists():
-        print_step(".env уже существует — пропускаем создание")
         return False
     print_step("Создание .env")
     client_id = input("Введите OZON_CLIENT_ID: ").strip()
@@ -76,7 +75,7 @@ def ensure_costs(repo_root: Path) -> bool:
     costs_csv = repo_root / "costs.csv"
     created = False
     if costs_xlsx.exists() or costs_csv.exists():
-        print_step("Файл себестоимости найден — пропускаем создание шаблона")
+        print_step("Файл себестоимости найден")
     else:
         print_step("Создание шаблона себестоимости costs.xlsx")
         try:
@@ -134,7 +133,7 @@ def main():
     if choice == "1":
         print_step("Выбран Месячный отчёт по продажам.")
         repo_root = Path(__file__).resolve().parent.parent
-        print_step("Мастер первой настройки и запуска отчёта Ozon")
+        print_step("Мастер настройки и запуска генерации отчёта Ozon")
         try:
             venv_python, venv_created = ensure_venv(repo_root)
             ensure_deps(venv_python, repo_root)
