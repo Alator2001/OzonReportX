@@ -23,5 +23,4 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [SUCCESS] Setup completed!
 pause
