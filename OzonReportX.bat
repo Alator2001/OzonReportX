@@ -1,33 +1,34 @@
 @echo off
-setlocal ENABLEDELAYEDEXPANSION
 chcp 65001 >nul
 cd /d "%~dp0"
 color 09
 
-echo   #######  #######  #######  ###  ##           #######  #######  #######  #######  ####### ########           ##   ## 
-echo   ##   ##      ###  ##   ##  #### ##           ##   ##  ##       ##   ##  ##   ##  ##   ##    ##               ##### 
-echo   ##   ##    ###    ##   ##  ## ####           #######  ####     #######  ##   ##  #######    ##                ### 
-echo   ##   ##  ###      ##   ##  ##  ###           ##  ##   ##       ##       ##   ##  ##  ##     ##               ##### 
-echo   #######  #######  #######  ##   ##           ##   ##  #######  ##       #######  ##   ##    ##              ##   ## 
-echo.........................................................................................................................
-echo                                           === OzonReportX — Master Setup ===
+echo.
+echo ============================================================
+echo          OZON REPORT X - Master Setup
+echo ============================================================
+echo.
 
-python --version >nul 2>nul
-if %errorlevel% neq 0 (
-    start "" "https://www.python.org/ftp/python/3.14.0"
-    echo Для работы программы, необходимо установить Python.
+python --version >nul 2>&1
+if errorlevel 1 (
+    echo Python not found! Opening download page...
+    start "" "https://www.python.org/downloads/"
+    echo.
+    echo Please install Python and restart this script.
     pause
-    exit /b
+    exit /b 1
 )
 
-set PY=python
-%PY% -X utf8 "scripts\first_run_setup.py"
+echo Starting setup...
+echo.
+
+python -X utf8 "scripts\first_run_setup.py"
 if errorlevel 1 (
-  echo [X] Скрипт завершился с ошибкой. Проверьте сообщение выше.
-  pause
-  exit /b 1
+    echo.
+    echo Script finished with errors. Check messages above.
+    pause
+    exit /b 1
 )
 
 echo.
 pause
-
