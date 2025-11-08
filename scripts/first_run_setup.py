@@ -7,6 +7,58 @@ from pathlib import Path
 def print_step(title: str):
     print(f"\n=== {title} ===")
 
+def ensure_auto_update_package(venv_python: Path, repo_root: Path):
+    """Проверяет и устанавливает необходимые пакеты для обновления"""
+    required_packages = ['requests', 'packaging']
+    
+    for package in required_packages:
+        try:
+            result = subprocess.run(
+                [str(venv_python), "-c", f"import {package}"],
+                cwd=repo_root,
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                subprocess.check_call(
+                    [str(venv_python), "-m", "pip", "install", package],
+                    cwd=repo_root,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+        except:
+            return False
+    return True
+
+
+def check_for_updates(venv_python: Path, repo_root: Path):
+    """Проверка и установка обновлений"""
+    print_step("Проверка обновлений")
+    
+    if not ensure_auto_update_package(venv_python, repo_root):
+        print("⚠ Не удалось установить необходимые пакеты")
+        return
+    
+    try:
+        auto_update_file = repo_root / "scripts" / "_auto_update.py"
+        
+        if not auto_update_file.exists():
+            print("⚠ Файл scripts/_auto_update.py не найден")
+            return
+        
+        result = subprocess.run(
+            [str(venv_python), str(auto_update_file)],
+            cwd=repo_root,
+            timeout=60
+        )
+        
+        if result.returncode == 0:
+            print("✓ Проверка обновлений завершена")
+            
+    except subprocess.TimeoutExpired:
+        print("⚠ Превышено время ожидания")
+    except Exception as e:
+        print(f"⚠ Ошибка: {e}")
 
 def run(cmd, cwd=None, quiet=False):
     if quiet:
@@ -129,14 +181,20 @@ def select_menu_option():
 
 
 def main():
+    repo_root = Path(__file__).resolve().parent.parent
+    print_step("Мастер настройки и запуска генерации отчёта Ozon")
+    
+    venv_python, venv_created = ensure_venv(repo_root)
+    ensure_deps(venv_python, repo_root)
+    
+    # Проверка обновлений сразу после установки зависимостей
+    check_for_updates(venv_python, repo_root)
+    
     choice = select_menu_option()
     if choice == "1":
         print_step("Выбран Месячный отчёт по продажам.")
-        repo_root = Path(__file__).resolve().parent.parent
         print_step("Мастер настройки и запуска генерации отчёта Ozon")
         try:
-            venv_python, venv_created = ensure_venv(repo_root)
-            ensure_deps(venv_python, repo_root)
             env_created = ensure_env(repo_root)
             costs_created = ensure_costs(repo_root)
             ensure_reports_dir(repo_root)
