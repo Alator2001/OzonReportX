@@ -123,10 +123,10 @@ def ensure_env(repo_root: Path) -> bool:
 
 
 def ensure_costs(repo_root: Path) -> bool:
- """Проверяет наличие файла себестоимости"""
+    """Проверяет наличие файла себестоимости"""
     costs_xlsx = repo_root / "costs.xlsx"
     costs_csv = repo_root / "costs.csv"
-    
+
     if costs_xlsx.exists() or costs_csv.exists():
         print_step("Файл себестоимости найден")
         return False
