@@ -123,24 +123,42 @@ def ensure_env(repo_root: Path) -> bool:
 
 
 def ensure_costs(repo_root: Path) -> bool:
+ """Проверяет наличие файла себестоимости"""
     costs_xlsx = repo_root / "costs.xlsx"
     costs_csv = repo_root / "costs.csv"
-    created = False
+    
     if costs_xlsx.exists() or costs_csv.exists():
         print_step("Файл себестоимости найден")
-    else:
-        print_step("Создание шаблона себестоимости costs.xlsx")
-        try:
-            import pandas as pd
-            df = pd.DataFrame(columns=["артикул", "себестоимость"])
-            df.to_excel(costs_xlsx, index=False)
-            created = True
+        return False
+    
+    print_step("Создание шаблона себестоимости costs.xlsx")
+    
+    try:
+        import subprocess
+        result = subprocess.run(
+            [str(venv_python), "-c", 
+             "import pandas as pd; "
+             "df = pd.DataFrame(columns=['артикул', 'себестоимость']); "
+             f"df.to_excel('{costs_xlsx}', index=False)"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0:
             print("Создан costs.xlsx. Заполните артикулы и себестоимость.")
-        except Exception as e:
-            # Резервный вариант — CSV, если нет pandas/openpyxl
-            costs_csv.write_text("артикул,себестоимость\n", encoding="utf-8")
-            print(f"Не удалось создать Excel ({e}). Создан резервный costs.csv.")
-    # Диалог по себестоимости — только если файл был создан сейчас
+            created = True
+        else:
+            raise Exception("pandas не установлен")
+            
+    except Exception as e:
+        # Резервный вариант — CSV
+        costs_csv.write_text("артикул,себестоимость\n", encoding="utf-8")
+        print(f"Не удалось создать Excel ({e}). Создан резервный costs.csv.")
+        created = True
+    
+    # Диалог по себестоимости
     if created:
         print_step("Заполнение себестоимости")
         print("Укажите себестоимость для своих артикулов в файле costs.xlsx (или costs.csv).")
@@ -148,13 +166,14 @@ def ensure_costs(repo_root: Path) -> bool:
             try:
                 target = str(costs_xlsx if costs_xlsx.exists() else costs_csv)
                 if os.name == 'nt':
-                    os.startfile(target)  # type: ignore[attr-defined]
+                    os.startfile(target)
                 elif sys.platform == 'darwin':
                     run(["open", target])
                 else:
                     run(["xdg-open", target])
             except Exception as e:
                 print(f"Не удалось открыть файл автоматически: {e}")
+    
     return created
 
 
