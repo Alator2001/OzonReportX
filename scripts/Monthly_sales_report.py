@@ -1,11 +1,18 @@
 import os
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
-from dateutil.parser import isoparse
-import time
 import json
+import time
+import shutil
+import importlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
+import requests
+from dateutil.parser import isoparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
 # 🔐 Загружаем данные для авторизации из переменных окружения
@@ -21,6 +28,20 @@ HEADERS = {
     'Api-Key': API_KEY,
     'Content-Type': 'application/json'
 }
+
+def create_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["POST", "GET"]),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 def get_custom_date_range():
     while True:
@@ -53,7 +74,6 @@ def load_cost_map():
 
     candidates = [
         os.path.join(repo_root, 'costs.xlsx'),
-        os.path.join(repo_root, 'costs.csv')
     ]
 
     for path in candidates:
@@ -99,111 +119,159 @@ def load_cost_map():
             except Exception as e:
                 print(f"⚠️ Не удалось прочитать {os.path.basename(path)}: {e}")
 
-    print("ℹ️ Файл себестоимости не найден (costs.xlsx или costs.csv в корне репозитория). Будет использовано значение 0.")
+    print("ℹ️ Файл себестоимости не найден (costs.xlsx). Будет использовано значение 0.")
     return {}
 
+# Импорт функций для работы с Performance API
+try:
+    from scripts.performance_api import get_cpc_campaigns_for_month, get_campaigns_data_for_excel  # type: ignore
+except ImportError:
+    import sys
+    from pathlib import Path
+    sys.path.append(str(Path(__file__).resolve().parent))
+    from performance_api import get_cpc_campaigns_for_month, get_campaigns_data_for_excel  # type: ignore
+
 # 📥 Получаем список заказов FBS (Fulfillment by Seller)
-def get_orders(date_from, date_to):
+def _fetch_fbs_page(session: requests.Session, date_from: str, date_to: str, status: str, limit: int, offset: int) -> List[Dict[str, Any]]:
+    url = 'https://api-seller.ozon.ru/v3/posting/fbs/list'
+    payload = {
+        "filter": {
+            "since": date_from,
+            "to": date_to,
+            "status": status
+        },
+        "limit": limit,
+        "offset": offset,
+        "with": {
+            "analytics_data": True,
+            "financial_data": True
+        }
+    }
+    resp = session.post(url, headers=HEADERS, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    postings = data.get("result", {}).get("postings", [])
+    for p in postings:
+        p["__schema"] = "FBS"
+    return postings
+
+# 📥 Получаем список заказов FBS (Fulfillment by Seller)
+def get_orders(date_from, date_to, session: Optional[requests.Session] = None):
     url = 'https://api-seller.ozon.ru/v3/posting/fbs/list'
     result = []
     limit = 100
+    session = session or create_session()
 
     # Статусы заказов, которые необходимо получить
     STATUSES = ["awaiting_packaging", "awaiting_deliver", "delivering", "delivered", "cancelled"]
 
     for status in STATUSES:
-        print(f"📥 [FBS] Получаем заказы со статусом: {status}")
         offset = 0
+        max_workers = 8
         while True:
-            payload = {
-                "filter": {
-                    "since": date_from,
-                    "to": date_to,
-                    "status": status
-                },
-                "limit": limit,
-                "offset": offset,
-                "with": {
-                    "analytics_data": True,
-                    "financial_data": True
-                }
-            }
-
-            response = requests.post(url, headers=HEADERS, json=payload)
-            response.raise_for_status()
-            data = response.json()
-
-            postings = data.get("result", {}).get("postings", [])
-            if not postings:
+            # Пакетная параллельная выборка страниц
+            futures = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for i in range(max_workers):
+                    page_offset = offset + i * limit
+                    futures[executor.submit(_fetch_fbs_page, session, date_from, date_to, status, limit, page_offset)] = page_offset
+                empty_hit = False
+                # Сохраняем результаты по возрастанию offset
+                page_results = []
+                for fut in as_completed(futures):
+                    page_offset = futures[fut]
+                    try:
+                        postings = fut.result()
+                    except Exception as e:
+                        # В случае ошибки прекращаем пакет
+                        postings = []
+                    page_results.append((page_offset, postings))
+                page_results.sort(key=lambda x: x[0])
+                for _, postings in page_results:
+                    if not postings:
+                        empty_hit = True
+                        break
+                    result.extend(postings)
+            if empty_hit:
                 break
-
-            for p in postings:
-                p["__schema"] = "FBS"  # Добавляем пометку о схеме
-            result.extend(postings)
-            offset += limit
-            time.sleep(0.2)  # Пауза между запросами
+            offset += max_workers * limit
 
     return result
 
 # 📥 Получаем список заказов FBO (Fulfillment by Ozon)
-def get_fbo_orders(date_from, date_to):
+def _fetch_fbo_page(session: requests.Session, date_from: str, date_to: str, status: str, limit: int, offset: int) -> List[Dict[str, Any]]:
+    url = 'https://api-seller.ozon.ru/v2/posting/fbo/list'
+    payload = {
+        "dir": "ASC",
+        "filter": {
+            "since": date_from,
+            "to": date_to,
+            "status": status
+        },
+        "limit": limit,
+        "offset": offset,
+        "with": {
+            "analytics_data": True,
+            "financial_data": True
+        }
+    }
+    resp = session.post(url, headers=HEADERS, json=payload)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):
+        postings = data
+    elif isinstance(data, dict) and "result" in data:
+        postings = data["result"]
+    else:
+        postings = []
+    for p in postings:
+        if isinstance(p, dict):
+            p["__schema"] = "FBO"
+    return postings
+
+def get_fbo_orders(date_from, date_to, session: Optional[requests.Session] = None):
 
     url = 'https://api-seller.ozon.ru/v2/posting/fbo/list'
     result = []
     limit = 100
+    session = session or create_session()
 
     STATUSES = ["awaiting_deliver", "delivering", "delivered", "cancelled"]
 
     for status in STATUSES:
-        print(f"📥 [FBO] Получаем заказы со статусом: {status}")
         offset = 0
+        max_workers = 8
         while True:
-            payload = {
-                "dir": "ASC",
-                "filter": {
-                    "since": date_from,
-                    "to": date_to,
-                    "status": status
-                },
-                "limit": limit,
-                "offset": offset,
-                "with": {
-                    "analytics_data": True,
-                    "financial_data": True
-                }
-            }
-
-            response = requests.post(url, headers=HEADERS, json=payload)
-            response.raise_for_status()
-
-            #print("📨 Ответ от API:", response.status_code)
-            #print(response.text)
-
-            data = response.json()
-
-            if isinstance(data, list):
-                postings = data
-            elif isinstance(data, dict) and "result" in data:
-                postings = data["result"]
-            else:
-                print(f"⚠️ Ожидался список заказов, но получено: {data}")
+            futures = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for i in range(max_workers):
+                    page_offset = offset + i * limit
+                    futures[executor.submit(_fetch_fbo_page, session, date_from, date_to, status, limit, page_offset)] = page_offset
+                empty_hit = False
+                page_results = []
+                for fut in as_completed(futures):
+                    page_offset = futures[fut]
+                    try:
+                        postings = fut.result()
+                    except Exception:
+                        postings = []
+                    page_results.append((page_offset, postings))
+                page_results.sort(key=lambda x: x[0])
+                for _, postings in page_results:
+                    if not postings:
+                        empty_hit = True
+                        break
+                    result.extend(postings)
+            if empty_hit:
                 break
-
-            if not postings:
-                break
-
-            for p in postings:
-                if isinstance(p, dict):
-                    p["__schema"] = "FBO"  # Добавляем пометку о схеме
-            result.extend(postings)
-            offset += limit
-            time.sleep(0.2)
+            offset += max_workers * limit
 
     return result
 
 # 💳 Получаем финансовые транзакции по заказу
-def get_transactions(posting_number, date_from, date_to):
+def get_transactions(posting_number, date_from, date_to, session: Optional[requests.Session] = None):
     url = "https://api-seller.ozon.ru/v3/finance/transaction/list"
+    session = session or create_session()
 
     payload = {
         "filter": {
@@ -220,7 +288,7 @@ def get_transactions(posting_number, date_from, date_to):
     all_operations = []
 
     while True:
-        response = requests.post(url, headers=HEADERS, json=payload)
+        response = session.post(url, headers=HEADERS, json=payload)
 
         if response.status_code != 200:
             print(f"❌ Ошибка при запросе транзакций для {posting_number}: {response.status_code}")
@@ -238,9 +306,52 @@ def get_transactions(posting_number, date_from, date_to):
     return all_operations
 
 # 📊 Преобразуем данные в Excel
-def to_excel(postings, date_from, date_to, month, year, output_file=None):
+def _ensure_reports_dir_and_check_space(reports_dir: str, min_free_mb: int = 20) -> None:
+    os.makedirs(reports_dir, exist_ok=True)
+    try:
+        usage = shutil.disk_usage(reports_dir)
+        free_mb = usage.free // (1024 * 1024)
+        if free_mb < min_free_mb:
+            raise RuntimeError(f"Недостаточно места на диске: доступно {free_mb} МБ, требуется ≥ {min_free_mb} МБ")
+    except Exception:
+        # Если не удалось определить, продолжаем без жёсткой блокировки
+        pass
+
+def _safe_save_excel(df: pd.DataFrame, output_file: str, sheet_name: str = "Sheet1") -> str:
+    # Пишем во временный файл и затем атомарно заменяем
+    base_dir = os.path.dirname(output_file)
+    tmp_path = os.path.join(base_dir, f"~tmp_{int(time.time())}.xlsx")
+    engine = None
+    if importlib.util.find_spec("xlsxwriter") is not None:
+        engine = "xlsxwriter"
+    try:
+        if engine:
+            # xlsxwriter не поддерживает sheet_name напрямую, используем openpyxl
+            with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+        else:
+            with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+        # Пытаемся заменить целевой файл
+        try:
+            if os.path.exists(output_file):
+                os.remove(output_file)
+        except PermissionError:
+            raise RuntimeError(f"Файл занят другим процессом: {output_file}. Закройте его и повторите.")
+        os.replace(tmp_path, output_file)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    return output_file
+
+# 📊 Преобразуем данные в Excel
+def to_excel(postings, date_from, date_to, month, year, output_file=None, session: Optional[requests.Session] = None):
     from datetime import datetime
     import pandas as pd
+    session = session or create_session()
 
     rows = []
     total_posts = max(len(postings or []), 1)
@@ -256,7 +367,7 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None):
     if not output_file:
         script_dir = os.path.dirname(__file__)
         reports_dir = os.path.abspath(os.path.join(script_dir, '..', 'reports'))
-        os.makedirs(reports_dir, exist_ok=True)
+        _ensure_reports_dir_and_check_space(reports_dir)
         output_file = os.path.join(reports_dir, f"{month_name} {year}.xlsx")
 
 
@@ -266,7 +377,21 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None):
     for idx, post in enumerate(postings, start=1):
         posting_number = post.get("posting_number", "")
         status = post.get("status", "")                         # Статус
-        date = post.get("shipment_date", "")                    # Дата отгрузки
+        schema = post.get("__schema", "")
+        
+        # Дата отгрузки - для FBS используется shipment_date, для FBO может быть другое поле
+        if schema == "FBO":
+            # Для FBO заказов пробуем различные поля с датами (в порядке приоритета)
+            date = (post.get("in_process_at") or 
+                   post.get("shipment_date") or 
+                   post.get("created_at") or 
+                   post.get("date") or
+                   post.get("in_process_at_date") or
+                   post.get("shipment_date_time") or "")
+        else:
+            # Для FBS используем shipment_date
+            date = post.get("shipment_date", "")
+        
         items = post.get("products", []) or []
 
         # Если в заказе нет товаров — пропускаем
@@ -308,7 +433,7 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None):
         sale_commission = 0.0
         price = 0.0
 
-        transactions = get_transactions(posting_number, date_from, date_to)
+        transactions = get_transactions(posting_number, date_from, date_to, session=session)
         for trans in transactions or []:
             amount += float(trans.get("amount") or 0)
             sale_commission += float(trans.get("sale_commission") or 0)
@@ -316,7 +441,7 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None):
 
         # Формируем значения в зависимости от статуса
         if status == "delivering":
-            amount_cell = "-"
+            amount_cell = amount
             sale_commission_cell = "-"
             delivery_cost_cell = "-"
             profit_cell = "-"
@@ -331,6 +456,13 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None):
             sale_commission_cell = sale_commission
             delivery_cost_cell = - amount + price + sale_commission
             profit_cell = amount + cost_price
+            # Если при доставленном заказе прибыль получилась отрицательной —
+            # считаем, что заказ по сути отменён: прибыль = стоимость логистики,
+            # себестоимость = 0, статус меняем на cancelled.
+            if profit_cell < 0:
+                status = "returned"
+                cost_price = 0.0
+                profit_cell = delivery_cost_cell
         else:
             amount_cell = "-"
             sale_commission_cell = "-"
@@ -359,16 +491,136 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None):
             print(f"\r⚙️ Обработка заказов: {percent}%", end="", flush=True)
 
     df = pd.DataFrame(rows)
-    df.to_excel(output_file, index=False)
+    output_file = _safe_save_excel(df, output_file, sheet_name="Заказы")
     print("\r✅ Обработка заказов: 100%")
     print(f"✅ Отчёт сохранён: {output_file}")
     return output_file
 
 from openpyxl import load_workbook
+from openpyxl.styles import Font, Alignment, PatternFill
 
-def calc_business_indicators(filename):
+def create_campaigns_sheet(filename: str, session: Optional[requests.Session] = None,
+                           date_from: Optional[str] = None, date_to: Optional[str] = None):
+    """
+    Создаёт лист Excel с данными об активных кампаниях за месяц.
+    """
+    if not session or not date_from or not date_to:
+        return
+    
+    print("📊 Получаем данные об активных кампаниях...")
+    
+    campaigns_data = get_campaigns_data_for_excel(session, date_from, date_to)
+    
+    if campaigns_data is None:
+        print("ℹ️ Не настроены переменные для Performance API. Пропускаем создание листа кампаний.")
+        return
+    
+    if not campaigns_data:
+        print("ℹ️ Не найдено активных кампаний за указанный период.")
+        return
+    
+    try:
+        # Открываем Excel-файл
+        wb = load_workbook(filename)
+        
+        # Удаляем лист "Кампании", если он уже существует
+        if "Кампании" in wb.sheetnames:
+            wb.remove(wb["Кампании"])
+        
+        # Создаём новый лист
+        ws_campaigns = wb.create_sheet("Кампании")
+        
+        # Заголовки столбцов
+        headers = [
+            "ID кампании", "Название кампании", "Состояние", "Тип оплаты", "Тип объекта",
+            "Бюджет (руб.)", "Дневной бюджет (руб.)", "Недельный бюджет (руб.)",
+            "Расход за период (руб.)", "Показы", "Клики", "CTR (%)",
+            "Средняя цена клика (руб.)", "Заказы (шт.)", "Заказы (руб.)", "ДРР (%)"
+        ]
+        
+        # Записываем заголовки
+        for col_idx, header in enumerate(headers, start=1):
+            cell = ws_campaigns.cell(row=1, column=col_idx)
+            cell.value = header
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            cell.font = Font(bold=True, color="FFFFFF")
+        
+        # Записываем данные
+        for row_idx, campaign in enumerate(campaigns_data, start=2):
+            for col_idx, header in enumerate(headers, start=1):
+                cell = ws_campaigns.cell(row=row_idx, column=col_idx)
+                value = campaign.get(header, "")
+                
+                # Форматируем числовые значения
+                if isinstance(value, (int, float)):
+                    cell.value = value
+                    if "руб." in header or "ДРР" in header or "CTR" in header:
+                        cell.number_format = "#,##0.00"
+                    elif "Показы" in header or "Клики" in header or "Заказы (шт.)" in header:
+                        cell.number_format = "#,##0"
+                else:
+                    cell.value = value
+                
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+        
+        # Автоматически подбираем ширину столбцов
+        for col_idx, header in enumerate(headers, start=1):
+            max_length = len(str(header))
+            for row in ws_campaigns.iter_rows(min_row=2, max_row=ws_campaigns.max_row, min_col=col_idx, max_col=col_idx):
+                for cell in row:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+            ws_campaigns.column_dimensions[ws_campaigns.cell(row=1, column=col_idx).column_letter].width = min(max_length + 2, 50)
+        
+        # Сохраняем изменения
+        wb.save(filename)
+        print(f"✅ Лист 'Кампании' создан: {len(campaigns_data)} кампаний")
+        
+    except Exception as e:
+        print(f"⚠️ Ошибка при создании листа кампаний: {str(e)}")
+
+
+def calc_business_indicators(filename, session: Optional[requests.Session] = None, 
+                            date_from: Optional[str] = None, date_to: Optional[str] = None):
     print("💲 Рассчёт бизнес показателей")
-
+    
+    # Пытаемся получить затраты на продвижение Ozon из Performance API
+    ozon_promotion_cost = 0.0
+    if session and date_from and date_to:
+        perf_stats = get_cpc_campaigns_for_month(session, date_from, date_to)
+        ozon_promotion_cost = perf_stats.get("total_cost", 0.0)
+        if ozon_promotion_cost > 0:
+            print(f"💰 Затраты на продвижение Ozon (CPC) из API: {ozon_promotion_cost:.2f} ₽")
+    
+    # Если не получилось из API или сумма 0 - спрашиваем у пользователя
+    if ozon_promotion_cost == 0.0:
+        print("Введите сумму затрат на продвижение Ozon за месяц (или Enter для 0):")
+        try:
+            user_input = input().strip()
+            if user_input:
+                ozon_promotion_cost = abs(float(user_input.replace(",", ".")))
+            else:
+                ozon_promotion_cost = 0.0
+        except ValueError:
+            print("❌ Некорректное число. Используем 0.")
+            ozon_promotion_cost = 0.0
+    
+    # Запрашиваем затраты на внешний маркетинг (кампании не на Ozon)
+    external_marketing_cost = 0.0
+    print("Введите сумму затрат на внешний маркетинг за месяц (кампании не на Ozon, или Enter для 0):")
+    try:
+        user_input = input().strip()
+        if user_input:
+            external_marketing_cost = abs(float(user_input.replace(",", ".")))
+        else:
+            external_marketing_cost = 0.0
+    except ValueError:
+        print("❌ Некорректное число. Используем 0.")
+        external_marketing_cost = 0.0
+    
+    
     # Открываем Excel-файл
     wb = load_workbook(filename)
     ws = wb.active  # Можно заменить на ws = wb["Имя_листа"], если нужно конкретный лист
@@ -391,9 +643,12 @@ def calc_business_indicators(filename):
         if isinstance(cell.value, (int, float)):
             cost_price += cell.value
 
-    net_profit_margin = (net_profit/sales_revenue)*100
+    # Вычитаем затраты на продвижение Ozon и внешний маркетинг из чистой прибыли
+    total_marketing_cost = ozon_promotion_cost + external_marketing_cost
+    net_profit = net_profit - total_marketing_cost
+    net_profit_margin = (net_profit/sales_revenue)*100 if sales_revenue > 0 else 0
     cogs = sales_revenue + cost_price
-    gross_profit_margin =(cogs/sales_revenue)*100
+    gross_profit_margin = (cogs/sales_revenue)*100 if sales_revenue > 0 else 0
     operating_expenses = cogs - net_profit
     # Записываем результат
     ws["P1"] = "Общаяя выручка"
@@ -410,26 +665,37 @@ def calc_business_indicators(filename):
     ws["Q6"] = gross_profit_margin
     ws["P7"] = "Операционные расходы"
     ws["Q7"] = operating_expenses
+    ws["P8"] = "Продвижение Ozon"
+    ws["Q8"] = ozon_promotion_cost
+    ws["P9"] = "Внешний маркетинг"
+    ws["Q9"] = external_marketing_cost
 
     # Сохраняем изменения
     wb.save(filename)
-    print(f"✅ Рассчёт бизнес показателей завершён")
+    print(f"✅ Бизнес показатели добавлены в отчёт")
+    
+    # Создаём лист с данными о кампаниях
+    create_campaigns_sheet(filename, session=session, date_from=date_from, date_to=date_to)
 
 # 🚀 Точка входа
 def main():
     date_from, date_to, month, year = get_custom_date_range()
     print("📦 Получаем список заказов за месяц...")
-
-    fbs_orders = get_orders(date_from, date_to)
-    fbo_orders = get_fbo_orders(date_from, date_to)
+    session = create_session()
+    fbs_orders = get_orders(date_from, date_to, session=session)
+    fbo_orders = get_fbo_orders(date_from, date_to, session=session)
 
     all_orders = fbs_orders + fbo_orders
     print(f"🔢 Найдено заказов: {len(all_orders)}")
     
     # Имя файла формируется внутри to_excel как "<Месяц> <Год>.xlsx"
-    output_file = to_excel(all_orders, date_from, date_to, month, year)
+    start_ts = time.time()
+    output_file = to_excel(all_orders, date_from, date_to, month, year, session=session)
+    duration_s = time.time() - start_ts
     
-    calc_business_indicators(output_file)
+    calc_business_indicators(output_file, session=session, date_from=date_from, date_to=date_to)
+    # Краткий итог
+    print(f"⏱ Время формирования: {duration_s:.1f} с")
 
 if __name__ == "__main__":
     main()

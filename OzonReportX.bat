@@ -16,7 +16,7 @@ if errorlevel 1 (
 echo [INFO] Starting setup...
 echo.
 
-python -X utf8 "scripts\first_run_setup.py"
+python -X utf8 "scripts\first_run_setup.py" %*
 if errorlevel 1 (
     echo [ERROR] Script finished with errors.
     pause

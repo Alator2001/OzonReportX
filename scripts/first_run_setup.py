@@ -2,32 +2,18 @@ import os
 import sys
 import subprocess
 from pathlib import Path
+import argparse
+# Импорт утилит как локального модуля при запуске по пути (scripts/first_run_setup.py)
+try:
+    from scripts.utils import print_step, prompt_yes_no, set_prompt_force  # type: ignore
+except ModuleNotFoundError:
+    sys.path.append(str(Path(__file__).resolve().parent))
+    from utils import print_step, prompt_yes_no, set_prompt_force  # type: ignore
 
-
-def print_step(title: str):
-    print(f"\n=== {title} ===")
+ 
 
 def ensure_auto_update_package(venv_python: Path, repo_root: Path):
-    """Проверяет и устанавливает необходимые пакеты для обновления"""
-    required_packages = ['requests', 'packaging']
-    
-    for package in required_packages:
-        try:
-            result = subprocess.run(
-                [str(venv_python), "-c", f"import {package}"],
-                cwd=repo_root,
-                capture_output=True,
-                timeout=5
-            )
-            if result.returncode != 0:
-                subprocess.check_call(
-                    [str(venv_python), "-m", "pip", "install", package],
-                    cwd=repo_root,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-        except:
-            return False
+    """Требуемые пакеты для автообновления уже ставятся через requirements.txt в ensure_deps."""
     return True
 
 
@@ -87,27 +73,29 @@ def ensure_venv(repo_root: Path) -> tuple[Path, bool]:
 
 def ensure_deps(venv_python: Path, repo_root: Path):
     print_step("Обновление pip и установка зависимостей")
+    # Определим каталог виртуального окружения и файл-маркер
+    venv_dir = Path(venv_python).resolve().parent.parent
+    bootstrap_marker = venv_dir / ".bootstrap_done"
+    if bootstrap_marker.exists():
+        print("Зависимости уже установлены (найден .bootstrap_done).")
+        return
+    # Обновляем pip и ставим зависимости одним вызовом
     run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], cwd=repo_root, quiet=True)
     config_dir = Path(__file__).resolve().parent
     req = config_dir / "requirements.txt"
     if req.exists():
         run([str(venv_python), "-m", "pip", "install", "-r", str(req)], cwd=repo_root, quiet=True)
     else:
+        # Резервный список, если requirements.txt отсутствует
         run([str(venv_python), "-m", "pip", "install",
-             "requests", "pandas", "openpyxl", "python-dateutil", "python-dotenv"], cwd=repo_root, quiet=True)
+             "requests", "pandas", "openpyxl", "python-dateutil", "python-dotenv", "packaging"], cwd=repo_root, quiet=True)
+    # Создаём маркер успешной установки
+    try:
+        bootstrap_marker.write_text("ok", encoding="utf-8")
+    except Exception:
+        pass
 
-
-def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
-    suffix = "[Y/n]" if default_yes else "[y/N]"
-    while True:
-        answer = input(f"{message} {suffix} ").strip().lower()
-        if not answer:
-            return default_yes
-        if answer in ("y", "yes", "д", "да"):
-            return True
-        if answer in ("n", "no", "н", "нет"):
-            return False
-        print("Пожалуйста, ответьте 'y' или 'n'.")
+ 
 
 
 def ensure_env(repo_root: Path) -> bool:
@@ -117,63 +105,86 @@ def ensure_env(repo_root: Path) -> bool:
     print_step("Создание .env")
     client_id = input("Введите OZON_CLIENT_ID: ").strip()
     api_key = input("Введите OZON_API_KEY: ").strip()
-    env_path.write_text(f"OZON_CLIENT_ID={client_id}\nOZON_API_KEY={api_key}\n", encoding="utf-8")
+    
+    env_content = f"OZON_CLIENT_ID={client_id}\nOZON_API_KEY={api_key}\n"
+    
+    # Опционально: Performance API для автоматического получения затрат на рекламу
+    if prompt_yes_no("Добавить Performance API credentials для автоматического получения затрат на рекламу? (опционально)", default_yes=False):
+        print("\nДля получения данных о рекламных кампаниях нужны отдельные ключи из раздела 'Продвижение' → 'API' в кабинете Ozon.")
+        perf_client_id = input("Введите OZON_PERF_CLIENT_ID (или Enter для пропуска): ").strip()
+        perf_api_key = input("Введите OZON_PERF_API_KEY (или Enter для пропуска): ").strip()
+        if perf_client_id and perf_api_key:
+            env_content += f"OZON_PERF_CLIENT_ID={perf_client_id}\nOZON_PERF_API_KEY={perf_api_key}\n"
+            print("✅ Performance API credentials добавлены")
+        else:
+            print("ℹ️ Performance API credentials не добавлены (можно добавить позже в .env)")
+    
+    env_path.write_text(env_content, encoding="utf-8")
     print("Файл .env создан")
     return True
 
 
-def ensure_costs(repo_root: Path) -> bool:
+def ensure_costs(venv_python, repo_root: Path) -> bool:
     """Проверяет наличие файла себестоимости"""
     costs_xlsx = repo_root / "costs.xlsx"
-    costs_csv = repo_root / "costs.csv"
 
-    if costs_xlsx.exists() or costs_csv.exists():
+    if costs_xlsx.exists():
         print_step("Файл себестоимости найден")
         return False
     
     print_step("Создание шаблона себестоимости costs.xlsx")
     
-    try:
-        import subprocess
-        result = subprocess.run(
-            [str(venv_python), "-c", 
-             "import pandas as pd; "
-             "df = pd.DataFrame(columns=['артикул', 'себестоимость']); "
-             f"df.to_excel('{costs_xlsx}', index=False)"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode == 0:
-            print("Создан costs.xlsx. Заполните артикулы и себестоимость.")
-            created = True
-        else:
-            raise Exception("pandas не установлен")
-            
-    except Exception as e:
-        # Резервный вариант — CSV
-        costs_csv.write_text("артикул,себестоимость\n", encoding="utf-8")
-        print(f"Не удалось создать Excel ({e}). Создан резервный costs.csv.")
+
+    import subprocess
+    # Путь для подстановки в однострочную команду Python
+    _path = str(costs_xlsx).replace("\\", "\\\\")
+    create_cmd = (
+        "import sys; "
+        "path=r\"" + _path + "\"; "
+        "try:\n"
+        "    import pandas as pd\n"
+        "    df = pd.DataFrame(columns=['артикул', 'себестоимость'])\n"
+        "    df.to_excel(path, index=False)\n"
+        "except Exception:\n"
+        "    from openpyxl import Workbook\n"
+        "    wb = Workbook()\n"
+        "    ws = wb.active\n"
+        "    ws.append(['артикул', 'себестоимость'])\n"
+        "    wb.save(path)\n"
+    )
+    result = subprocess.run(
+        [str(venv_python), "-c", create_cmd],
+        cwd=repo_root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=10
+    )
+    
+    if result.returncode == 0:
+        print("Создан costs.xlsx. Заполните артикулы и себестоимость.")
         created = True
+    else:
+        raise Exception("Не удалось создать файл себестоимости (ни через pandas, ни через openpyxl)")
+            
     
     # Диалог по себестоимости
     if created:
         print_step("Заполнение себестоимости")
-        print("Укажите себестоимость для своих артикулов в файле costs.xlsx (или costs.csv).")
+        print("Укажите себестоимость для своих артикулов в файле costs.xlsx")
         if prompt_yes_no("Открыть файл себестоимости сейчас?", default_yes=True):
             try:
-                target = str(costs_xlsx if costs_xlsx.exists() else costs_csv)
-                if os.name == 'nt':
-                    os.startfile(target)
-                elif sys.platform == 'darwin':
-                    run(["open", target])
+                target = str(costs_xlsx)
+                if costs_xlsx.exists():
+                    if os.name == 'nt':
+                        os.startfile(target)
+                    elif sys.platform == 'darwin':
+                        run(["open", target])
+                    else:
+                        run(["xdg-open", target])
                 else:
-                    run(["xdg-open", target])
+                    print("Файл не найден.")
             except Exception as e:
                 print(f"Не удалось открыть файл автоматически: {e}")
-    
     return created
 
 
@@ -203,6 +214,18 @@ def main():
     repo_root = Path(__file__).resolve().parent.parent
     print_step("Мастер настройки и запуска генерации отчёта Ozon")
     
+    parser = argparse.ArgumentParser(add_help=False)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--yes", action="store_true", help="Автоматически отвечать Да на все вопросы")
+    group.add_argument("--no", action="store_true", help="Автоматически отвечать Нет на все вопросы")
+    args, _unknown = parser.parse_known_args()
+    if args.yes:
+        set_prompt_force(True)
+    elif args.no:
+        set_prompt_force(False)
+    else:
+        set_prompt_force(None)
+    
     venv_python, venv_created = ensure_venv(repo_root)
     ensure_deps(venv_python, repo_root)
     
@@ -215,7 +238,7 @@ def main():
         print_step("Мастер настройки и запуска генерации отчёта Ozon")
         try:
             env_created = ensure_env(repo_root)
-            costs_created = ensure_costs(repo_root)
+            costs_created = ensure_costs(venv_python, repo_root)
             ensure_reports_dir(repo_root)
             # Спрашиваем разрешение на запуск только при самом первом конфигурировании
             if venv_created or env_created or costs_created:
@@ -242,5 +265,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
