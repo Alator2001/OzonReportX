@@ -3,3 +3,4 @@
 __pycache__/
 costs.xlsx
 merged.xlsx
+/scripts/__pycache__
