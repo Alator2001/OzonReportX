@@ -470,18 +470,17 @@ def _get_stats_direct(session: requests.Session, perf_client_id: str, perf_token
         return {"total_cost": 0.0, "total_clicks": 0, "campaigns_count": 0}
 
 
-def get_active_campaigns_for_month(session: requests.Session, perf_client_id: str, perf_token: str,
-                                   date_from: str, date_to: str) -> List[Dict[str, Any]]:
+def get_campaigns_for_period(session: requests.Session, perf_client_id: str, perf_token: str,
+                              date_from: str, date_to: str) -> List[Dict[str, Any]]:
     """
-    Получает список активных кампаний за указанный месяц.
+    Получает список всех рекламных кампаний за указанный период.
     
-    Фильтрует кампании по:
-    - state = CAMPAIGN_STATE_RUNNING (активные кампании)
-    - Период активности кампании пересекается с указанным месяцем
+    Включает кампании в любом состоянии (активные, остановленные, завершённые и т.д.),
+    у которых период жизни пересекается с указанным периодом.
     """
-    # Получаем все активные кампании
+    # Получаем все кампании без фильтра по state (активные + неактивные)
     all_campaigns = list_campaigns(session, perf_client_id, perf_token, 
-                                   state="CAMPAIGN_STATE_RUNNING")
+                                   state=None, adv_object_type=None)
     
     if not all_campaigns:
         return []
@@ -552,6 +551,15 @@ def get_active_campaigns_for_month(session: requests.Session, perf_client_id: st
             active_in_period.append(campaign)
     
     return active_in_period
+
+
+def get_active_campaigns_for_month(session: requests.Session, perf_client_id: str, perf_token: str,
+                                   date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    """
+    Алиас для get_campaigns_for_period. Оставлен для совместимости.
+    Возвращает все кампании за период (активные и неактивные).
+    """
+    return get_campaigns_for_period(session, perf_client_id, perf_token, date_from, date_to)
 
 
 def get_campaign_statistics_json(session: requests.Session, perf_client_id: str, perf_token: str,
@@ -639,14 +647,14 @@ def get_campaign_statistics_json(session: requests.Session, perf_client_id: str,
 def get_active_campaigns_with_statistics(session: requests.Session, perf_client_id: str, perf_token: str,
                                          date_from: str, date_to: str) -> List[Dict[str, Any]]:
     """
-    Получает активные кампании за месяц вместе со статистикой.
+    Получает все кампании за период (активные и неактивные) вместе со статистикой.
     
     Возвращает список словарей, каждый содержит:
     - Данные кампании (id, title, state, budget и т.д.)
     - Статистику за период (расход, показы, клики, заказы и т.д.)
     """
-    # Получаем активные кампании за период
-    active_campaigns = get_active_campaigns_for_month(session, perf_client_id, perf_token, date_from, date_to)
+    # Получаем все кампании за период (активные и неактивные)
+    active_campaigns = get_campaigns_for_period(session, perf_client_id, perf_token, date_from, date_to)
     
     if not active_campaigns:
         return []
@@ -706,34 +714,31 @@ def get_active_campaigns_with_statistics(session: requests.Session, perf_client_
 
 
 def get_cpc_campaigns_for_month(session: requests.Session, date_from: str, date_to: str) -> Dict[str, Any]:
-    """Главная функция: получает список CPC кампаний, которые были активны в указанном месяце"""
+    """
+    Получает все рекламные кампании за указанный период (активные и неактивные)
+    и возвращает суммарные затраты на продвижение для расчёта итоговых показателей.
+    """
     perf_client_id, perf_api_key = get_performance_api_credentials()
     if not perf_client_id or not perf_api_key:
         print("ℹ️ Не настроены переменные для Performance API: OZON_PERF_CLIENT_ID и OZON_PERF_API_KEY. Пропускаем автозагрузку маркетинга.")
         return {"total_cost": 0.0, "total_clicks": 0, "campaigns_count": 0}
 
-    print("📢 Получаем данные о рекламных кампаниях (CPC)...")
+    print("📢 Получаем данные о рекламных кампаниях за период...")
     
     perf_token = get_performance_token(session, perf_client_id, perf_api_key)
     if not perf_token:
         print("⚠️ Не удалось получить токен для Performance API")
         return {"total_cost": 0.0, "total_clicks": 0, "campaigns_count": 0}
     
-    # Получаем активные кампании за период
-    active_campaigns = get_active_campaigns_for_month(session, perf_client_id, perf_token, date_from, date_to)
-    if not active_campaigns:
-        print("ℹ️ Не найдено активных кампаний за указанный период")
+    # Получаем все кампании за период (активные и неактивные)
+    campaigns_for_period = get_campaigns_for_period(session, perf_client_id, perf_token, date_from, date_to)
+    if not campaigns_for_period:
+        print("ℹ️ Не найдено кампаний за указанный период")
         return {"total_cost": 0.0, "total_clicks": 0, "campaigns_count": 0}
     
-    # Фильтруем только CPC кампании (SKU тип)
-    cpc_campaigns = [c for c in active_campaigns if c.get("advObjectType") == "SKU" or c.get("paymentType") == "CPC"]
-    
-    if not cpc_campaigns:
-        print("ℹ️ Не найдено CPC кампаний (оплата за клик)")
-        return {"total_cost": 0.0, "total_clicks": 0, "campaigns_count": 0}
-    
+    # Учитываем все кампании (любой тип: CPC, CPM и т.д.) для подсчёта расходов
     campaign_ids = []
-    for camp in cpc_campaigns:
+    for camp in campaigns_for_period:
         camp_id = camp.get("id") or camp.get("campaign_id")
         if camp_id:
             try:
@@ -746,13 +751,13 @@ def get_cpc_campaigns_for_month(session: requests.Session, date_from: str, date_
         return {"total_cost": 0.0, "total_clicks": 0, "campaigns_count": 0}
     
     stats = get_campaign_stats_for_month(session, perf_client_id, perf_token, campaign_ids, date_from, date_to)
-    print(f"✅ Найдено CPC кампаний: {stats['campaigns_count']}, затрат: {stats['total_cost']:.2f} ₽, кликов: {stats['total_clicks']}")
+    print(f"✅ Найдено кампаний за период: {stats['campaigns_count']}, затрат на продвижение: {stats['total_cost']:.2f} ₽, кликов: {stats['total_clicks']}")
     return stats
 
 
 def get_campaigns_data_for_excel(session: requests.Session, date_from: str, date_to: str) -> Optional[List[Dict[str, Any]]]:
     """
-    Получает данные об активных кампаниях за месяц для вывода в Excel.
+    Получает данные обо всех рекламных кампаниях за период (активные и неактивные) для вывода в Excel.
     
     Возвращает список словарей с данными для таблицы:
     - ID кампании
@@ -778,7 +783,7 @@ def get_campaigns_data_for_excel(session: requests.Session, date_from: str, date
     if not perf_token:
         return None
     
-    # Получаем активные кампании со статистикой
+    # Получаем все кампании за период (активные и неактивные) со статистикой
     campaigns_with_stats = get_active_campaigns_with_statistics(session, perf_client_id, perf_token, date_from, date_to)
     
     if not campaigns_with_stats:

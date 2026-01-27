@@ -392,6 +392,13 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
             # Для FBS используем shipment_date
             date = post.get("shipment_date", "")
         
+        # Оставляем только дату без времени (YYYY-MM-DD)
+        if date and isinstance(date, str):
+            if "T" in date:
+                date = date.split("T")[0]
+            elif " " in date:
+                date = date.split(" ")[0]
+        
         items = post.get("products", []) or []
 
         # Если в заказе нет товаров — пропускаем
@@ -445,6 +452,13 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
             sale_commission_cell = "-"
             delivery_cost_cell = "-"
             profit_cell = "-"
+            cost_price = 0.0   # себестоимость 0 — заказ ещё в доставке
+        elif status == "awaiting_packaging":
+            amount_cell = "-"
+            sale_commission_cell = "-"
+            delivery_cost_cell = "-"
+            profit_cell = "-"
+            cost_price = 0.0   # себестоимость 0 — заказ ожидает сборки
         elif status == "cancelled":
             amount_cell = amount
             sale_commission_cell = "-"
@@ -502,12 +516,12 @@ from openpyxl.styles import Font, Alignment, PatternFill
 def create_campaigns_sheet(filename: str, session: Optional[requests.Session] = None,
                            date_from: Optional[str] = None, date_to: Optional[str] = None):
     """
-    Создаёт лист Excel с данными об активных кампаниях за месяц.
+    Создаёт лист Excel с данными обо всех рекламных кампаниях за период (активные и неактивные).
     """
     if not session or not date_from or not date_to:
         return
     
-    print("📊 Получаем данные об активных кампаниях...")
+    print("📊 Получаем данные о рекламных кампаниях за период...")
     
     campaigns_data = get_campaigns_data_for_excel(session, date_from, date_to)
     
@@ -516,7 +530,7 @@ def create_campaigns_sheet(filename: str, session: Optional[requests.Session] = 
         return
     
     if not campaigns_data:
-        print("ℹ️ Не найдено активных кампаний за указанный период.")
+        print("ℹ️ Не найдено кампаний за указанный период.")
         return
     
     try:
