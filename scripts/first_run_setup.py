@@ -198,6 +198,95 @@ def run_report(venv_python: Path, repo_root: Path):
     main_script = repo_root / "scripts" / "Monthly_sales_report.py"
     run([str(venv_python), str(main_script)], cwd=repo_root)
 
+
+# Названия месяцев для имён файлов отчётов («Месяц Год.xlsx»), как в Monthly_sales_report
+MONTHS_RU = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
+]
+
+
+def ask_abc_xyz_date_range():
+    """Запрашивает у пользователя диапазон месяцев для ABC&XYZ-анализа. Возвращает (from_month, from_year, to_month, to_year)."""
+    print("Укажите диапазон месяцев для анализа (по одному месяцу — введите его дважды).")
+    while True:
+        try:
+            from_part = input("Месяц и год начала (например 10 2025): ").strip().split()
+            to_part = input("Месяц и год конца (например 12 2025): ").strip().split()
+            if len(from_part) >= 2 and len(to_part) >= 2:
+                from_month = int(from_part[0])
+                from_year = int(from_part[1])
+                to_month = int(to_part[0])
+                to_year = int(to_part[1])
+                if not (1 <= from_month <= 12 and 2000 <= from_year <= 2100):
+                    print("Некорректное начало: месяц 1–12, год 2000–2100.")
+                    continue
+                if not (1 <= to_month <= 12 and 2000 <= to_year <= 2100):
+                    print("Некорректный конец: месяц 1–12, год 2000–2100.")
+                    continue
+                if (from_year, from_month) <= (to_year, to_month):
+                    return from_month, from_year, to_month, to_year
+                print("Начало периода должно быть не позже конца.")
+            else:
+                print("Введите два числа через пробел: месяц и год (например 10 2025).")
+        except ValueError:
+            print("Некорректный ввод. Введите месяц и год числами через пробел.")
+
+
+def run_abc_xyz(
+    venv_python: Path,
+    repo_root: Path,
+    from_month: int,
+    from_year: int,
+    to_month: int,
+    to_year: int,
+):
+    """
+    Проверяет наличие отчётов за запрошенный диапазон в reports; недостающие генерирует.
+    Затем объединяет заказы из отчётов за этот диапазон в папку «ABC&XYZ reports».
+    """
+    ensure_reports_dir(repo_root)
+    reports_dir = repo_root / "reports"
+    main_script = repo_root / "scripts" / "Monthly_sales_report.py"
+    abc_script = repo_root / "scripts" / "ABC_XYZ_analytics_report.py"
+
+    # Список (year, month) от начала до конца включительно
+    start_ym = from_year * 12 + (from_month - 1)
+    end_ym = to_year * 12 + (to_month - 1)
+    months_to_need = []
+    for i in range(start_ym, end_ym + 1):
+        y, m = i // 12, (i % 12) + 1
+        months_to_need.append((y, m))
+
+    missing = []
+    for y, m in months_to_need:
+        fname = f"{MONTHS_RU[m - 1]} {y}.xlsx"
+        if not (reports_dir / fname).exists():
+            missing.append((y, m))
+
+    if missing:
+        print_step("Генерация недостающих месячных отчётов")
+        for y, m in missing:
+            label = f"{MONTHS_RU[m - 1]} {y}"
+            print(f"  Формируется отчёт за {label}...")
+            run(
+                [str(venv_python), str(main_script), "--month", str(m), "--year", str(y)],
+                cwd=repo_root,
+            )
+
+    print_step("ABC&XYZ-анализ: объединение заказов из отчётов за выбранный период")
+    run(
+        [
+            str(venv_python), str(abc_script),
+            "-i", str(reports_dir),
+            "--output_dir", "ABC&XYZ reports",
+            "--from-month", str(from_month), "--from-year", str(from_year),
+            "--to-month", str(to_month), "--to-year", str(to_year),
+        ],
+        cwd=repo_root,
+    )
+
+
 def select_menu_option():
     print_step("Меню выбора отчёта")
     print("1. Месячный отчёт по продажам")
@@ -254,8 +343,18 @@ def main():
             print(f"\nОшибка: {e}")
             sys.exit(1)
     elif choice == "2":
-        print("Выбран ABC&XYZ-анализ.")
-        print("Пока в разработке. Но скоро появится")
+        print_step("Выбран ABC&XYZ-анализ.")
+        try:
+            ensure_env(repo_root)
+            ensure_costs(venv_python, repo_root)
+            ensure_reports_dir(repo_root)
+            from_month, from_year, to_month, to_year = ask_abc_xyz_date_range()
+            run_abc_xyz(venv_python, repo_root, from_month, from_year, to_month, to_year)
+        except KeyboardInterrupt:
+            print("\nОперация прервана пользователем.")
+        except Exception as e:
+            print(f"\nОшибка: {e}")
+            sys.exit(1)
         return
     if choice == "3":
         print("Выход из программы.")

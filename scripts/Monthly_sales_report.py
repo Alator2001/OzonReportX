@@ -317,21 +317,32 @@ def _ensure_reports_dir_and_check_space(reports_dir: str, min_free_mb: int = 20)
         # Если не удалось определить, продолжаем без жёсткой блокировки
         pass
 
+def _artikul_to_number(v):
+    """Преобразует значение артикула в число, если возможно; иначе возвращает как есть."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return v
+    s = str(v).strip()
+    if not s:
+        return v
+    try:
+        n = float(s.replace(",", "."))
+        return int(n) if n == int(n) else n
+    except (ValueError, TypeError):
+        return v
+
+
 def _safe_save_excel(df: pd.DataFrame, output_file: str, sheet_name: str = "Sheet1") -> str:
     # Пишем во временный файл и затем атомарно заменяем
     base_dir = os.path.dirname(output_file)
     tmp_path = os.path.join(base_dir, f"~tmp_{int(time.time())}.xlsx")
-    engine = None
-    if importlib.util.find_spec("xlsxwriter") is not None:
-        engine = "xlsxwriter"
     try:
-        if engine:
-            # xlsxwriter не поддерживает sheet_name напрямую, используем openpyxl
-            with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-        else:
-            with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            if "Артикул" in df.columns:
+                col_idx = list(df.columns).index("Артикул") + 1
+                ws = writer.sheets[sheet_name]
+                for row in range(2, len(df) + 2):
+                    ws.cell(row=row, column=col_idx).number_format = "0"
         # Пытаемся заменить целевой файл
         try:
             if os.path.exists(output_file):
@@ -483,11 +494,12 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
             delivery_cost_cell = "-"
             profit_cell = "-"
 
+        artikul_val = _artikul_to_number(offer_ids_joined) if len(offer_ids_list) == 1 else offer_ids_joined
         rows.append({
             "Статус": status,
             "Номер заказа": posting_number,
             "Название товара": name,
-            "Артикул": offer_ids_joined,
+            "Артикул": artikul_val,
             "Количество шт.": quantity_total,
             "Цена продажи": price,
             "Комиссия за продажу Ozon": sale_commission_cell,
@@ -505,6 +517,8 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
             print(f"\r⚙️ Обработка заказов: {percent}%", end="", flush=True)
 
     df = pd.DataFrame(rows)
+    if "Артикул" in df.columns:
+        df["Артикул"] = df["Артикул"].apply(_artikul_to_number)
     output_file = _safe_save_excel(df, output_file, sheet_name="Заказы")
     print("\r✅ Обработка заказов: 100%")
     print(f"✅ Отчёт сохранён: {output_file}")
@@ -635,43 +649,88 @@ def calc_business_indicators(filename, session: Optional[requests.Session] = Non
         external_marketing_cost = 0.0
     
     
-    # Открываем Excel-файл
+    # Открываем Excel-файл; лист «Заказы»: A=Статус, F=Цена продажи, G=Комиссия Ozon, H=Логистика, J=Себестоимость, K=Прибыль
     wb = load_workbook(filename)
-    ws = wb.active  # Можно заменить на ws = wb["Имя_листа"], если нужно конкретный лист
+    ws = wb["Заказы"] if "Заказы" in wb.sheetnames else wb.active
 
-    # Считаем Общую выручку
+    # Считаем Общую выручку, Чистую прибыль, Себестоимость
     sales_revenue = 0
-    for cell in ws["F"][1:]: 
+    for cell in ws["F"][1:]:
         if isinstance(cell.value, (int, float)):
             sales_revenue += cell.value
 
-    # Считаем Чистую прибыль
     net_profit = 0
-    for cell in ws["K"][1:]: 
+    for cell in ws["K"][1:]:
         if isinstance(cell.value, (int, float)):
             net_profit += cell.value
 
-    # Считаем Себестоимость
     cost_price = 0
-    for cell in ws["J"][1:]: 
+    for cell in ws["J"][1:]:
         if isinstance(cell.value, (int, float)):
             cost_price += cell.value
+
+    # Новые показатели по строкам заказов: статус, средний чек, отменённые/доставленные, средние доли комиссии и логистики
+    total_orders = max(0, ws.max_row - 1)
+    delivered_count = 0
+    cancelled_returned_count = 0
+    ratios_commission_pct = []   # Комиссия Ozon / Цена продажи, %
+    ratios_logistics_pct = []   # Логистика / Цена продажи, %
+    revenue_for_avg_check = 0.0
+    orders_nonzero_price = 0
+
+    for row in range(2, ws.max_row + 1):
+        status_val = ws.cell(row=row, column=1).value
+        status = str(status_val).strip().lower() if status_val is not None else ""
+        if status == "delivered":
+            delivered_count += 1
+        if status in ("cancelled", "returned"):
+            cancelled_returned_count += 1
+
+        price_val = ws.cell(row=row, column=6).value
+        comm_val = ws.cell(row=row, column=7).value
+        log_val = ws.cell(row=row, column=8).value
+
+        try:
+            price = float(price_val) if price_val is not None and str(price_val).strip() not in ("-", "") else None
+        except (TypeError, ValueError):
+            price = None
+        try:
+            comm = float(comm_val) if comm_val is not None and str(comm_val).strip() not in ("-", "") else None
+        except (TypeError, ValueError):
+            comm = None
+        try:
+            log = float(log_val) if log_val is not None and str(log_val).strip() not in ("-", "") else None
+        except (TypeError, ValueError):
+            log = None
+
+        if price is not None and price != 0:
+            revenue_for_avg_check += price
+            orders_nonzero_price += 1
+            if comm is not None:
+                ratios_commission_pct.append(abs((comm / price) * 100))
+            if log is not None:
+                ratios_logistics_pct.append((log / price) * 100)
+
+    average_check = (revenue_for_avg_check / orders_nonzero_price) if orders_nonzero_price > 0 else 0
+    avg_commission_pct = (sum(ratios_commission_pct) / len(ratios_commission_pct)) if ratios_commission_pct else 0
+    avg_logistics_pct = (sum(ratios_logistics_pct) / len(ratios_logistics_pct)) if ratios_logistics_pct else 0
 
     # Вычитаем затраты на продвижение Ozon и внешний маркетинг из чистой прибыли
     total_marketing_cost = ozon_promotion_cost + external_marketing_cost
     net_profit = net_profit - total_marketing_cost
-    net_profit_margin = (net_profit/sales_revenue)*100 if sales_revenue > 0 else 0
+    net_profit_margin = (net_profit / sales_revenue) * 100 if sales_revenue > 0 else 0
     cogs = sales_revenue + cost_price
-    gross_profit_margin = (cogs/sales_revenue)*100 if sales_revenue > 0 else 0
+    gross_profit_margin = (cogs / sales_revenue) * 100 if sales_revenue > 0 else 0
     operating_expenses = cogs - net_profit
+
     # Записываем результат
-    ws["P1"] = "Общаяя выручка"
+    ws["P1"] = "Общая выручка"
     ws["Q1"] = sales_revenue
     ws["P2"] = "Чистая прибыль"
     ws["Q2"] = net_profit
     ws["P3"] = "Итоговая себестоимость"
     ws["Q3"] = cost_price
-    ws["P4"] = "Рентабельность  по чистой прибыли (Net Profit Margin) %"
+    ws["P4"] = "Рентабельность по чистой прибыли (Net Profit Margin) %"
     ws["Q4"] = net_profit_margin
     ws["P5"] = "COGS (валовая прибыль)"
     ws["Q5"] = cogs
@@ -684,6 +743,19 @@ def calc_business_indicators(filename, session: Optional[requests.Session] = Non
     ws["P9"] = "Внешний маркетинг"
     ws["Q9"] = external_marketing_cost
 
+    ws["P10"] = "Средний чек"
+    ws["Q10"] = average_check
+    ws["P11"] = "Общее количество заказов"
+    ws["Q11"] = total_orders
+    ws["P12"] = "Количество отменённых заказов"
+    ws["Q12"] = cancelled_returned_count
+    ws["P13"] = "Количество доставленных заказов"
+    ws["Q13"] = delivered_count
+    ws["P14"] = "Комиссии Ozon %"
+    ws["Q14"] = avg_commission_pct
+    ws["P15"] = "Логистика %"
+    ws["Q15"] = avg_logistics_pct
+
     # Сохраняем изменения
     wb.save(filename)
     print(f"✅ Бизнес показатели добавлены в отчёт")
@@ -692,8 +764,29 @@ def calc_business_indicators(filename, session: Optional[requests.Session] = Non
     create_campaigns_sheet(filename, session=session, date_from=date_from, date_to=date_to)
 
 # 🚀 Точка входа
-def main():
-    date_from, date_to, month, year = get_custom_date_range()
+def date_range_for_month(month: int, year: int):
+    """Возвращает (date_from, date_to) в формате API для заданных месяца и года."""
+    from calendar import monthrange
+    first_day = datetime(year, month, 1)
+    last_day = datetime(year, month, monthrange(year, month)[1])
+    return first_day.strftime('%Y-%m-%dT00:00:00Z'), last_day.strftime('%Y-%m-%dT23:59:59Z')
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description="Месячный отчёт по продажам Ozon.")
+    parser.add_argument("--month", type=int, default=None, help="Номер месяца (1–12), для неинтерактивного запуска")
+    parser.add_argument("--year", type=int, default=None, help="Год (например 2025), для неинтерактивного запуска")
+    args = parser.parse_args(argv)
+
+    if args.month is not None and args.year is not None:
+        if not (1 <= args.month <= 12 and 2000 <= args.year <= 2100):
+            raise ValueError("Укажите месяц 1–12 и год 2000–2100")
+        month, year = args.month, args.year
+        date_from, date_to = date_range_for_month(month, year)
+    else:
+        date_from, date_to, month, year = get_custom_date_range()
+
     print("📦 Получаем список заказов за месяц...")
     session = create_session()
     fbs_orders = get_orders(date_from, date_to, session=session)
@@ -710,6 +803,7 @@ def main():
     calc_business_indicators(output_file, session=session, date_from=date_from, date_to=date_to)
     # Краткий итог
     print(f"⏱ Время формирования: {duration_s:.1f} с")
+
 
 if __name__ == "__main__":
     main()
