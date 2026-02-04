@@ -5,10 +5,10 @@ from pathlib import Path
 import argparse
 # Импорт утилит как локального модуля при запуске по пути (scripts/first_run_setup.py)
 try:
-    from scripts.utils import print_step, prompt_yes_no, set_prompt_force  # type: ignore
+    from scripts.utils import print_step, prompt_yes_no, set_prompt_force, log_verbose, VERBOSE  # type: ignore
 except ModuleNotFoundError:
     sys.path.append(str(Path(__file__).resolve().parent))
-    from utils import print_step, prompt_yes_no, set_prompt_force  # type: ignore
+    from utils import print_step, prompt_yes_no, set_prompt_force, log_verbose, VERBOSE  # type: ignore
 
  
 
@@ -18,33 +18,27 @@ def ensure_auto_update_package(venv_python: Path, repo_root: Path):
 
 
 def check_for_updates(venv_python: Path, repo_root: Path):
-    """Проверка и установка обновлений"""
-    print_step("Проверка обновлений")
-    
+    """Проверка и установка обновлений (тихо, кроме ошибок)."""
+    log_verbose("Проверка обновлений...")
     if not ensure_auto_update_package(venv_python, repo_root):
         print("⚠ Не удалось установить необходимые пакеты")
         return
-    
     try:
         auto_update_file = repo_root / "scripts" / "_auto_update.py"
-        
         if not auto_update_file.exists():
-            print("⚠ Файл scripts/_auto_update.py не найден")
             return
-        
         result = subprocess.run(
             [str(venv_python), str(auto_update_file)],
             cwd=repo_root,
-            timeout=60
+            timeout=60,
+            capture_output=not VERBOSE,
         )
-        
         if result.returncode == 0:
-            print("✓ Проверка обновлений завершена")
-            
+            log_verbose("Проверка обновлений завершена")
     except subprocess.TimeoutExpired:
-        print("⚠ Превышено время ожидания")
+        log_verbose("Превышено время ожидания проверки обновлений")
     except Exception as e:
-        print(f"⚠ Ошибка: {e}")
+        print(f"⚠ Ошибка проверки обновлений: {e}")
 
 def run(cmd, cwd=None, quiet=False):
     if quiet:
@@ -59,7 +53,7 @@ def ensure_venv(repo_root: Path) -> tuple[Path, bool]:
     venv_dir = repo_root / ".venv"
     created = False
     if not venv_dir.exists():
-        print_step("Создание виртуального окружения (.venv)")
+        print_step("Создание окружения .venv")
         run([sys.executable, "-m", "venv", str(venv_dir)])
         created = True
     venv_python = venv_dir / "Scripts" / "python.exe"
@@ -72,13 +66,12 @@ def ensure_venv(repo_root: Path) -> tuple[Path, bool]:
 
 
 def ensure_deps(venv_python: Path, repo_root: Path):
-    print_step("Обновление pip и установка зависимостей")
-    # Определим каталог виртуального окружения и файл-маркер
     venv_dir = Path(venv_python).resolve().parent.parent
     bootstrap_marker = venv_dir / ".bootstrap_done"
     if bootstrap_marker.exists():
-        print("Зависимости уже установлены (найден .bootstrap_done).")
+        log_verbose("Зависимости уже установлены.")
         return
+    print_step("Установка зависимостей")
     # Обновляем pip и ставим зависимости одним вызовом
     run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], cwd=repo_root, quiet=True)
     config_dir = Path(__file__).resolve().parent
@@ -287,21 +280,57 @@ def run_abc_xyz(
     )
 
 
+def run_recommended_prices(venv_python: Path, repo_root: Path):
+    """Запуск скрипта расчёта рекомендуемых цен (минимальная и желательная) по costs.xlsx."""
+    script = repo_root / "scripts" / "recommended_prices.py"
+    if not script.exists():
+        print("⚠ Скрипт recommended_prices.py не найден.")
+        return
+    run(
+        [str(venv_python), str(script)],
+        cwd=repo_root,
+    )
+
+
+def run_update_prices(venv_python: Path, repo_root: Path):
+    """Запуск скрипта обновления минимальных цен на Ozon."""
+    script = repo_root / "scripts" / "update_prices.py"
+    if not script.exists():
+        print("⚠ Скрипт update_prices.py не найден.")
+        return
+    run(
+        [str(venv_python), str(script)],
+        cwd=repo_root,
+    )
+
+
 def select_menu_option():
-    print_step("Меню выбора отчёта")
-    print("1. Месячный отчёт по продажам")
-    print("2. ABC&XYZ-анализ")
-    print("3. Выход")   
+    print()
+    print("  " + "=" * 50)
+    print("  📋  ГЛАВНОЕ МЕНЮ  OzonReportX")
+    print("  " + "=" * 50)
+    print()
+    print("  1. Месячный отчёт по продажам")
+    print("  2. ABC&XYZ-анализ")
+    print("  3. Рассчитать поставку FBO")
+    print("  4. Управление ценой")
+    print("  5. Выход")
+    print()
     while True:
-        choice = input("Выберите опцию (1-3): ").strip()
-        if choice in ("1", "2", "3"):
+        choice = input("  Введите номер (1–5) или q для выхода: ").strip().lower()
+        if choice in ("q", "выход", "exit", "quit"):
+            return "5"
+        if choice in ("1", "2", "3", "4", "5"):
             return choice
-        print("Пожалуйста, выберите корректную опцию (1, 2 или 3).")
+        print("  ⚠ Введите число от 1 до 5 или q для выхода.")
 
 
 def main():
     repo_root = Path(__file__).resolve().parent.parent
-    print_step("Мастер настройки и запуска генерации отчёта Ozon")
+    print()
+    print("  " + "=" * 50)
+    print("  🛒  OzonReportX — отчёты и управление ценами Ozon")
+    print("  " + "=" * 50)
     
     parser = argparse.ArgumentParser(add_help=False)
     group = parser.add_mutually_exclusive_group()
@@ -318,47 +347,87 @@ def main():
     venv_python, venv_created = ensure_venv(repo_root)
     ensure_deps(venv_python, repo_root)
     
-    # Проверка обновлений сразу после установки зависимостей
     check_for_updates(venv_python, repo_root)
     
-    choice = select_menu_option()
-    if choice == "1":
-        print_step("Выбран Месячный отчёт по продажам.")
-        print_step("Мастер настройки и запуска генерации отчёта Ozon")
-        try:
-            env_created = ensure_env(repo_root)
-            costs_created = ensure_costs(venv_python, repo_root)
-            ensure_reports_dir(repo_root)
-            # Спрашиваем разрешение на запуск только при самом первом конфигурировании
-            if venv_created or env_created or costs_created:
-                if prompt_yes_no("Можно начинать формирование отчёта?", default_yes=True):
-                    run_report(venv_python, repo_root)
+    while True:
+        choice = select_menu_option()
+        if choice == "5":
+            print("\n  👋 Выход из программы.")
+            return
+        if choice == "1":
+            print_step("Месячный отчёт по продажам")
+            try:
+                env_created = ensure_env(repo_root)
+                costs_created = ensure_costs(venv_python, repo_root)
+                ensure_reports_dir(repo_root)
+                if venv_created or env_created or costs_created:
+                    if prompt_yes_no("Можно начинать формирование отчёта?", default_yes=True):
+                        run_report(venv_python, repo_root)
+                    else:
+                        print("Окей, запуск отчёта отменён. Вы можете запустить позже: run.bat или python config/first_run_setup.py")
                 else:
-                    print("Окей, запуск отчёта отменён. Вы можете запустить позже: run.bat или python config/first_run_setup.py")
-            else:
-                run_report(venv_python, repo_root)
-        except KeyboardInterrupt:
-            print("\nОперация прервана пользователем.")
-        except Exception as e:
-            print(f"\nОшибка: {e}")
-            sys.exit(1)
-    elif choice == "2":
-        print_step("Выбран ABC&XYZ-анализ.")
-        try:
-            ensure_env(repo_root)
-            ensure_costs(venv_python, repo_root)
-            ensure_reports_dir(repo_root)
-            from_month, from_year, to_month, to_year = ask_abc_xyz_date_range()
-            run_abc_xyz(venv_python, repo_root, from_month, from_year, to_month, to_year)
-        except KeyboardInterrupt:
-            print("\nОперация прервана пользователем.")
-        except Exception as e:
-            print(f"\nОшибка: {e}")
-            sys.exit(1)
-        return
-    if choice == "3":
-        print("Выход из программы.")
-        return
+                    run_report(venv_python, repo_root)
+            except KeyboardInterrupt:
+                print("\nОперация прервана пользователем.")
+            except Exception as e:
+                print(f"\nОшибка: {e}")
+                sys.exit(1)
+            continue
+        if choice == "2":
+            print_step("ABC&XYZ-анализ")
+            try:
+                ensure_env(repo_root)
+                ensure_costs(venv_python, repo_root)
+                ensure_reports_dir(repo_root)
+                from_month, from_year, to_month, to_year = ask_abc_xyz_date_range()
+                run_abc_xyz(venv_python, repo_root, from_month, from_year, to_month, to_year)
+            except KeyboardInterrupt:
+                print("\nОперация прервана пользователем.")
+            except Exception as e:
+                print(f"\nОшибка: {e}")
+                sys.exit(1)
+            continue
+        if choice == "3":
+            print_step("Рассчитать поставку FBO")
+            try:
+                ensure_env(repo_root)
+                ensure_reports_dir(repo_root)
+                fbo_script = repo_root / "scripts" / "fbo_supply_report.py"
+                if fbo_script.exists():
+                    run(
+                        [str(venv_python), str(fbo_script)],
+                        cwd=repo_root,
+                    )
+                else:
+                    print("⚠️ Модуль расчёта поставок FBO не найден.")
+            except KeyboardInterrupt:
+                print("\nОперация прервана пользователем.")
+            except Exception as e:
+                print(f"\nОшибка: {e}")
+                import traceback
+                print(traceback.format_exc())
+            continue
+        if choice == "4":
+            print_step("Управление ценой")
+            try:
+                ensure_costs(venv_python, repo_root)
+                ensure_env(repo_root)
+                ensure_reports_dir(repo_root)
+                price_management_script = repo_root / "scripts" / "price_management.py"
+                if price_management_script.exists():
+                    run(
+                        [str(venv_python), str(price_management_script)],
+                        cwd=repo_root,
+                    )
+                else:
+                    print("⚠️ Модуль управления ценой не найден.")
+            except KeyboardInterrupt:
+                print("\nОперация прервана пользователем.")
+            except Exception as e:
+                print(f"\nОшибка: {e}")
+                import traceback
+                print(traceback.format_exc())
+            continue
     
 
 

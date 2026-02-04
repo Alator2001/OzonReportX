@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 _PROMPT_FORCE: Optional[bool] = None
+
+# Тихий режим: минимум вывода. OZON_VERBOSE=1 — подробный вывод.
+VERBOSE = os.environ.get("OZON_VERBOSE", "").strip().lower() in ("1", "true", "yes")
 
 
 def set_prompt_force(value: Optional[bool]) -> None:
@@ -10,8 +14,15 @@ def set_prompt_force(value: Optional[bool]) -> None:
     _PROMPT_FORCE = value
 
 
-def print_step(title: str):
-    print(f"\n=== {title} ===")
+def log_verbose(msg: str) -> None:
+    """Печатает только при OZON_VERBOSE=1."""
+    if VERBOSE:
+        print(msg)
+
+
+def print_step(title: str) -> None:
+    """Короткий заголовок шага (без шума)."""
+    print(f"\n· {title}")
 
 
 def prompt_yes_no(message: str, default_yes: bool = True) -> bool:

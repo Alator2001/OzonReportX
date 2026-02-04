@@ -67,6 +67,22 @@ def get_custom_date_range():
 
 
 
+def _normalize_articul_key(s: str) -> str:
+    """Приводит артикул к одному виду для сопоставления (Excel даёт 12345.0, API — 12345)."""
+    if not s or not isinstance(s, str):
+        return (s or "").strip()
+    s = s.strip()
+    if s.lower() == 'nan':
+        return ""
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+        return s
+    except (ValueError, TypeError):
+        return s
+
+
 # 📄 Загрузка карты себестоимости из внешнего файла
 def load_cost_map():
     script_dir = os.path.dirname(__file__)
@@ -105,8 +121,9 @@ def load_cost_map():
 
                 mapping = {}
                 for _, row in df.iterrows():
-                    key = str(row.get(key_col, '')).strip()
-                    if not key or key.lower() == 'nan':
+                    raw = row.get(key_col, '')
+                    key = _normalize_articul_key(str(raw).strip() if raw is not None else '')
+                    if not key:
                         continue
                     try:
                         value = float(row.get(cost_col, 0) or 0)
@@ -435,15 +452,12 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
         # Себестоимость (по всем товарам, со знаком минус)
         cost_price = 0.0
         for it in items:
-            oid = str(it.get("offer_id", ""))
+            oid = str(it.get("offer_id", "") or "").strip()
             q = int(it.get("quantity", 0) or 0)
 
-            # 1) Пытаемся найти точное совпадение по offer_id
-            unit_cost = None
-            if oid in cost_map:
-                unit_cost = float(cost_map.get(oid, 0))
-
-            unit_cost = unit_cost if unit_cost is not None else 0.0
+            # Совпадение по offer_id (ключ нормализован: 12345 и 12345.0 из Excel → один ключ)
+            oid_norm = _normalize_articul_key(oid)
+            unit_cost = float(cost_map.get(oid_norm, 0) or 0) if oid_norm else 0.0
             cost_price -= unit_cost * q
 
         # Агрегация транзакций по заказу (без дублей, без эквайринга)
@@ -482,12 +496,13 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
             delivery_cost_cell = - amount + price + sale_commission
             profit_cell = amount + cost_price
             # Если при доставленном заказе прибыль получилась отрицательной —
-            # считаем, что заказ по сути отменён: прибыль = стоимость логистики,
-            # себестоимость = 0, статус меняем на cancelled.
+            # считаем, что заказ по сути возврат: убыток = минус стоимость логистики,
+            # себестоимость = 0, статус меняем на returned.
             if profit_cell < 0:
                 status = "returned"
                 cost_price = 0.0
-                profit_cell = delivery_cost_cell
+                # Итоговая прибыль при возврате — всегда со знаком минус (убыток)
+                profit_cell = -abs(delivery_cost_cell)
         else:
             amount_cell = "-"
             sale_commission_cell = "-"
