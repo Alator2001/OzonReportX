@@ -171,16 +171,36 @@ def action_calculate_optimal_prices(repo_root: Path) -> bool:
     # Рассчитываем цены
     min_prices = []
     desired_prices = []
-    
-    for _, row in df.iterrows():
+
+    def _parse_cost(val):
+        """Преобразует значение себестоимости в float (поддержка запятой как разделителя)."""
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip().replace(",", ".")
+        if not s or s.lower() == "nan":
+            return 0.0
         try:
-            cost_val = float(row.get(cost_col, 0) or 0)
+            return float(s)
         except (TypeError, ValueError):
-            cost_val = 0.0
+            return 0.0
+
+    for _, row in df.iterrows():
+        raw = row.get(cost_col, 0)
+        cost_val = _parse_cost(raw)
         min_p, des_p = compute_prices(cost_val, total_rate, min_margin, desired_margin)
         min_prices.append(min_p)
         desired_prices.append(des_p)
-    
+
+    # Если ни одна цена не посчиталась — предупреждаем
+    filled_min = sum(1 for p in min_prices if p is not None)
+    if filled_min == 0 and len(df) > 0:
+        print("⚠️ Не удалось рассчитать ни одной цены. Проверьте:")
+        print(f"   — столбец «{cost_col}»: все значения должны быть положительными числами (можно с запятой);")
+        print(f"   — комиссия+логистика из отчёта: {total_rate*100:.1f}%. Сумма с маржой не должна превышать 100%.")
+        print(f"   (Маржа мин/жел: {min_margin*100:.0f}% / {desired_margin*100:.0f}%).")
+
     # Обновляем колонки
     if COL_MIN_PRICE in df.columns:
         df = df.drop(columns=[COL_MIN_PRICE])
@@ -694,13 +714,8 @@ def action_add_to_actions(repo_root: Path) -> bool:
         print("⚠️ Не найдено товаров с рассчитанными ценами.")
         return False
     
-    print(f"✅ Товаров с ценами: {len(product_id_to_prices)}, акций: {len(actions_info_list)}")
-    if not prompt_yes_no("Продолжить добавление товаров в акции?", default_yes=False):
-        print("❌ Добавление отменено.")
-        return False
-    
     log_verbose("Проверка кандидатов для добавления в акции...")
-    total_added = 0
+    preview_rows = []
     for action_info in actions_info_list:
         action_id = action_info["id"]
         action_name = action_info["name"]
@@ -729,12 +744,46 @@ def action_add_to_actions(repo_root: Path) -> bool:
                 current_action_price = product_info.get("action_price", 0)
                 if current_action_price == 0 or current_action_price is None:
                     stock = product_info.get("stock", 0) or 0
+                    offer_id = product_id_to_offer_id.get(product_id, "—")
                     products_to_add.append({
                         "product_id": product_id,
                         "action_price": int(target_price),
                         "stock": int(stock) if stock else 0
                     })
-        
+                    preview_rows.append({
+                        "product_id": product_id,
+                        "offer_id": offer_id,
+                        "action_name": action_name,
+                        "action_price": int(target_price),
+                        "stock": int(stock) if stock else 0,
+                    })
+
+    if not preview_rows:
+        print("⚠️ Не найдено товаров, которые можно добавить в акции.")
+        return False
+
+    print("✅ Кандидаты для добавления в акции:")
+    for row in preview_rows:
+        print(f"   {row['offer_id']} | {row['action_name']} | {row['action_price']}")
+
+    if not prompt_yes_no("Продолжить добавление товаров в акции?", default_yes=False):
+        print("❌ Добавление отменено.")
+        return False
+
+    total_added = 0
+    for action_info in actions_info_list:
+        action_id = action_info["id"]
+        action_name = action_info["name"]
+        products_to_add = []
+        for row in preview_rows:
+            if row["action_name"] != action_name:
+                continue
+            products_to_add.append({
+                "product_id": row["product_id"],
+                "action_price": row["action_price"],
+                "stock": row["stock"],
+            })
+
         if products_to_add:
             result = activate_products_in_action(action_id, products_to_add)
             added = result.get("product_ids", []) or []
@@ -743,6 +792,17 @@ def action_add_to_actions(repo_root: Path) -> bool:
             log_verbose(f"Акция {action_name}: добавлено {len(added)}, не добавлено {len(rejected)}")
     print(f"✅ Добавление в акции завершено. Всего добавлено: {total_added} товаров.")
     return True
+
+
+def action_get_current_prices_and_actions(repo_root: Path) -> bool:
+    """
+    Действие: Узнать текущие цены и акции.
+    Последовательно обновляет текущие цены продажи и активные акции в costs.xlsx.
+    """
+    print_step("Узнать текущие цены и акции")
+    prices_ok = action_get_current_prices(repo_root)
+    actions_ok = action_get_active_actions(repo_root)
+    return bool(prices_ok and actions_ok)
 
 
 def action_process_discount_requests(repo_root: Path) -> bool:
@@ -952,6 +1012,12 @@ def action_process_discount_requests(repo_root: Path) -> bool:
     return True
 
 
+def refresh_costs_views(repo_root: Path) -> None:
+    """Обновляет данные по текущим ценам и активным акциям в costs.xlsx."""
+    print_step("Обновление costs.xlsx после изменений")
+    action_get_current_prices_and_actions(repo_root)
+
+
 def show_price_management_menu(repo_root: Path):
     """
     Показывает меню управления ценой и обрабатывает выбор пользователя.
@@ -960,33 +1026,32 @@ def show_price_management_menu(repo_root: Path):
         print_step("Управление ценой")
         print("1. Диапазон рентабельности")
         print("2. Рассчитать оптимальную цену")
-        print("3. Узнать текущую цену продажи")
-        print("4. Узнать активные акции")
-        print("5. Удалить невыгодные акции")
-        print("6. Добавить товары в акции")
-        print("7. Обработать заявки на скидку")
-        print("8. Назад в главное меню")
+        print("3. Узнать текущие цены и акции")
+        print("4. Удалить невыгодные акции")
+        print("5. Добавить товары в акции")
+        print("6. Обработать заявки на скидку")
+        print("0. Назад в главное меню")
         
-        choice = input("Выберите опцию (1-8): ").strip()
+        choice = input("Выберите опцию (0-6): ").strip()
         
         if choice == "1":
             action_set_margin_range(repo_root)
         elif choice == "2":
             action_calculate_optimal_prices(repo_root)
         elif choice == "3":
-            action_get_current_prices(repo_root)
+            action_get_current_prices_and_actions(repo_root)
         elif choice == "4":
-            action_get_active_actions(repo_root)
+            if action_remove_unprofitable_actions(repo_root):
+                refresh_costs_views(repo_root)
         elif choice == "5":
-            action_remove_unprofitable_actions(repo_root)
+            if action_add_to_actions(repo_root):
+                refresh_costs_views(repo_root)
         elif choice == "6":
-            action_add_to_actions(repo_root)
-        elif choice == "7":
             action_process_discount_requests(repo_root)
-        elif choice == "8":
+        elif choice == "0":
             break
         else:
-            print("Пожалуйста, выберите корректную опцию (1-8).")
+            print("Пожалуйста, выберите корректную опцию (0-6).")
         
         print()  # Пустая строка для читаемости
 

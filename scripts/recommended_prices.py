@@ -564,7 +564,7 @@ def get_actions_for_products(
         print("⚠️ Не найдено активных акций.")
         return {}, [], {}
     
-    print(f"✅ Найдено {len(actions)} акций")
+    log_verbose(f"Найдено {len(actions)} акций")
     log_verbose("Получение товаров в акциях...")
     
     # Создаём маппинг product_id -> offer_id для кэширования
@@ -642,9 +642,9 @@ def get_actions_for_products(
             actions_by_offer[offer_id][action_name] = action_price
     
     if actions_by_offer:
-        print(f"✅ В акциях: {len(actions_by_offer)} артикулов")
+        log_verbose(f"В акциях: {len(actions_by_offer)} артикулов")
     else:
-        print("⚠️ Не найдено товаров из вашего списка в активных акциях.")
+        log_verbose("Не найдено товаров из вашего списка в активных акциях.")
     
     # Обратный маппинг offer_id -> product_id
     offer_id_to_product_id: Dict[str, int] = {}
@@ -930,7 +930,7 @@ def get_report_path(repo_root: Path, year: int, month: int) -> Path:
 
 def load_rates_from_report(report_path: Path) -> float:
     """
-    Читает значения «Комиссии Ozon %» (Q14) и «Логистика %» (Q15) из листа «Заказы»
+    Читает значения «Комиссии Ozon %» (Q15) и «Логистика %» (Q16) из листа «Заказы»
     месячного отчёта и возвращает их сумму в виде десятичной доли (например, 0.15 для 15%).
     """
     if not report_path.exists():
@@ -955,14 +955,14 @@ def load_rates_from_report(report_path: Path) -> float:
 
     ws = wb[ORDER_SHEET]
 
-    # Читаем значения из ячеек Q14 (Комиссии Ozon %) и Q15 (Логистика %)
-    commission_pct = ws["Q14"].value
-    logistics_pct = ws["Q15"].value
+    # Читаем значения из ячеек Q15 (Комиссии Ozon %) и Q16 (Логистика %)
+    commission_pct = ws["Q15"].value
+    logistics_pct = ws["Q16"].value
     
     # Если значения не прочитались, пробуем альтернативный способ через pandas
     if commission_pct is None or logistics_pct is None:
         try:
-            df_summary = pd.read_excel(report_path, sheet_name=ORDER_SHEET, header=None, usecols="P:Q", skiprows=13, nrows=2)
+            df_summary = pd.read_excel(report_path, sheet_name=ORDER_SHEET, header=None, usecols="P:Q", skiprows=14, nrows=2)
             if len(df_summary) >= 2:
                 if pd.notna(df_summary.iloc[0, 1]):
                     commission_pct = df_summary.iloc[0, 1]
@@ -1006,8 +1006,8 @@ def load_rates_from_report(report_path: Path) -> float:
         error_msg = (
             f"\n❌ ОШИБКА: Не удалось прочитать значения комиссии и логистики из отчёта.\n"
             f"   Файл: {report_path.name}\n"
-            f"   Комиссия Ozon % (Q14): {commission_pct_raw}\n"
-            f"   Логистика % (Q15): {logistics_pct_raw}\n\n"
+            f"   Комиссия Ozon % (Q15): {commission_pct_raw}\n"
+            f"   Логистика % (Q16): {logistics_pct_raw}\n\n"
             f"   Возможные причины:\n"
             f"   1. Отчёт не был сохранён после генерации (формулы не вычислены)\n"
             f"   2. В отчёте отсутствуют данные о комиссиях и логистике\n"

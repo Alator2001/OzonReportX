@@ -148,6 +148,15 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent))
     from performance_api import get_cpc_campaigns_for_month, get_campaigns_data_for_excel  # type: ignore
 
+# Импорт функций для получения расходов из отчёта о балансе
+try:
+    from scripts.balance_report import get_star_products_for_month, get_product_placement_in_ozon_warehouses_for_month  # type: ignore
+except ImportError:
+    from pathlib import Path
+    import sys
+    sys.path.append(str(Path(__file__).resolve().parent))
+    from balance_report import get_star_products_for_month, get_product_placement_in_ozon_warehouses_for_month  # type: ignore
+
 # 📥 Получаем список заказов FBS (Fulfillment by Seller)
 def _fetch_fbs_page(session: requests.Session, date_from: str, date_to: str, status: str, limit: int, offset: int) -> List[Dict[str, Any]]:
     url = 'https://api-seller.ozon.ru/v3/posting/fbs/list'
@@ -649,7 +658,32 @@ def calc_business_indicators(filename, session: Optional[requests.Session] = Non
         except ValueError:
             print("❌ Некорректное число. Используем 0.")
             ozon_promotion_cost = 0.0
-    
+
+    # Расходы по «Звёздным товарам» из отчёта о балансе (за месяц, с разбивкой по 30 дней)
+    # В отчёте показываем со знаком плюс (как Продвижение Ozon)
+    star_products_cost = 0.0
+    fbo_storage_cost = 0.0
+    if date_from and date_to:
+        try:
+            # date_from вида "2025-02-01T00:00:00Z"
+            parts = date_from.split("T")[0].split("-")
+            if len(parts) == 3:
+                year = int(parts[0])
+                month = int(parts[1])
+                raw = get_star_products_for_month(month, year)
+                star_products_cost = abs(float(raw))
+                if star_products_cost > 0:
+                    print(f"💰 Звёздные товары (из отчёта о балансе): {star_products_cost:.2f} ₽")
+                raw_storage = get_product_placement_in_ozon_warehouses_for_month(month, year)
+                fbo_storage_cost = abs(float(raw_storage))
+                if fbo_storage_cost > 0:
+                    print(f"💰 Расход хранения FBO (из отчёта о балансе): {fbo_storage_cost:.2f} ₽")
+        except Exception as e:
+            print(f"⚠️ Не удалось получить данные из баланса: {e}")
+
+    # Продвижение Ozon = CPC + Звёздные товары
+    ozon_promotion_total = ozon_promotion_cost + star_products_cost
+
     # Запрашиваем затраты на внешний маркетинг (кампании не на Ozon)
     external_marketing_cost = 0.0
     print("Введите сумму затрат на внешний маркетинг за месяц (кампании не на Ozon, или Enter для 0):")
@@ -730,9 +764,9 @@ def calc_business_indicators(filename, session: Optional[requests.Session] = Non
     avg_commission_pct = (sum(ratios_commission_pct) / len(ratios_commission_pct)) if ratios_commission_pct else 0
     avg_logistics_pct = (sum(ratios_logistics_pct) / len(ratios_logistics_pct)) if ratios_logistics_pct else 0
 
-    # Вычитаем затраты на продвижение Ozon и внешний маркетинг из чистой прибыли
-    total_marketing_cost = ozon_promotion_cost + external_marketing_cost
-    net_profit = net_profit - total_marketing_cost
+    # Вычитаем затраты на продвижение Ozon (CPC + Звёздные товары) и внешний маркетинг из чистой прибыли
+    total_marketing_cost = ozon_promotion_total + external_marketing_cost
+    net_profit = net_profit - total_marketing_cost - fbo_storage_cost
     net_profit_margin = (net_profit / sales_revenue) * 100 if sales_revenue > 0 else 0
     cogs = sales_revenue + cost_price
     gross_profit_margin = (cogs / sales_revenue) * 100 if sales_revenue > 0 else 0
@@ -754,22 +788,26 @@ def calc_business_indicators(filename, session: Optional[requests.Session] = Non
     ws["P7"] = "Операционные расходы"
     ws["Q7"] = operating_expenses
     ws["P8"] = "Продвижение Ozon"
-    ws["Q8"] = ozon_promotion_cost
-    ws["P9"] = "Внешний маркетинг"
-    ws["Q9"] = external_marketing_cost
+    ws["Q8"] = ozon_promotion_total
+    ws["P9"] = "Звёздные товары"
+    ws["Q9"] = star_products_cost
+    ws["P10"] = "Внешний маркетинг"
+    ws["Q10"] = external_marketing_cost
 
-    ws["P10"] = "Средний чек"
-    ws["Q10"] = average_check
-    ws["P11"] = "Общее количество заказов"
-    ws["Q11"] = total_orders
-    ws["P12"] = "Количество отменённых заказов"
-    ws["Q12"] = cancelled_returned_count
-    ws["P13"] = "Количество доставленных заказов"
-    ws["Q13"] = delivered_count
-    ws["P14"] = "Комиссии Ozon %"
-    ws["Q14"] = avg_commission_pct
-    ws["P15"] = "Логистика %"
-    ws["Q15"] = avg_logistics_pct
+    ws["P11"] = "Средний чек"
+    ws["Q11"] = average_check
+    ws["P12"] = "Общее количество заказов"
+    ws["Q12"] = total_orders
+    ws["P13"] = "Количество отменённых заказов"
+    ws["Q13"] = cancelled_returned_count
+    ws["P14"] = "Количество доставленных заказов"
+    ws["Q14"] = delivered_count
+    ws["P15"] = "Комиссии Ozon %"
+    ws["Q15"] = avg_commission_pct
+    ws["P16"] = "Логистика %"
+    ws["Q16"] = avg_logistics_pct
+    ws["P17"] = "Расход хранения FBO"
+    ws["Q17"] = fbo_storage_cost
 
     # Сохраняем изменения
     wb.save(filename)
