@@ -6,3 +6,6 @@ merged.xlsx
 /scripts/__pycache__
 scripts/__pycache__/performance_api.cpython-314.pyc
 /ABC&XYZ reports
+/stocks reports
+margin_settings.json
+/balance reports
