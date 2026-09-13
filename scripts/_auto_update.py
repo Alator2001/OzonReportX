@@ -7,6 +7,7 @@ import os
 import zipfile
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from packaging import version
 
@@ -119,37 +120,63 @@ def apply_update(source_dir, repo_root):
     print("Установка обновления...")
     
     # Список файлов и папок, которые НЕ нужно обновлять
-    preserve = {'.venv', '.git', '__pycache__', 'reports', '.env', 
+    preserve = {'.venv', '.git', '__pycache__', 'reports', '.env',
                 'costs.xlsx', 'costs.csv', 'version.txt', 'updater.log',
-                'backup_*'}
-    
-    updated_count = 0
-    
-    for item in source_dir.iterdir():
-        # Пропускаем защищённые файлы
-        if any(item.match(pattern) for pattern in preserve):
-            continue
-        
-        dest = repo_root / item.name
-        
-        try:
-            if dest.exists():
-                if dest.is_dir():
-                    shutil.rmtree(dest)
-                else:
-                    dest.unlink()
-            
+                'backup_*', '.cache', 'margin_settings.json',
+                'ABC&XYZ reports', 'stocks reports', 'balance reports'}
+    repo_root = Path(repo_root).resolve()
+    items = [item for item in source_dir.iterdir()
+             if not any(item.match(pattern) for pattern in preserve)]
+    # Finish copying before touching the installed version. Keep displaced files for rollback.
+    staging = Path(tempfile.mkdtemp(prefix="ozon_update_", dir=repo_root.parent))
+    keep_staging = False
+    try:
+        pending = staging / "pending"
+        previous = staging / "previous"
+        pending.mkdir()
+        previous.mkdir()
+        for item in items:
             if item.is_dir():
-                shutil.copytree(item, dest)
+                shutil.copytree(item, pending / item.name)
             else:
-                shutil.copy2(item, dest)
-            
-            updated_count += 1
-            
-        except Exception as e:
-            print(f"⚠ Не удалось обновить {item.name}: {e}")
-    
-    print(f"✓ Обновлено файлов: {updated_count}")
+                shutil.copy2(item, pending / item.name)
+
+        applied = []
+        try:
+            for item in items:
+                dest = repo_root / item.name
+                if dest.resolve().parent != repo_root:
+                    raise RuntimeError(f"Недопустимый путь обновления: {dest}")
+                old = previous / item.name
+                existed = dest.exists()
+                if existed:
+                    os.replace(dest, old)
+                applied.append((dest, old, existed))
+                os.replace(pending / item.name, dest)
+        except Exception as install_error:
+            rollback_errors = []
+            for dest, old, existed in reversed(applied):
+                try:
+                    if dest.is_dir():
+                        shutil.rmtree(dest)
+                    else:
+                        dest.unlink(missing_ok=True)
+                    if existed:
+                        os.replace(old, dest)
+                except OSError as exc:
+                    rollback_errors.append(f"{dest.name}: {exc}")
+            if rollback_errors:
+                keep_staging = True
+                raise RuntimeError(
+                    f"Ошибка установки и отката. Сохранены файлы для восстановления: {previous}. "
+                    + "; ".join(rollback_errors)
+                ) from install_error
+            raise
+    finally:
+        if not keep_staging:
+            shutil.rmtree(staging)
+
+    print(f"✓ Обновлено файлов: {len(items)}")
 
 
 def update_version_file(new_version):

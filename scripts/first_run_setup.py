@@ -3,6 +3,7 @@ import sys
 import subprocess
 from pathlib import Path
 import argparse
+import hashlib
 
 try:
     from scripts.utils import print_step, prompt_yes_no, set_prompt_force, log_verbose, VERBOSE  # type: ignore
@@ -29,8 +30,6 @@ def check_for_updates(venv_python: Path, repo_root: Path):
         result = subprocess.run(
             [str(venv_python), str(auto_update_file)],
             cwd=repo_root,
-            timeout=60,
-            capture_output=not VERBOSE,
         )
         if result.returncode == 0:
             log_verbose("Проверка обновлений завершена.")
@@ -67,26 +66,16 @@ def ensure_venv(repo_root: Path) -> tuple[Path, bool]:
 def ensure_deps(venv_python: Path, repo_root: Path):
     venv_dir = Path(venv_python).resolve().parent.parent
     bootstrap_marker = venv_dir / ".bootstrap_done"
-    if bootstrap_marker.exists():
+    req = repo_root / "config" / "requirements.txt"
+    fingerprint = hashlib.sha256(req.read_bytes()).hexdigest()
+    if bootstrap_marker.exists() and bootstrap_marker.read_text(encoding="utf-8").strip() == fingerprint:
         log_verbose("Зависимости уже установлены.")
         return
     print_step("Установка зависимостей")
     run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], cwd=repo_root, quiet=True)
-    config_dir = Path(__file__).resolve().parent
-    req = config_dir / "requirements.txt"
-    if req.exists():
-        run([str(venv_python), "-m", "pip", "install", "-r", str(req)], cwd=repo_root, quiet=True)
-    else:
-        run(
-            [
-                str(venv_python), "-m", "pip", "install",
-                "requests", "pandas", "openpyxl", "python-dateutil", "python-dotenv", "packaging",
-            ],
-            cwd=repo_root,
-            quiet=True,
-        )
+    run([str(venv_python), "-m", "pip", "install", "-r", str(req)], cwd=repo_root, quiet=True)
     try:
-        bootstrap_marker.write_text("ok", encoding="utf-8")
+        bootstrap_marker.write_text(fingerprint, encoding="utf-8")
     except Exception:
         pass
 
@@ -123,8 +112,8 @@ def ensure_costs(venv_python, repo_root: Path) -> bool:
 
     print_step("Создание шаблона себестоимости costs.xlsx")
     create_cmd = (
-        "import sys; "
-        f"path=r'{str(costs_xlsx)}'; "
+        "import sys\n"
+        "path = sys.argv[1]\n"
         "try:\n"
         "    import pandas as pd\n"
         "    df = pd.DataFrame(columns=['артикул', 'себестоимость'])\n"
@@ -137,7 +126,7 @@ def ensure_costs(venv_python, repo_root: Path) -> bool:
         "    wb.save(path)\n"
     )
     result = subprocess.run(
-        [str(venv_python), "-c", create_cmd],
+        [str(venv_python), "-c", create_cmd, str(costs_xlsx)],
         cwd=repo_root,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -208,7 +197,7 @@ def list_report_files(repo_root: Path, folder_name: str) -> list[Path]:
     folder = repo_root / folder_name
     if not folder.exists():
         return []
-    return sorted(folder.glob("*.xlsx"), key=lambda p: p.name)
+    return sorted((p for p in folder.glob("*.xlsx") if p.is_file() and not p.name.startswith(("~$", "~tmp_"))), key=lambda p: p.name)
 
 
 def print_system_status(repo_root: Path):
@@ -255,22 +244,23 @@ def print_main_screen(repo_root: Path):
     print()
     print("Разделы")
     print("1. Отчёты")
-    print("2. Цены и акции")
-    print("3. Поставки")
-    print("4. Финансы")
-    print("5. Настройки")
-    print("6. Выход")
+    print("2. Цены и скидки")
+    print("3. Акции")
+    print("4. Поставки")
+    print("5. Финансы")
+    print("6. Настройки")
+    print("7. Выход")
     print()
 
 
 def select_main_menu_option() -> str:
     while True:
-        choice = input("Введите номер раздела (1-6) или q для выхода: ").strip().lower()
-        if choice in ("q", "quit", "exit", "6"):
-            return "6"
-        if choice in ("1", "2", "3", "4", "5"):
+        choice = input("Введите номер раздела (1-7) или q для выхода: ").strip().lower()
+        if choice in ("q", "quit", "exit", "7"):
+            return "7"
+        if choice in ("1", "2", "3", "4", "5", "6"):
             return choice
-        print("Введите число от 1 до 6.")
+        print("Введите число от 1 до 7.")
 
 
 def run_report(venv_python: Path, repo_root: Path):
@@ -373,6 +363,14 @@ def run_update_prices(venv_python: Path, repo_root: Path):
     run([str(venv_python), str(script)], cwd=repo_root)
 
 
+def run_ui_action(venv_python: Path, repo_root: Path, command: str):
+    script = repo_root / "scripts" / "ui_actions.py"
+    if not script.exists():
+        print("Скрипт ui_actions.py не найден.")
+        return
+    run([str(venv_python), str(script), command], cwd=repo_root)
+
+
 def ensure_base_requirements(venv_python: Path, repo_root: Path, need_costs: bool = False):
     ensure_env(repo_root)
     if need_costs:
@@ -446,8 +444,9 @@ def run_balance_report_flow(venv_python: Path, repo_root: Path):
         print("Операция отменена.")
 
 
-def run_price_management_flow(venv_python: Path, repo_root: Path):
-    print_step("Цены и акции")
+def run_price_management_flow(venv_python: Path, repo_root: Path, menu: str = "all"):
+    section_title = "Цены и акции" if menu == "all" else "Цены и скидки" if menu == "pricing" else "Акции"
+    print_step(section_title)
     ensure_costs(venv_python, repo_root)
     ensure_env(repo_root)
     ensure_reports_dir(repo_root)
@@ -455,7 +454,10 @@ def run_price_management_flow(venv_python: Path, repo_root: Path):
     if not price_management_script.exists():
         print("Модуль управления ценами не найден.")
         return
-    run([str(venv_python), str(price_management_script)], cwd=repo_root)
+    command = [str(venv_python), str(price_management_script)]
+    if menu != "all":
+        command.extend(["--menu", menu])
+    run(command, cwd=repo_root)
 
 
 def show_reports_menu(venv_python: Path, repo_root: Path, venv_created: bool):
@@ -481,17 +483,18 @@ def show_reports_menu(venv_python: Path, repo_root: Path, venv_created: bool):
 def show_pricing_menu(venv_python: Path, repo_root: Path):
     while True:
         choice = choose_menu(
-            "ЦЕНЫ И АКЦИИ",
+            "ЦЕНЫ И СКИДКИ",
             [
-                "Открыть раздел управления ценами и акциями",
+                "Открыть раздел цен и скидок",
                 "Рассчитать рекомендованные цены",
                 "Обновить минимальные цены на Ozon",
+                "Обработать заявки на скидку",
             ],
         )
         if choice == "0":
             return
         if choice == "1":
-            run_price_management_flow(venv_python, repo_root)
+            run_price_management_flow(venv_python, repo_root, menu="pricing")
         elif choice == "2":
             ensure_costs(venv_python, repo_root)
             ensure_env(repo_root)
@@ -501,6 +504,34 @@ def show_pricing_menu(venv_python: Path, repo_root: Path):
             ensure_costs(venv_python, repo_root)
             ensure_env(repo_root)
             run_update_prices(venv_python, repo_root)
+        elif choice == "4":
+            ensure_costs(venv_python, repo_root)
+            ensure_env(repo_root)
+            ensure_reports_dir(repo_root)
+            run_ui_action(venv_python, repo_root, "discount-requests")
+
+
+def show_actions_menu(venv_python: Path, repo_root: Path):
+    while True:
+        choice = choose_menu(
+            "АКЦИИ",
+            [
+                "Синхронизировать текущие цены и акции",
+                "Удалить невыгодные акции",
+                "Добавить товары в акции",
+            ],
+        )
+        if choice == "0":
+            return
+        ensure_costs(venv_python, repo_root)
+        ensure_env(repo_root)
+        ensure_reports_dir(repo_root)
+        if choice == "1":
+            run_ui_action(venv_python, repo_root, "refresh-pricing")
+        elif choice == "2":
+            run_ui_action(venv_python, repo_root, "remove-unprofitable-actions")
+        elif choice == "3":
+            run_ui_action(venv_python, repo_root, "add-to-actions")
 
 
 def show_supply_menu(venv_python: Path, repo_root: Path):
@@ -565,6 +596,7 @@ def main():
     repo_root = Path(__file__).resolve().parent.parent
 
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--setup-only", action="store_true", help="Подготовить окружение без открытия меню")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--yes", action="store_true", help="Автоматически отвечать Да на все вопросы")
     group.add_argument("--no", action="store_true", help="Автоматически отвечать Нет на все вопросы")
@@ -578,24 +610,28 @@ def main():
 
     venv_python, venv_created = ensure_venv(repo_root)
     ensure_deps(venv_python, repo_root)
+    if args.setup_only:
+        return
     check_for_updates(venv_python, repo_root)
 
     while True:
         print_main_screen(repo_root)
         choice = select_main_menu_option()
-        if choice == "6":
+        if choice == "7":
             print("\nВыход из программы.")
             return
         try:
             if choice == "1":
                 show_reports_menu(venv_python, repo_root, venv_created)
             elif choice == "2":
-                run_price_management_flow(venv_python, repo_root)
+                show_pricing_menu(venv_python, repo_root)
             elif choice == "3":
-                show_supply_menu(venv_python, repo_root)
+                show_actions_menu(venv_python, repo_root)
             elif choice == "4":
-                show_finance_menu(venv_python, repo_root)
+                show_supply_menu(venv_python, repo_root)
             elif choice == "5":
+                show_finance_menu(venv_python, repo_root)
+            elif choice == "6":
                 show_settings_menu(venv_python, repo_root)
         except KeyboardInterrupt:
             print("\nОперация прервана пользователем.")

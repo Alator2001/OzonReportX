@@ -3,10 +3,11 @@
 Модуль управления ценами - разделение логики на отдельные действия.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Добавляем путь к scripts для импорта
 script_dir = Path(__file__).resolve().parent
@@ -67,6 +68,9 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter
+from file_io import write_costs_dataframe, save_workbook_atomic
+from file_lock import locked_costs
+from contextlib import ExitStack, closing
 
 
 def action_set_margin_range(repo_root: Path) -> Tuple[float, float]:
@@ -125,6 +129,7 @@ def action_set_margin_range(repo_root: Path) -> Tuple[float, float]:
     return min_margin, desired_margin
 
 
+@locked_costs
 def action_calculate_optimal_prices(repo_root: Path) -> bool:
     """
     Действие 2: Рассчитать оптимальную цену.
@@ -210,351 +215,357 @@ def action_calculate_optimal_prices(repo_root: Path) -> bool:
     df[COL_MIN_PRICE] = min_prices
     df[COL_DESIRED_PRICE] = desired_prices
     
-    df.to_excel(costs_path, index=False)
+    write_costs_dataframe(df, costs_path)
     print(f"✅ Рассчитаны оптимальные цены для {len(df)} товаров (маржа {min_margin*100:.0f}% / {desired_margin*100:.0f}%).")
     return True
 
 
+@locked_costs
 def action_get_current_prices(repo_root: Path) -> bool:
     """
     Действие 3: Узнать текущую цену продажи.
     Расчёт колонок Текущая цена на Ozon, Цена с учётом акций и скидок, Ожидаемая рентабельность.
     """
-    print_step("Узнать текущую цену продажи")
+    with ExitStack() as books:
+        print_step("Узнать текущую цену продажи")
     
-    costs_path = repo_root / COSTS_FILENAME
+        costs_path = repo_root / COSTS_FILENAME
     
-    if not costs_path.exists():
-        print(f"❌ Файл {COSTS_FILENAME} не найден.")
-        return False
-    
-    df, key_col, cost_col = load_costs_df(costs_path)
-    log_verbose(f"Загружено записей: {len(df)}")
-    if COL_MIN_PRICE not in df.columns:
-        print(f"⚠️ Колонка «{COL_MIN_PRICE}» не найдена.")
-        if prompt_yes_no("Рассчитать оптимальные цены сейчас?", default_yes=True):
-            if not action_calculate_optimal_prices(repo_root):
-                return False
-            # Перезагружаем данные
-            df, key_col, cost_col = load_costs_df(costs_path)
-        else:
-            print("❌ Невозможно рассчитать рентабельность без минимальной цены.")
+        if not costs_path.exists():
+            print(f"❌ Файл {COSTS_FILENAME} не найден.")
             return False
     
-    # Получаем отчёт для расчёта комиссии
-    prev_year, prev_month = get_prev_month_year()
-    report_path = get_report_path(repo_root, prev_year, prev_month)
+        df, key_col, cost_col = load_costs_df(costs_path)
+        log_verbose(f"Загружено записей: {len(df)}")
+        if COL_MIN_PRICE not in df.columns:
+            print(f"⚠️ Колонка «{COL_MIN_PRICE}» не найдена.")
+            if prompt_yes_no("Рассчитать оптимальные цены сейчас?", default_yes=True):
+                if not action_calculate_optimal_prices(repo_root):
+                    return False
+                # Перезагружаем данные
+                df, key_col, cost_col = load_costs_df(costs_path)
+            else:
+                print("❌ Невозможно рассчитать рентабельность без минимальной цены.")
+                return False
     
-    if not report_path.exists():
-        print(f"⚠ Файл отчёта не найден: {report_path.name}")
-        if prompt_yes_no("Сгенерировать отчёт за предыдущий месяц?", default_yes=True):
+        # Получаем отчёт для расчёта комиссии
+        prev_year, prev_month = get_prev_month_year()
+        report_path = get_report_path(repo_root, prev_year, prev_month)
+    
+        if not report_path.exists():
+            print(f"⚠ Файл отчёта не найден: {report_path.name}")
+            if prompt_yes_no("Сгенерировать отчёт за предыдущий месяц?", default_yes=True):
+                try:
+                    report_path = generate_monthly_report(repo_root, prev_month, prev_year)
+                except Exception as e:
+                    print(f"❌ Не удалось сгенерировать отчёт: {e}")
+                    return False
+            else:
+                print("❌ Невозможно рассчитать рентабельность без отчёта.")
+                return False
+    
+        total_rate = load_rates_from_report(report_path)
+        log_verbose(f"Комиссия+логистика: {total_rate*100:.2f}%")
+        log_verbose("Получение цен с Ozon...")
+        offer_ids_list = []
+        for _, row in df.iterrows():
+            art = _artikul_normalize(row.get(key_col))
+            if art:
+                offer_ids_list.append(art)
+    
+        prices_map, marketing_prices_map = get_product_prices_from_ozon(offer_ids_list)
+        if prices_map:
+            print(f"✅ Получено цен для {len(prices_map)} артикулов")
+        else:
+            print("⚠️ Не удалось получить цены с Ozon (возможно, не настроены API ключи).")
+    
+        # Рассчитываем текущие цены и рентабельность
+        current_prices = []
+        marketing_prices = []
+        current_margins = []
+    
+        for _, row in df.iterrows():
             try:
-                report_path = generate_monthly_report(repo_root, prev_month, prev_year)
-            except Exception as e:
-                print(f"❌ Не удалось сгенерировать отчёт: {e}")
-                return False
-        else:
-            print("❌ Невозможно рассчитать рентабельность без отчёта.")
-            return False
+                cost_val = float(row.get(cost_col, 0) or 0)
+            except (TypeError, ValueError):
+                cost_val = 0.0
+        
+            art = _artikul_normalize(row.get(key_col))
+            if art:
+                art_normalized = _normalize_offer_id(art)
+                current_price = prices_map.get(art) or prices_map.get(art_normalized)
+                marketing_price = marketing_prices_map.get(art) or marketing_prices_map.get(art_normalized)
+            else:
+                current_price = None
+                marketing_price = None
+        
+            current_prices.append(round(current_price) if current_price is not None else None)
+            marketing_prices.append(round(marketing_price) if marketing_price is not None else None)
+        
+            price_for_margin = marketing_price if marketing_price is not None else current_price
+            margin = compute_current_margin(price_for_margin, cost_val, total_rate)
+            current_margins.append(round(margin * 100, 2) if margin is not None else None)
     
-    total_rate = load_rates_from_report(report_path)
-    log_verbose(f"Комиссия+логистика: {total_rate*100:.2f}%")
-    log_verbose("Получение цен с Ozon...")
-    offer_ids_list = []
-    for _, row in df.iterrows():
-        art = _artikul_normalize(row.get(key_col))
-        if art:
-            offer_ids_list.append(art)
+        # Обновляем колонки
+        for c in [COL_CURRENT_PRICE, COL_MARKETING_PRICE, COL_CURRENT_MARGIN]:
+            if c in df.columns:
+                df = df.drop(columns=[c])
     
-    prices_map, marketing_prices_map = get_product_prices_from_ozon(offer_ids_list)
-    if prices_map:
-        print(f"✅ Получено цен для {len(prices_map)} артикулов")
-    else:
-        print("⚠️ Не удалось получить цены с Ozon (возможно, не настроены API ключи).")
+        df[COL_CURRENT_PRICE] = current_prices
+        df[COL_MARKETING_PRICE] = marketing_prices
+        df[COL_CURRENT_MARGIN] = current_margins
     
-    # Рассчитываем текущие цены и рентабельность
-    current_prices = []
-    marketing_prices = []
-    current_margins = []
+        write_costs_dataframe(df, costs_path)
     
-    for _, row in df.iterrows():
+        # Применяем условное форматирование
         try:
-            cost_val = float(row.get(cost_col, 0) or 0)
-        except (TypeError, ValueError):
-            cost_val = 0.0
+            wb = books.enter_context(closing(load_workbook(costs_path)))
+            ws = wb["Основной"] if "Основной" in wb.sheetnames else wb.active
         
-        art = _artikul_normalize(row.get(key_col))
-        if art:
-            art_normalized = _normalize_offer_id(art)
-            current_price = prices_map.get(art) or prices_map.get(art_normalized)
-            marketing_price = marketing_prices_map.get(art) or marketing_prices_map.get(art_normalized)
-        else:
-            current_price = None
-            marketing_price = None
+            # Форматирование для рентабельности
+            min_margin, desired_margin = load_margin_settings(repo_root)
+            if min_margin is None:
+                min_margin = MIN_MARGIN_DEFAULT
+            if desired_margin is None:
+                desired_margin = DESIRED_MARGIN_DEFAULT
         
-        current_prices.append(round(current_price) if current_price is not None else None)
-        marketing_prices.append(round(marketing_price) if marketing_price is not None else None)
+            margin_col_idx = None
+            for col_idx, cell in enumerate(ws[1], start=1):
+                if cell.value == COL_CURRENT_MARGIN:
+                    margin_col_idx = col_idx
+                    break
         
-        price_for_margin = marketing_price if marketing_price is not None else current_price
-        margin = compute_current_margin(price_for_margin, cost_val, total_rate)
-        current_margins.append(round(margin * 100, 2) if margin is not None else None)
+            if margin_col_idx:
+                min_margin_pct = min_margin * 100
+                desired_margin_pct = desired_margin * 100
+            
+                green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                green_rule = CellIsRule(
+                    operator="between",
+                    formula=[min_margin_pct, desired_margin_pct],
+                    fill=green_fill
+                )
+            
+                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                red_rule = CellIsRule(
+                    operator="lessThan",
+                    formula=[min_margin_pct],
+                    fill=red_fill
+                )
+            
+                margin_col_letter = ws.cell(row=1, column=margin_col_idx).column_letter
+                data_range = f"{margin_col_letter}2:{margin_col_letter}{len(df) + 1}"
+                ws.conditional_formatting.add(data_range, green_rule)
+                ws.conditional_formatting.add(data_range, red_rule)
+        
+            # Форматирование для текущей цены: красный < мин, зелёный >= мин, более зелёный >= желательной
+            current_price_col_idx = None
+            min_price_col_idx = None
+            desired_price_col_idx = None
+            for col_idx, cell in enumerate(ws[1], start=1):
+                if cell.value == COL_CURRENT_PRICE:
+                    current_price_col_idx = col_idx
+                elif cell.value == COL_MIN_PRICE:
+                    min_price_col_idx = col_idx
+                elif cell.value == COL_DESIRED_PRICE:
+                    desired_price_col_idx = col_idx
+        
+            if current_price_col_idx and min_price_col_idx:
+                current_price_col_letter = ws.cell(row=1, column=current_price_col_idx).column_letter
+                min_price_col_letter = ws.cell(row=1, column=min_price_col_idx).column_letter
+                data_range = f"{current_price_col_letter}2:{current_price_col_letter}{len(df) + 1}"
+            
+                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                red_formula = f"AND({current_price_col_letter}2<>\"\", {current_price_col_letter}2>0, {current_price_col_letter}2<{min_price_col_letter}2)"
+                red_rule = FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False)
+            
+                green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                green_formula = f"AND({current_price_col_letter}2<>\"\", {current_price_col_letter}2>0, {current_price_col_letter}2>={min_price_col_letter}2)"
+                green_rule = FormulaRule(formula=[green_formula], fill=green_fill, stopIfTrue=False)
+            
+                ws.conditional_formatting.add(data_range, red_rule)
+                ws.conditional_formatting.add(data_range, green_rule)
+            
+                # Цена выше диапазона (>= желательной) — более насыщенный зелёный (применяется поверх обычного зелёного)
+                if desired_price_col_idx:
+                    desired_price_col_letter = ws.cell(row=1, column=desired_price_col_idx).column_letter
+                    dark_green_fill = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
+                    dark_green_formula = f"AND({current_price_col_letter}2<>\"\", {current_price_col_letter}2>0, {current_price_col_letter}2>={desired_price_col_letter}2)"
+                    dark_green_rule = FormulaRule(formula=[dark_green_formula], fill=dark_green_fill, stopIfTrue=True)
+                    ws.conditional_formatting.add(data_range, dark_green_rule)
+        
+            # Форматирование для цены с акциями
+            marketing_price_col_idx = None
+            for col_idx, cell in enumerate(ws[1], start=1):
+                if cell.value == COL_MARKETING_PRICE:
+                    marketing_price_col_idx = col_idx
+                    break
+        
+            if marketing_price_col_idx and min_price_col_idx:
+                marketing_price_col_letter = ws.cell(row=1, column=marketing_price_col_idx).column_letter
+            
+                green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                green_formula = f"AND({marketing_price_col_letter}2<>\"\", {marketing_price_col_letter}2>0, {marketing_price_col_letter}2>={min_price_col_letter}2)"
+                green_rule = FormulaRule(formula=[green_formula], fill=green_fill, stopIfTrue=False)
+            
+                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                red_formula = f"AND({marketing_price_col_letter}2<>\"\", {marketing_price_col_letter}2>0, {marketing_price_col_letter}2<{min_price_col_letter}2)"
+                red_rule = FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False)
+            
+                data_range = f"{marketing_price_col_letter}2:{marketing_price_col_letter}{len(df) + 1}"
+                ws.conditional_formatting.add(data_range, red_rule)
+                ws.conditional_formatting.add(data_range, green_rule)
+        
+            save_workbook_atomic(wb, costs_path)
+            wb.close()
+            print("✅ Применено условное форматирование к колонкам.")
+        except Exception as e:
+            print(f"⚠️ Не удалось применить условное форматирование: {e}")
     
-    # Обновляем колонки
-    for c in [COL_CURRENT_PRICE, COL_MARKETING_PRICE, COL_CURRENT_MARGIN]:
-        if c in df.columns:
-            df = df.drop(columns=[c])
-    
-    df[COL_CURRENT_PRICE] = current_prices
-    df[COL_MARKETING_PRICE] = marketing_prices
-    df[COL_CURRENT_MARGIN] = current_margins
-    
-    df.to_excel(costs_path, index=False)
-    
-    # Применяем условное форматирование
-    try:
-        wb = load_workbook(costs_path)
-        ws = wb.active
-        
-        # Форматирование для рентабельности
-        min_margin, desired_margin = load_margin_settings(repo_root)
-        if min_margin is None:
-            min_margin = MIN_MARGIN_DEFAULT
-        if desired_margin is None:
-            desired_margin = DESIRED_MARGIN_DEFAULT
-        
-        margin_col_idx = None
-        for col_idx, cell in enumerate(ws[1], start=1):
-            if cell.value == COL_CURRENT_MARGIN:
-                margin_col_idx = col_idx
-                break
-        
-        if margin_col_idx:
-            min_margin_pct = min_margin * 100
-            desired_margin_pct = desired_margin * 100
-            
-            green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            green_rule = CellIsRule(
-                operator="between",
-                formula=[min_margin_pct, desired_margin_pct],
-                fill=green_fill
-            )
-            
-            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-            red_rule = CellIsRule(
-                operator="lessThan",
-                formula=[min_margin_pct],
-                fill=red_fill
-            )
-            
-            margin_col_letter = ws.cell(row=1, column=margin_col_idx).column_letter
-            data_range = f"{margin_col_letter}2:{margin_col_letter}{len(df) + 1}"
-            ws.conditional_formatting.add(data_range, green_rule)
-            ws.conditional_formatting.add(data_range, red_rule)
-        
-        # Форматирование для текущей цены: красный < мин, зелёный >= мин, более зелёный >= желательной
-        current_price_col_idx = None
-        min_price_col_idx = None
-        desired_price_col_idx = None
-        for col_idx, cell in enumerate(ws[1], start=1):
-            if cell.value == COL_CURRENT_PRICE:
-                current_price_col_idx = col_idx
-            elif cell.value == COL_MIN_PRICE:
-                min_price_col_idx = col_idx
-            elif cell.value == COL_DESIRED_PRICE:
-                desired_price_col_idx = col_idx
-        
-        if current_price_col_idx and min_price_col_idx:
-            current_price_col_letter = ws.cell(row=1, column=current_price_col_idx).column_letter
-            min_price_col_letter = ws.cell(row=1, column=min_price_col_idx).column_letter
-            data_range = f"{current_price_col_letter}2:{current_price_col_letter}{len(df) + 1}"
-            
-            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-            red_formula = f"AND({current_price_col_letter}2<>\"\", {current_price_col_letter}2>0, {current_price_col_letter}2<{min_price_col_letter}2)"
-            red_rule = FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False)
-            
-            green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            green_formula = f"AND({current_price_col_letter}2<>\"\", {current_price_col_letter}2>0, {current_price_col_letter}2>={min_price_col_letter}2)"
-            green_rule = FormulaRule(formula=[green_formula], fill=green_fill, stopIfTrue=False)
-            
-            ws.conditional_formatting.add(data_range, red_rule)
-            ws.conditional_formatting.add(data_range, green_rule)
-            
-            # Цена выше диапазона (>= желательной) — более насыщенный зелёный (применяется поверх обычного зелёного)
-            if desired_price_col_idx:
-                desired_price_col_letter = ws.cell(row=1, column=desired_price_col_idx).column_letter
-                dark_green_fill = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
-                dark_green_formula = f"AND({current_price_col_letter}2<>\"\", {current_price_col_letter}2>0, {current_price_col_letter}2>={desired_price_col_letter}2)"
-                dark_green_rule = FormulaRule(formula=[dark_green_formula], fill=dark_green_fill, stopIfTrue=True)
-                ws.conditional_formatting.add(data_range, dark_green_rule)
-        
-        # Форматирование для цены с акциями
-        marketing_price_col_idx = None
-        for col_idx, cell in enumerate(ws[1], start=1):
-            if cell.value == COL_MARKETING_PRICE:
-                marketing_price_col_idx = col_idx
-                break
-        
-        if marketing_price_col_idx and min_price_col_idx:
-            marketing_price_col_letter = ws.cell(row=1, column=marketing_price_col_idx).column_letter
-            
-            green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            green_formula = f"AND({marketing_price_col_letter}2<>\"\", {marketing_price_col_letter}2>0, {marketing_price_col_letter}2>={min_price_col_letter}2)"
-            green_rule = FormulaRule(formula=[green_formula], fill=green_fill, stopIfTrue=False)
-            
-            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-            red_formula = f"AND({marketing_price_col_letter}2<>\"\", {marketing_price_col_letter}2>0, {marketing_price_col_letter}2<{min_price_col_letter}2)"
-            red_rule = FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False)
-            
-            data_range = f"{marketing_price_col_letter}2:{marketing_price_col_letter}{len(df) + 1}"
-            ws.conditional_formatting.add(data_range, red_rule)
-            ws.conditional_formatting.add(data_range, green_rule)
-        
-        wb.save(costs_path)
-        print("✅ Применено условное форматирование к колонкам.")
-    except Exception as e:
-        print(f"⚠️ Не удалось применить условное форматирование: {e}")
-    
-    print("✅ Текущие цены получены и сохранены.")
-    return True
+        print("✅ Текущие цены получены и сохранены.")
+        return True
 
 
+@locked_costs
 def action_get_active_actions(repo_root: Path) -> bool:
     """
     Действие 4: Узнать активные акции.
     Просмотр в каких акциях участвует товар и по какой цене.
     """
-    print_step("Узнать активные акции")
+    with ExitStack() as books:
+        print_step("Узнать активные акции")
     
-    costs_path = repo_root / COSTS_FILENAME
+        costs_path = repo_root / COSTS_FILENAME
     
-    if not costs_path.exists():
-        print(f"❌ Файл {COSTS_FILENAME} не найден.")
-        return False
+        if not costs_path.exists():
+            print(f"❌ Файл {COSTS_FILENAME} не найден.")
+            return False
     
-    df, key_col, cost_col = load_costs_df(costs_path)
-    print(f"Загружен файл себестоимости: {len(df)} записей.")
+        df, key_col, cost_col = load_costs_df(costs_path)
+        print(f"Загружен файл себестоимости: {len(df)} записей.")
     
-    # Получаем артикулы
-    offer_ids_list = []
-    for _, row in df.iterrows():
-        art = _artikul_normalize(row.get(key_col))
-        if art:
-            offer_ids_list.append(art)
+        # Получаем артикулы
+        offer_ids_list = []
+        for _, row in df.iterrows():
+            art = _artikul_normalize(row.get(key_col))
+            if art:
+                offer_ids_list.append(art)
     
-    # Получаем информацию об акциях
-    actions_map, actions_info_list, _ = get_actions_for_products(offer_ids_list)
+        # Получаем информацию об акциях
+        actions_map, actions_info_list, _ = get_actions_for_products(offer_ids_list)
     
-    if not actions_info_list:
-        print("⚠️ Активные акции не найдены.")
-        return False
+        if not actions_info_list:
+            print("⚠️ Активные акции не найдены.")
+            return False
     
-    log_verbose(f"Найдено акций: {len(actions_info_list)}")
+        log_verbose(f"Найдено акций: {len(actions_info_list)}")
     
-    # Создаём DataFrame для листа акций
-    actions_df_data = {}
-    actions_df_data[key_col] = df[key_col].values
+        # Создаём DataFrame для листа акций
+        actions_df_data = {}
+        actions_df_data[key_col] = df[key_col].values
     
-    # Проверяем наличие минимальной цены
-    if COL_MIN_PRICE not in df.columns:
-        print(f"⚠️ Колонка «{COL_MIN_PRICE}» не найдена.")
-        if prompt_yes_no("Рассчитать оптимальные цены сейчас?", default_yes=True):
-            if not action_calculate_optimal_prices(repo_root):
-                return False
-            df, key_col, cost_col = load_costs_df(costs_path)
-        else:
-            print("⚠️ Продолжаем без минимальной цены.")
+        # Проверяем наличие минимальной цены
+        if COL_MIN_PRICE not in df.columns:
+            print(f"⚠️ Колонка «{COL_MIN_PRICE}» не найдена.")
+            if prompt_yes_no("Рассчитать оптимальные цены сейчас?", default_yes=True):
+                if not action_calculate_optimal_prices(repo_root):
+                    return False
+                df, key_col, cost_col = load_costs_df(costs_path)
+            else:
+                print("⚠️ Продолжаем без минимальной цены.")
     
-    if COL_MIN_PRICE in df.columns:
-        actions_df_data[COL_MIN_PRICE] = df[COL_MIN_PRICE].values
+        if COL_MIN_PRICE in df.columns:
+            actions_df_data[COL_MIN_PRICE] = df[COL_MIN_PRICE].values
     
-    # Получаем цены в акциях для каждого товара
-    action_prices_dicts = {}
-    for action_info in actions_info_list:
-        action_name = action_info["name"]
-        action_prices_dicts[action_name] = []
-    
-    for _, row in df.iterrows():
-        art = _artikul_normalize(row.get(key_col))
-        if art:
-            art_normalized = _normalize_offer_id(art)
-            art_actions = actions_map.get(art) or actions_map.get(art_normalized) or {}
-        else:
-            art_actions = {}
-        
+        # Получаем цены в акциях для каждого товара
+        action_prices_dicts = {}
         for action_info in actions_info_list:
             action_name = action_info["name"]
-            action_price = art_actions.get(action_name)
-            if action_price is not None:
-                action_prices_dicts[action_name].append(round(action_price))
+            action_prices_dicts[action_name] = []
+    
+        for _, row in df.iterrows():
+            art = _artikul_normalize(row.get(key_col))
+            if art:
+                art_normalized = _normalize_offer_id(art)
+                art_actions = actions_map.get(art) or actions_map.get(art_normalized) or {}
             else:
-                action_prices_dicts[action_name].append(None)
+                art_actions = {}
+        
+            for action_info in actions_info_list:
+                action_name = action_info["name"]
+                action_price = art_actions.get(action_name)
+                if action_price is not None:
+                    action_prices_dicts[action_name].append(round(action_price))
+                else:
+                    action_prices_dicts[action_name].append(None)
     
-    # Добавляем колонки акций
-    for action_info in actions_info_list:
-        action_name = action_info["name"]
-        actions_df_data[action_name] = action_prices_dicts[action_name]
+        # Добавляем колонки акций
+        for action_info in actions_info_list:
+            action_name = action_info["name"]
+            actions_df_data[action_name] = action_prices_dicts[action_name]
     
-    actions_df = pd.DataFrame(actions_df_data)
+        actions_df = pd.DataFrame(actions_df_data)
     
-    # Сохраняем в Excel
-    try:
-        wb = load_workbook(costs_path)
+        # Сохраняем в Excel
+        try:
+            wb = books.enter_context(closing(load_workbook(costs_path)))
         
-        if 'Sheet1' in wb.sheetnames:
-            wb['Sheet1'].title = 'Основной'
+            if 'Sheet1' in wb.sheetnames:
+                wb['Sheet1'].title = 'Основной'
         
-        if "Акции" in wb.sheetnames:
-            wb.remove(wb["Акции"])
+            if "Акции" in wb.sheetnames:
+                wb.remove(wb["Акции"])
         
-        ws_actions = wb.create_sheet("Акции")
+            ws_actions = wb.create_sheet("Акции")
         
-        # Записываем заголовки
-        for c_idx, col_name in enumerate(actions_df.columns, start=1):
-            ws_actions.cell(row=1, column=c_idx, value=col_name)
+            # Записываем заголовки
+            for c_idx, col_name in enumerate(actions_df.columns, start=1):
+                ws_actions.cell(row=1, column=c_idx, value=col_name)
         
-        # Записываем данные
-        for r_idx, row in enumerate(actions_df.itertuples(index=False), start=2):
-            for c_idx, value in enumerate(row, start=1):
-                ws_actions.cell(row=r_idx, column=c_idx, value=value)
+            # Записываем данные
+            for r_idx, row in enumerate(actions_df.itertuples(index=False), start=2):
+                for c_idx, value in enumerate(row, start=1):
+                    ws_actions.cell(row=r_idx, column=c_idx, value=value)
         
-        # Применяем условное форматирование
-        if COL_MIN_PRICE in actions_df.columns:
-            min_price_col_idx = None
-            for col_idx, col_name in enumerate(actions_df.columns, start=1):
-                if col_name == COL_MIN_PRICE:
-                    min_price_col_idx = col_idx
-                    break
-            
-            if min_price_col_idx:
-                min_price_col_letter = get_column_letter(min_price_col_idx)
-                
+            # Применяем условное форматирование
+            if COL_MIN_PRICE in actions_df.columns:
+                min_price_col_idx = None
                 for col_idx, col_name in enumerate(actions_df.columns, start=1):
-                    if col_name == key_col or col_name == COL_MIN_PRICE:
-                        continue
+                    if col_name == COL_MIN_PRICE:
+                        min_price_col_idx = col_idx
+                        break
+            
+                if min_price_col_idx:
+                    min_price_col_letter = get_column_letter(min_price_col_idx)
+                
+                    for col_idx, col_name in enumerate(actions_df.columns, start=1):
+                        if col_name == key_col or col_name == COL_MIN_PRICE:
+                            continue
                     
-                    action_col_letter = get_column_letter(col_idx)
+                        action_col_letter = get_column_letter(col_idx)
                     
-                    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-                    green_formula = f"AND({action_col_letter}2<>\"\", {action_col_letter}2>0, {action_col_letter}2>={min_price_col_letter}2)"
-                    green_rule = FormulaRule(formula=[green_formula], fill=green_fill, stopIfTrue=False)
+                        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                        green_formula = f"AND({action_col_letter}2<>\"\", {action_col_letter}2>0, {action_col_letter}2>={min_price_col_letter}2)"
+                        green_rule = FormulaRule(formula=[green_formula], fill=green_fill, stopIfTrue=False)
                     
-                    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-                    red_formula = f"AND({action_col_letter}2<>\"\", {action_col_letter}2>0, {action_col_letter}2<{min_price_col_letter}2)"
-                    red_rule = FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False)
+                        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                        red_formula = f"AND({action_col_letter}2<>\"\", {action_col_letter}2>0, {action_col_letter}2<{min_price_col_letter}2)"
+                        red_rule = FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False)
                     
-                    data_range = f"{action_col_letter}2:{action_col_letter}{len(actions_df) + 1}"
-                    ws_actions.conditional_formatting.add(data_range, red_rule)
-                    ws_actions.conditional_formatting.add(data_range, green_rule)
+                        data_range = f"{action_col_letter}2:{action_col_letter}{len(actions_df) + 1}"
+                        ws_actions.conditional_formatting.add(data_range, red_rule)
+                        ws_actions.conditional_formatting.add(data_range, green_rule)
         
-        wb.save(costs_path)
-        print(f"✅ Создан лист «Акции» с {len(actions_info_list)} колонками акций.")
-    except Exception as e:
-        print(f"⚠️ Ошибка при создании листа «Акции»: {e}")
-        import traceback
-        print(traceback.format_exc())
-        return False
+            save_workbook_atomic(wb, costs_path)
+            wb.close()
+            print(f"✅ Создан лист «Акции» с {len(actions_info_list)} колонками акций.")
+        except Exception as e:
+            print(f"⚠️ Ошибка при создании листа «Акции»: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return False
     
-    return True
+        return True
 
 
 def action_remove_unprofitable_actions(repo_root: Path) -> bool:
@@ -562,79 +573,80 @@ def action_remove_unprofitable_actions(repo_root: Path) -> bool:
     Действие 5: Удалить невыгодные акции.
     Удаление товаров из акций, где цена меньше минимальной.
     """
-    print_step("Удалить невыгодные акции")
+    with ExitStack() as books:
+        print_step("Удалить невыгодные акции")
     
-    costs_path = repo_root / COSTS_FILENAME
+        costs_path = repo_root / COSTS_FILENAME
     
-    if not costs_path.exists():
-        print(f"❌ Файл {COSTS_FILENAME} не найден.")
-        return False
+        if not costs_path.exists():
+            print(f"❌ Файл {COSTS_FILENAME} не найден.")
+            return False
     
-    # Проверяем наличие листа "Акции"
-    try:
-        wb = load_workbook(costs_path)
-        if "Акции" not in wb.sheetnames:
-            print("⚠️ Лист «Акции» не найден.")
-            if prompt_yes_no("Получить информацию об активных акциях сейчас?", default_yes=True):
-                if not action_get_active_actions(repo_root):
+        # Проверяем наличие листа "Акции"
+        try:
+            wb = books.enter_context(closing(load_workbook(costs_path)))
+            if "Акции" not in wb.sheetnames:
+                print("⚠️ Лист «Акции» не найден.")
+                if prompt_yes_no("Получить информацию об активных акциях сейчас?", default_yes=True):
+                    if not action_get_active_actions(repo_root):
+                        return False
+                    wb = books.enter_context(closing(load_workbook(costs_path)))
+                else:
+                    print("❌ Невозможно удалить из акций без информации об акциях.")
                     return False
-                wb = load_workbook(costs_path)
-            else:
-                print("❌ Невозможно удалить из акций без информации об акциях.")
-                return False
-    except Exception as e:
-        print(f"❌ Ошибка при открытии файла: {e}")
-        return False
+        except Exception as e:
+            print(f"❌ Ошибка при открытии файла: {e}")
+            return False
     
-    df, key_col, cost_col = load_costs_df(costs_path)
+        df, key_col, cost_col = load_costs_df(costs_path)
     
-    # Получаем артикулы и маппинг
-    offer_ids_list = []
-    for _, row in df.iterrows():
-        art = _artikul_normalize(row.get(key_col))
-        if art:
-            offer_ids_list.append(art)
+        # Получаем артикулы и маппинг
+        offer_ids_list = []
+        for _, row in df.iterrows():
+            art = _artikul_normalize(row.get(key_col))
+            if art:
+                offer_ids_list.append(art)
     
-    _, actions_info_list, offer_id_to_product_id = get_actions_for_products(offer_ids_list)
+        _, actions_info_list, offer_id_to_product_id = get_actions_for_products(offer_ids_list)
     
-    if not actions_info_list:
-        print("⚠️ Активные акции не найдены.")
-        return False
+        if not actions_info_list:
+            print("⚠️ Активные акции не найдены.")
+            return False
     
-    ws_actions = wb['Акции']
-    action_name_to_id = {a["name"]: a["id"] for a in actions_info_list}
+        ws_actions = wb['Акции']
+        action_name_to_id = {a["name"]: a["id"] for a in actions_info_list}
     
-    if not offer_id_to_product_id or not action_name_to_id:
-        print("⚠️ Недостаточно данных для удаления из акций.")
-        return False
+        if not offer_id_to_product_id or not action_name_to_id:
+            print("⚠️ Недостаточно данных для удаления из акций.")
+            return False
     
-    candidates = collect_deactivation_candidates_from_sheet(
-        ws_actions,
-        key_col,
-        COL_MIN_PRICE,
-        action_name_to_id,
-        offer_id_to_product_id,
-    )
+        candidates = collect_deactivation_candidates_from_sheet(
+            ws_actions,
+            key_col,
+            COL_MIN_PRICE,
+            action_name_to_id,
+            offer_id_to_product_id,
+        )
     
-    if not candidates:
-        print("✅ Товары с ценой ниже минимальной не найдены.")
+        if not candidates:
+            print("✅ Товары с ценой ниже минимальной не найдены.")
+            return True
+    
+        total_to_remove = sum(len(ids) for ids in candidates.values())
+        print(f"Найдено {total_to_remove} товаров для удаления из {len(candidates)} акций.")
+    
+        if not prompt_yes_no("Продолжить удаление?", default_yes=False):
+            print("❌ Удаление отменено.")
+            return False
+    
+        log_verbose("Удаление товаров из акций...")
+        for action_id, product_ids in candidates.items():
+            result = deactivate_products_in_action(action_id, product_ids)
+            removed = result.get("product_ids", []) or []
+            rejected = result.get("rejected", []) or []
+            log_verbose(f"Акция {action_id}: удалено {len(removed)}, не удалено {len(rejected)}")
+        print("✅ Удаление из акций завершено.")
         return True
-    
-    total_to_remove = sum(len(ids) for ids in candidates.values())
-    print(f"Найдено {total_to_remove} товаров для удаления из {len(candidates)} акций.")
-    
-    if not prompt_yes_no("Продолжить удаление?", default_yes=False):
-        print("❌ Удаление отменено.")
-        return False
-    
-    log_verbose("Удаление товаров из акций...")
-    for action_id, product_ids in candidates.items():
-        result = deactivate_products_in_action(action_id, product_ids)
-        removed = result.get("product_ids", []) or []
-        rejected = result.get("rejected", []) or []
-        log_verbose(f"Акция {action_id}: удалено {len(removed)}, не удалено {len(rejected)}")
-    print("✅ Удаление из акций завершено.")
-    return True
 
 
 def action_add_to_actions(repo_root: Path) -> bool:
@@ -794,6 +806,7 @@ def action_add_to_actions(repo_root: Path) -> bool:
     return True
 
 
+@locked_costs
 def action_get_current_prices_and_actions(repo_root: Path) -> bool:
     """
     Действие: Узнать текущие цены и акции.
@@ -1018,51 +1031,311 @@ def refresh_costs_views(repo_root: Path) -> None:
     action_get_current_prices_and_actions(repo_root)
 
 
-def show_price_management_menu(repo_root: Path):
-    """
-    Показывает меню управления ценой и обрабатывает выбор пользователя.
-    """
+def build_discount_request_plan(repo_root: Path) -> Dict[str, Any]:
+    costs_path = repo_root / COSTS_FILENAME
+    if not costs_path.exists():
+        return {"ok": False, "message": f"Файл {COSTS_FILENAME} не найден.", "items": [], "approve_tasks": [], "decline_tasks": []}
+
+    df, key_col, _cost_col = load_costs_df(costs_path)
+    if COL_MIN_PRICE not in df.columns:
+        return {
+            "ok": False,
+            "message": f"Колонка «{COL_MIN_PRICE}» не найдена в {COSTS_FILENAME}. Сначала рассчитайте минимальные цены.",
+            "items": [],
+            "approve_tasks": [],
+            "decline_tasks": [],
+        }
+
+    offer_id_to_min_price: Dict[str, float] = {}
+    for _, row in df.iterrows():
+        art = _artikul_normalize(row.get(key_col))
+        if not art:
+            continue
+        art_normalized = _normalize_offer_id(art)
+        min_price = row.get(COL_MIN_PRICE)
+        try:
+            min_price_val = float(min_price) if min_price is not None else 0.0
+        except (TypeError, ValueError):
+            min_price_val = 0.0
+        if min_price_val <= 0:
+            continue
+        offer_id_to_min_price[art_normalized] = min_price_val
+        if art != art_normalized:
+            offer_id_to_min_price[art] = min_price_val
+
+    if not offer_id_to_min_price:
+        return {"ok": False, "message": "Не найдено товаров с минимальной ценой.", "items": [], "approve_tasks": [], "decline_tasks": []}
+
+    discount_tasks = get_discount_requests(status="NEW", limit=50)
+    if not discount_tasks:
+        return {"ok": True, "message": "Новых заявок на скидку не найдено.", "items": [], "approve_tasks": [], "decline_tasks": []}
+
+    skus_from_tasks: List[int] = []
+    for task in discount_tasks:
+        sku = task.get("sku")
+        try:
+            if sku is not None:
+                skus_from_tasks.append(int(sku))
+        except (TypeError, ValueError):
+            continue
+    sku_to_offer_id: Dict[int, str] = get_sku_to_offer_id_mapping(list(dict.fromkeys(skus_from_tasks))) if skus_from_tasks else {}
+
+    items: List[Dict[str, Any]] = []
+    approve_tasks: List[Dict[str, Any]] = []
+    decline_tasks: List[Dict[str, Any]] = []
+
+    for task in discount_tasks:
+        task_id = task.get("id")
+        sku = task.get("sku")
+        requested_price = task.get("requested_price")
+        requested_quantity_min = task.get("requested_quantity_min")
+        requested_quantity_max = task.get("requested_quantity_max")
+
+        offer_id_raw: Optional[str] = None
+        try:
+            if sku is not None:
+                offer_id_raw = sku_to_offer_id.get(int(sku))
+        except (TypeError, ValueError):
+            offer_id_raw = None
+        if not offer_id_raw and sku is not None:
+            offer_id_raw = str(sku)
+
+        offer_id_normalized = _normalize_offer_id(offer_id_raw) if offer_id_raw else ""
+        min_price = offer_id_to_min_price.get(offer_id_normalized) or offer_id_to_min_price.get(offer_id_raw or "")
+
+        try:
+            requested_price_val = float(requested_price) if requested_price is not None else None
+        except (TypeError, ValueError):
+            requested_price_val = None
+
+        try:
+            q_min = max(1, int(requested_quantity_min)) if requested_quantity_min is not None else 1
+        except (TypeError, ValueError):
+            q_min = 1
+        try:
+            q_max = max(q_min, int(requested_quantity_max)) if requested_quantity_max is not None else q_min
+        except (TypeError, ValueError):
+            q_max = q_min
+
+        decision = "decline"
+        reason = ""
+        approved_task: Optional[Dict[str, Any]] = None
+        declined_task: Optional[Dict[str, Any]] = None
+        price_state = "unknown"
+        price_delta: Optional[float] = None
+
+        if requested_price_val is not None and min_price is not None:
+            price_delta = requested_price_val - min_price
+            price_state = "ok" if price_delta >= 0 else "below_min"
+
+        def build_approve_payload(comment: str) -> Dict[str, Any]:
+            return {
+                "id": task_id,
+                "approved_price": int(requested_price_val),
+                "approved_quantity_min": q_min,
+                "approved_quantity_max": q_max,
+                "seller_comment": comment,
+            }
+
+        if not sku:
+            reason = "SKU отсутствует в заявке."
+        elif min_price is None:
+            reason = "Минимальная цена не рассчитана для этого товара."
+            if requested_price_val is not None:
+                approved_task = build_approve_payload(
+                    f"Одобрено вручную: товара нет в {COSTS_FILENAME}, минимальная цена не найдена."
+                )
+        elif requested_price_val is None:
+            reason = "В заявке не указана корректная запрошенная цена."
+        elif requested_price_val >= min_price:
+            decision = "approve"
+            reason = f"Запрошенная цена {requested_price_val:.2f} ₽ не ниже минимальной цены {min_price:.2f} ₽."
+            approved_task = build_approve_payload(
+                f"Одобрено: запрошенная цена {requested_price_val:.0f} ₽ не ниже минимальной {min_price:.0f} ₽"
+            )
+            approve_tasks.append(approved_task)
+        else:
+            reason = f"Запрошенная цена {requested_price_val:.2f} ₽ ниже минимальной цены {min_price:.2f} ₽."
+            approved_task = build_approve_payload(
+                f"Одобрено вручную: запрошенная цена {requested_price_val:.0f} ₽ ниже минимальной {min_price:.0f} ₽"
+            )
+
+        if decision != "approve":
+            declined_task = {
+                "id": task_id,
+                "seller_comment": f"Отклонено: {reason}",
+            }
+            decline_tasks.append(declined_task)
+
+        items.append(
+            {
+                "id": task_id,
+                "sku": str(sku or "—"),
+                "offer_id": offer_id_raw or "—",
+                "requested_price": requested_price_val,
+                "requested_quantity_min": q_min,
+                "requested_quantity_max": q_max,
+                "min_price": min_price,
+                "price_state": price_state,
+                "price_delta": price_delta,
+                "recommended_action": decision,
+                "recommendation_reason": reason,
+                "approve_payload": approved_task,
+                "decline_payload": declined_task,
+            }
+        )
+
+    return {
+        "ok": True,
+        "message": f"Найдено {len(items)} новых заявок на скидку.",
+        "items": items,
+        "approve_tasks": approve_tasks,
+        "decline_tasks": decline_tasks,
+    }
+
+
+def process_discount_request_item(item: Dict[str, Any], action: str) -> Dict[str, Any]:
+    if action == "approve":
+        payload = item.get("approve_payload")
+        if not payload:
+            return {"ok": False, "message": "Эту заявку нельзя одобрить автоматически: нет корректного payload."}
+        result = approve_discount_requests([payload])
+        ok = result.get("success_count", 0) > 0 and result.get("fail_count", 0) == 0
+        return {"ok": ok, "message": "Заявка одобрена." if ok else "Не удалось одобрить заявку.", "result": result}
+
+    if action == "decline":
+        payload = item.get("decline_payload")
+        if not payload:
+            return {"ok": False, "message": "Не найден payload для отклонения заявки."}
+        result = decline_discount_requests([payload])
+        ok = result.get("success_count", 0) > 0 and result.get("fail_count", 0) == 0
+        return {"ok": ok, "message": "Заявка отклонена." if ok else "Не удалось отклонить заявку.", "result": result}
+
+    return {"ok": False, "message": f"Неизвестное действие: {action}"}
+
+
+def process_discount_request_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    approve_result = {"success_count": 0, "fail_count": 0, "fail_details": []}
+    decline_result = {"success_count": 0, "fail_count": 0, "fail_details": []}
+
+    approve_tasks = plan.get("approve_tasks") or []
+    decline_tasks = plan.get("decline_tasks") or []
+    if approve_tasks:
+        approve_result = approve_discount_requests(approve_tasks)
+    if decline_tasks:
+        decline_result = decline_discount_requests(decline_tasks)
+
+    expected_count = len(approve_tasks) + len(decline_tasks)
+    success_count = approve_result.get("success_count", 0) + decline_result.get("success_count", 0)
+    fail_count = approve_result.get("fail_count", 0) + decline_result.get("fail_count", 0)
+    ok = fail_count == 0 and success_count == expected_count
+    message = f"Автоматически обработано: одобрено {approve_result.get('success_count', 0)}, отклонено {decline_result.get('success_count', 0)}."
+    if not ok:
+        message += " Не все заявки обработаны. Обновите список перед повторной отправкой."
+    return {
+        "ok": ok,
+        "approve_result": approve_result,
+        "decline_result": decline_result,
+        "message": message,
+    }
+
+
+def show_pricing_menu(repo_root: Path) -> None:
+    """Показывает меню управления ценами и скидками."""
     while True:
-        print_step("Управление ценой")
+        print_step("Цены и скидки")
         print("1. Диапазон рентабельности")
         print("2. Рассчитать оптимальную цену")
-        print("3. Узнать текущие цены и акции")
-        print("4. Удалить невыгодные акции")
-        print("5. Добавить товары в акции")
-        print("6. Обработать заявки на скидку")
-        print("0. Назад в главное меню")
-        
-        choice = input("Выберите опцию (0-6): ").strip()
-        
+        print("3. Обработать заявки на скидку")
+        print("0. Назад")
+
+        choice = input("Выберите опцию (0-3): ").strip()
+
         if choice == "1":
             action_set_margin_range(repo_root)
         elif choice == "2":
             action_calculate_optimal_prices(repo_root)
         elif choice == "3":
-            action_get_current_prices_and_actions(repo_root)
-        elif choice == "4":
-            if action_remove_unprofitable_actions(repo_root):
-                refresh_costs_views(repo_root)
-        elif choice == "5":
-            if action_add_to_actions(repo_root):
-                refresh_costs_views(repo_root)
-        elif choice == "6":
             action_process_discount_requests(repo_root)
         elif choice == "0":
             break
         else:
-            print("Пожалуйста, выберите корректную опцию (0-6).")
-        
-        print()  # Пустая строка для читаемости
+            print("Пожалуйста, выберите корректную опцию (0-3).")
+
+        print()
 
 
-def main():
+def show_actions_menu(repo_root: Path) -> None:
+    """Показывает меню управления акциями."""
+    while True:
+        print_step("Акции")
+        print("1. Узнать текущие цены и акции")
+        print("2. Удалить невыгодные акции")
+        print("3. Добавить товары в акции")
+        print("0. Назад")
+
+        choice = input("Выберите опцию (0-3): ").strip()
+
+        if choice == "1":
+            action_get_current_prices_and_actions(repo_root)
+        elif choice == "2":
+            if action_remove_unprofitable_actions(repo_root):
+                refresh_costs_views(repo_root)
+        elif choice == "3":
+            if action_add_to_actions(repo_root):
+                refresh_costs_views(repo_root)
+        elif choice == "0":
+            break
+        else:
+            print("Пожалуйста, выберите корректную опцию (0-3).")
+
+        print()
+
+
+def show_price_management_menu(repo_root: Path) -> None:
+    """Показывает корневое меню разделов цен и акций."""
+    while True:
+        print_step("Цены и акции")
+        print("1. Цены и скидки")
+        print("2. Акции")
+        print("0. Выход")
+
+        choice = input("Выберите раздел (0-2): ").strip()
+
+        if choice == "1":
+            show_pricing_menu(repo_root)
+        elif choice == "2":
+            show_actions_menu(repo_root)
+        elif choice == "0":
+            break
+        else:
+            print("Пожалуйста, выберите корректную опцию (0-2).")
+
+        print()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
     """Точка входа для запуска модуля как скрипта."""
+    parser = argparse.ArgumentParser(description="Меню разделов цен и акций.")
+    parser.add_argument(
+        "--menu",
+        choices=("all", "pricing", "actions"),
+        default="all",
+        help="Сразу открыть конкретный раздел.",
+    )
+    args = parser.parse_args(argv)
+
     script_dir = Path(__file__).resolve().parent
     repo_root = script_dir.parent
-    
-    show_price_management_menu(repo_root)
+
+    if args.menu == "pricing":
+        show_pricing_menu(repo_root)
+    elif args.menu == "actions":
+        show_actions_menu(repo_root)
+    else:
+        show_price_management_menu(repo_root)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

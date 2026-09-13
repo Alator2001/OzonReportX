@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import pandas as pd
+try:
+    from scripts.file_lock import locked_costs
+except ModuleNotFoundError:
+    from file_lock import locked_costs
+try:
+    from scripts.file_io import read_costs_dataframe
+except ModuleNotFoundError:
+    from file_io import read_costs_dataframe
 import requests
 from dotenv import load_dotenv
 
@@ -51,7 +59,7 @@ def load_costs_df(costs_path: Path) -> tuple[pd.DataFrame, str]:
     if not costs_path.exists():
         raise FileNotFoundError(f"Файл себестоимости не найден: {costs_path}")
 
-    df = pd.read_excel(costs_path)
+    df = read_costs_dataframe(costs_path)
     lower_cols = {c.lower(): c for c in df.columns}
     key_col = None
     for v in ["prefix", "префикс", "код", "артикул", "offer_id"]:
@@ -210,6 +218,7 @@ def update_min_prices_on_ozon(updates: List[Dict[str, Any]]) -> Dict[str, Any]:
         raise RuntimeError(f"Ошибка при обновлении цен: {e}")
 
 
+@locked_costs
 def run(repo_root: Path) -> None:
     """Основная функция обновления цен."""
     costs_path = repo_root / COSTS_FILENAME
@@ -384,8 +393,10 @@ def run(repo_root: Path) -> None:
                             print(f"        Пример: {err}")
                 else:
                     print(f"   ⚠️ Неожиданный формат result: {type(results_list)}")
+                    total_errors += len(batch)
             else:
                 print(f"   ⚠️ Неожиданный формат ответа: {result}")
+                total_errors += len(batch)
             
         except Exception as e:
             print(f"   ❌ Ошибка при обновлении батча: {e}")
@@ -397,6 +408,7 @@ def run(repo_root: Path) -> None:
     print(f"   Обновлено товаров: {total_updated}")
     if total_errors > 0:
         print(f"   Ошибок: {total_errors}")
+        raise RuntimeError(f"Обновление цен завершено с ошибками: {total_errors}; успешно: {total_updated}.")
 
 
 def main():

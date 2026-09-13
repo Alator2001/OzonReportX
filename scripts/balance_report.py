@@ -13,6 +13,10 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+try:
+    from scripts.file_io import excel_writer, atomic_output_path
+except ModuleNotFoundError:
+    from file_io import excel_writer, atomic_output_path
 
 load_dotenv()
 CLIENT_ID = os.getenv("OZON_CLIENT_ID")
@@ -78,59 +82,36 @@ def _extract_product_placement_in_ozon_warehouses_value(data: dict) -> float:
     return total
 
 
-def get_star_products_for_month(month: int, year: int) -> float:
-    """
-    Запрашивает отчёт о балансе за месяц (с разбивкой по 30 дней) и возвращает
-    суммарные расходы по «Звёздным товарам» за период.
-    """
+def get_monthly_balance_reports(month: int, year: int) -> list[dict]:
+    """Load every monthly segment; a failed segment must not look like zero expenses."""
     from calendar import monthrange
     first = f"{year}-{month:02d}-01"
     last_day = monthrange(year, month)[1]
-    total = 0.0
-    # Первый отрезок: 01 — min(30, last_day)
     end1 = min(30, last_day)
     to1 = f"{year}-{month:02d}-{end1:02d}"
-    try:
-        data1 = get_balance_report(first, to1)
-        total += _extract_star_products_value(data1)
-    except Exception:
-        pass
-    # Если в месяце 31 день — отдельный запрос за 31-е
+    reports = [get_balance_report(first, to1)]
     if last_day == 31:
-        try:
-            data2 = get_balance_report(f"{year}-{month:02d}-31", f"{year}-{month:02d}-31")
-            total += _extract_star_products_value(data2)
-        except Exception:
-            pass
+        reports.append(get_balance_report(f"{year}-{month:02d}-31", f"{year}-{month:02d}-31"))
+    return reports
+
+
+def get_star_products_for_month(month: int, year: int, reports=None) -> float:
+    """Суммарные расходы по «Звёздным товарам» из всех отрезков месяца."""
+    if reports is None:
+        reports = get_monthly_balance_reports(month, year)
+    total = 0.0
+    for data in reports:
+        total += _extract_star_products_value(data)
     return total
 
 
-def get_product_placement_in_ozon_warehouses_for_month(month: int, year: int) -> float:
-    """
-    Запрашивает отчёт о балансе за месяц (с разбивкой по 30 дней) и возвращает
-    суммарные расходы по хранению FBO за период.
-    """
-    from calendar import monthrange
-
-    first = f"{year}-{month:02d}-01"
-    last_day = monthrange(year, month)[1]
+def get_product_placement_in_ozon_warehouses_for_month(month: int, year: int, reports=None) -> float:
+    """Суммарные расходы по хранению FBO из всех отрезков месяца."""
+    if reports is None:
+        reports = get_monthly_balance_reports(month, year)
     total = 0.0
-
-    end1 = min(30, last_day)
-    to1 = f"{year}-{month:02d}-{end1:02d}"
-    try:
-        data1 = get_balance_report(first, to1)
-        total += _extract_product_placement_in_ozon_warehouses_value(data1)
-    except Exception:
-        pass
-
-    if last_day == 31:
-        try:
-            data2 = get_balance_report(f"{year}-{month:02d}-31", f"{year}-{month:02d}-31")
-            total += _extract_product_placement_in_ozon_warehouses_value(data2)
-        except Exception:
-            pass
-
+    for data in reports:
+        total += _extract_product_placement_in_ozon_warehouses_value(data)
     return total
 
 
@@ -175,7 +156,7 @@ def save_report(data: dict, date_from: str, date_to: str, repo_root: Path) -> Pa
     out_dir = ensure_balance_reports_dir(repo_root)
     base_name = f"{date_from}_to_{date_to}"
     json_path = out_dir / f"{base_name}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
+    with atomic_output_path(json_path) as temporary, open(temporary, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     try:
@@ -207,7 +188,7 @@ def save_report(data: dict, date_from: str, date_to: str, repo_root: Path) -> Pa
             rows_cf.append({"Раздел": name, "Сумма": _money(s.get("amount")), "Комиссия": "—"})
 
         excel_path = out_dir / f"{base_name}.xlsx"
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        with atomic_output_path(excel_path) as temporary, excel_writer(temporary) as writer:
             pd.DataFrame(rows_total).to_excel(writer, sheet_name="Баланс", index=False)
             pd.DataFrame(rows_cf).to_excel(writer, sheet_name="Движения", index=False)
         print(f"   Excel: {excel_path.name}")

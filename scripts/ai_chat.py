@@ -4,21 +4,26 @@
 """
 
 import os
+from contextlib import ExitStack, closing
 import sys
 import re
 import json
-import time
+from datetime import date
 import requests
 import pandas as pd
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openpyxl import load_workbook
+try:
+    from scripts.file_io import read_costs_dataframe
+except ModuleNotFoundError:
+    from file_io import read_costs_dataframe
 
 # Загружаем переменные окружения
 load_dotenv()
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+OLLAMA_HOST = (os.getenv("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+OLLAMA_CHAT_URL = f"{OLLAMA_HOST}/api/chat"
 
 # Импортируем функции для работы с отчётами
 try:
@@ -30,203 +35,444 @@ try:
         MONTHS_RU,
         ORDER_SHEET,
     )
+    from analytics_models import ArtikulAggregateState, YearlyArtikulSummaryState, WorkflowState
+    from analytics_reducers import (
+        build_workflow_fallback_answer_core,
+        build_yearly_artikul_profit_summary_core,
+        extract_year_from_text as extract_year_from_text_core,
+        is_yearly_artikul_report_request_core,
+    )
+    from agent_workflows import (
+        build_workflow_state_core,
+        detect_workflow_core,
+        get_workflow_followup_needs_core,
+    )
+    from payload_policy import format_model_payload_core
 except ImportError:
-    # Если не удалось импортировать, создаём заглушки
     REPORTS_DIR_NAME = "reports"
     ORDER_SHEET = "Заказы"
     MONTHS_RU = [
         "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
+        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
     ]
-    
+
     def get_report_path(repo_root: Path, year: int, month: int) -> Path:
         name = f"{MONTHS_RU[month - 1]} {year}.xlsx"
         return repo_root / REPORTS_DIR_NAME / name
+    from analytics_models import ArtikulAggregateState, YearlyArtikulSummaryState, WorkflowState
+    from analytics_reducers import (
+        build_workflow_fallback_answer_core,
+        build_yearly_artikul_profit_summary_core,
+        extract_year_from_text as extract_year_from_text_core,
+        is_yearly_artikul_report_request_core,
+    )
+    from agent_workflows import (
+        build_workflow_state_core,
+        detect_workflow_core,
+        get_workflow_followup_needs_core,
+    )
+    from payload_policy import format_model_payload_core
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Рекомендуемая модель для чата: groq/compound-mini (70K TPM, без лимита TPD)
-# llama-3.3-70b-versatile имеет лимит 12K TPM — при больших запросах даёт 429
-DEFAULT_MODEL = "groq/compound-mini"
-# Модель можно переопределить в .env: GROQ_MODEL=groq/compound-mini
-GROQ_MODEL = (os.getenv("GROQ_MODEL") or "").strip() or DEFAULT_MODEL
+DEFAULT_MODEL = "qwen3:4b"
+OLLAMA_MODEL = (os.getenv("OLLAMA_MODEL") or "").strip() or DEFAULT_MODEL
+CURRENT_DATE = date.today().isoformat()
+CURRENT_YEAR = date.today().year
 
-# Лимиты для моделей Groq API (на основе данных из консоли)
-# Обновляйте эти значения, если они изменятся в вашем аккаунте
-MODEL_LIMITS = {
-    "llama-3.3-70b-versatile": {
-        "rpm": 30,  # Requests per Minute
-        "rpd": 1000,  # Requests per Day
-        "tpm": 12000,  # Tokens per Minute
-        "tpd": 100000,  # Tokens per Day
-    },
-    "groq/compound": {
-        "rpm": 30,
-        "rpd": 250,
-        "tpm": 70000,
-        "tpd": None,  # No limit
-    },
-    "groq/compound-mini": {
-        "rpm": 30,
-        "rpd": 250,
-        "tpm": 70000,
-        "tpd": None,  # No limit
-    },
-    "llama-3.1-8b-instant": {
-        "rpm": 30,
-        "rpd": 14400,
-        "tpm": 6000,
-        "tpd": 500000,
-    },
-}
-
-# Системный промпт - только инструкции и возможности, БЕЗ данных
 SYSTEM_PROMPT = r"""
-Ты — AI-консультант по бизнесу на маркетплейсе Ozon и работе программы OzonReportX.
+Ты — локальный AI-аналитик OzonReportX.
+Текущая дата: """ + CURRENT_DATE + r""".
+Если пользователь говорит "этот год", это """ + str(CURRENT_YEAR) + r""" год.
 
-# 0) Главная цель
-Давай практичные рекомендации и анализ по бизнесу Ozon, используя данные, которые программа может предоставить через инструменты (TOOLS).
+Главная задача: выбрать правильные инструменты и вернуть строго один JSON-объект.
 
-# 0.1) ПРИМЕР ПРАВИЛЬНОГО ПОВЕДЕНИЯ
-Когда пользователь пишет: "Проанализируй последние 3 месяца"
-Ты ДОЛЖЕН вернуть ТОЛЬКО этот JSON (без текста до/после):
-{"type": "DATA_REQUEST", "needs": [{"tool": "list_reports", "args": {}}, {"tool": "get_month_summary", "args": {"period": "2025-12"}}, {"tool": "get_month_summary", "args": {"period": "2025-11"}}, {"tool": "get_month_summary", "args": {"period": "2025-10"}}], "reason": "Анализ за последние 3 месяца"}
-
-НЕ возвращай FINAL_ANSWER с текстом "нужны данные" или "запросите данные" - это ОШИБКА!
-
-# 1) Критически важные правила (обязательно)
-1) НЕЛЬЗЯ выдумывать цифры, периоды, значения метрик, результаты отчётов и содержимое файлов.
-   - Если данных нет в сообщениях, запроси их через DATA_REQUEST.
-2) Всегда указывай период, к которому относятся любые цифры и выводы (например: "2025-12" или "Декабрь 2025").
-3) Если в полученных данных нет нужного поля или есть ошибка — так и скажи в FINAL_ANSWER: "данные недоступны" / "инструмент вернул ошибку".
-4) Экономь токены:
-   - Запрашивай минимальный набор инструментов.
-   - Не запрашивай большие списки без необходимости.
-5) После того как пользователь/система прислали блок "✅ ДАННЫЕ УСПЕШНО ПОЛУЧЕНЫ" (или любой блок данных от инструментов),
-   тебе ЗАПРЕЩЕНО возвращать DATA_REQUEST. Ты обязан вернуть FINAL_ANSWER на основе полученных данных.
-6) Ты НЕ должен объяснять внутреннюю кухню (про инструменты, токены, архитектуру) пользователю, если он не спрашивает напрямую.
-
-# 1.1) СТРОЖАЙШЕЕ ПРАВИЛО - НИКОГДА НЕ ПРОСИ ПОЛЬЗОВАТЕЛЯ ЗАПРОСИТЬ ДАННЫЕ
-⚠️ КРИТИЧЕСКИ ВАЖНО: Если пользователь просит "проанализируй", "сравни", "покажи", "дай", "сколько" + упоминание периода/месяца/артикула:
-   - Ты ДОЛЖЕН вернуть DATA_REQUEST с нужными инструментами
-   - ЗАПРЕЩЕНО возвращать FINAL_ANSWER с текстом типа "Пожалуйста, запросите данные" или "нужны данные из отчётов"
-   - ЗАПРЕЩЕНО объяснять пользователю, что нужны данные - ты САМ их запрашиваешь через DATA_REQUEST
-   
-Примеры ПРАВИЛЬНОГО поведения:
-   - Пользователь: "Проанализируй последние 3 месяца"
-     → Ты возвращаешь: {"type": "DATA_REQUEST", "needs": [{"tool": "list_reports", "args": {}}, {"tool": "get_month_summary", "args": {"period": "2025-12"}}, {"tool": "get_month_summary", "args": {"period": "2025-11"}}, {"tool": "get_month_summary", "args": {"period": "2025-10"}}], "reason": "Анализ за последние 3 месяца"}
-   
-   - Пользователь: "Сравни прибыль за декабрь и ноябрь"
-     → Ты возвращаешь: {"type": "DATA_REQUEST", "needs": [{"tool": "get_month_summary", "args": {"period": "2025-12"}}, {"tool": "get_month_summary", "args": {"period": "2025-11"}}], "reason": "Сравнение прибыли за два месяца"}
-
-Примеры НЕПРАВИЛЬНОГО поведения (ЗАПРЕЩЕНО):
-   - Пользователь: "Проанализируй последние 3 месяца"
-     → ❌ НЕПРАВИЛЬНО: {"type": "FINAL_ANSWER", "answer": "Для анализа нужны данные. Пожалуйста, запросите месячные сводки."}
-     → ❌ НЕПРАВИЛЬНО: {"type": "FINAL_ANSWER", "answer": "Сейчас доступны только списки отчётов, без метрик. Запросите get_month_summary."}
-
-# 2) Разрешённые форматы ответа
-Ты ОБЯЗАН возвращать ТОЛЬКО один валидный JSON-объект (без Markdown, без ``` и без текста снаружи JSON).
-
-Разрешено только 2 типа:
-
-A) DATA_REQUEST — если для ответа обязательно нужны данные:
-{
-  "type": "DATA_REQUEST",
-  "needs": [
-    {"tool": "<tool_name>", "args": {...}}
-  ],
-  "reason": "<коротко зачем это нужно>"
-}
-
-B) FINAL_ANSWER — если данных достаточно или вопрос общий:
-{
-  "type": "FINAL_ANSWER",
-  "answer": "<ответ пользователю на русском>"
-}
+# Формат ответа
+Разрешены только 2 формата:
+1. {"type":"DATA_REQUEST","needs":[{"tool":"<tool_name>","args":{}}],"reason":"<кратко>"}
+2. {"type":"FINAL_ANSWER","answer":"<ответ на русском>"}
 
 Запрещено:
-- добавлять любые поля кроме type/needs/reason/answer
-- писать текст до/после JSON
-- возвращать массив вместо объекта
+- любой текст до JSON или после JSON;
+- поля кроме type, needs, reason, answer;
+- форматы {"tool":...}, {"action":...}, {"instrument":...}, {"requests":...}, {"parameters":...}, {"params":...};
+- массив вместо объекта.
 
-# 3) Как принимать решение: DATA_REQUEST или FINAL_ANSWER
-🚨 КРИТИЧЕСКИ ВАЖНО: Ты НИКОГДА не должен просить пользователя запросить данные. Если нужны данные - ты САМ запрашиваешь их через DATA_REQUEST.
+Если нужны данные, верни только DATA_REQUEST.
+Если данных достаточно, верни только FINAL_ANSWER.
+Если после получения данных их всё ещё недостаточно, можно вернуть ещё один DATA_REQUEST, но всё равно только в каноническом формате выше.
 
-Возвращай FINAL_ANSWER ТОЛЬКО если:
-- вопрос общий (что умеет программа, как считать маржу, как интерпретировать метрики и т.п.)
-- можно ответить без конкретных чисел И без данных из отчётов
-- пользователь не указал период/артикул и можно попросить уточнение в самом FINAL_ANSWER (без инструментов)
+# Как выбирать инструмент
+Используй get_month_summary, если нужен общий разбор одного месяца.
+Используй get_month_report_full_data, если нужны все строки, все колонки, детальный отчёт по месяцу или агрегация по заказам.
+Используй get_artikul_stats, если пользователь спрашивает про один конкретный артикул.
+Используй get_top_profit и get_top_orders, если нужен рейтинг.
+Используй list_reports, если сначала нужно понять, какие месяцы вообще доступны.
 
-🚨 ОБЯЗАТЕЛЬНО возвращай DATA_REQUEST, если пользователь просит:
-- "проанализируй", "сравни", "покажи", "дай", "сколько", "какая" + упоминание периода/месяца/артикула
-- конкретные цифры (выручка/прибыль/маржа/заказы/комиссии) за период
-- анализ конкретного артикула / сравнение периодов
-- топы по прибыли/заказам
-- себестоимость/минимальную/желательную цену по артикулам
-- ABC&XYZ категории, списки категорий, сводки
-- ЛЮБОЙ запрос, который требует данных из отчётов или costs.xlsx
+# Полное описание инструментов
+list_reports(args={})
+- Аргументы: не нужны.
+- Возвращает: список доступных месячных отчётов с полями period, file, path.
+- Используй, когда нужно сначала определить, какие месяцы реально есть в системе.
+- Особенно важен для запросов вида "за этот год", "за последние месяцы", "за доступные месяцы".
 
-🚨 ЗАПРЕЩЕНО (это КРИТИЧЕСКАЯ ОШИБКА):
-- Просить пользователя запросить данные (например: "Пожалуйста, запросите месячные сводки")
-- Объяснять, что нужны данные, вместо того чтобы их запросить
-- Возвращать FINAL_ANSWER с просьбой к пользователю использовать инструменты
-- Возвращать FINAL_ANSWER с текстом типа "нужны данные из отчётов" или "доступны только списки отчётов"
+get_month_summary(args={"period":"2026-03"}) или {"period":"Март 2026"}
+- Обязательный аргумент: period.
+- Возвращает: сводку по месяцу.
+- Используй для общего обзора месяца, KPI, выручки, прибыли, маржи, структуры расходов.
+- Не используй, если пользователь просит все строки отчёта или полный список заказов.
 
-🚨 ОБЯЗАТЕЛЬНО: Если пользователь просит "последние N месяцев", "проанализируй N месяцев", "сравни последние N месяцев":
-- СНАЧАЛА запроси list_reports {}, чтобы узнать доступные периоды
-- ЗАТЕМ в ОДНОМ DATA_REQUEST запроси get_month_summary для КАЖДОГО из последних N месяцев
-- НЕ делай отдельные запросы для каждого месяца - запроси все сразу в одном DATA_REQUEST
-- Пример для "последние 3 месяца": {"type": "DATA_REQUEST", "needs": [{"tool": "list_reports", "args": {}}, {"tool": "get_month_summary", "args": {"period": "2025-12"}}, {"tool": "get_month_summary", "args": {"period": "2025-11"}}, {"tool": "get_month_summary", "args": {"period": "2025-10"}}], "reason": "Анализ за последние 3 месяца"}
+get_month_report_full_data(args={"period":"Март 2026"}) или {"period":"2026-03"}
+- Обязательный аргумент: period.
+- Возвращает: полный месячный отчёт целиком, включая строки отчёта, колонки, статистику по артикулам, распределения и агрегаты.
+- Это главный инструмент для глубокого анализа месяца и для агрегации по нескольким месяцам.
+- Используй его для годовых отчётов по артикулам, продажам и прибыли.
+- Если нужно собрать данные за несколько месяцев, верни несколько вызовов get_month_report_full_data, по одному на каждый месяц.
 
-Если период/артикул не указан и без него нельзя выбрать данные:
-- НЕ вызывай инструменты
-- верни FINAL_ANSWER с просьбой уточнить период/артикул (коротко, 1–2 вопроса)
+get_top_profit(args={"period":"Март 2026","n":10})
+- Обязательный аргумент: period.
+- Необязательный аргумент: n, по умолчанию 10.
+- Возвращает: top_profit и period.
+- Используй, когда пользователь прямо просит топ артикулов по прибыли.
 
-# 4) Контекст программы OzonReportX (кратко)
-Программа работает с:
-- costs.xlsx: себестоимость и расчётные цены (минимальная/желательная), и др. поля
-- месячные отчёты продаж Excel (лист "Заказы"): сводка метрик + детальные данные заказов
-- ABC&XYZ отчёты: прибыльность (A/B/C) и стабильность спроса (X/Y/Z)
+get_top_orders(args={"period":"Март 2026","n":10})
+- Обязательный аргумент: period.
+- Необязательный аргумент: n, по умолчанию 10.
+- Возвращает: top_orders и period.
+- Используй, когда пользователь просит топ артикулов по количеству заказов или продаж.
 
-Формулы:
-- Прибыль по заказу = "Сумма начисления" - "Себестоимость"
-- Рентабельность = (прибыль / выручка) * 100%
-- Рекомендованная цена = Себестоимость / (1 - (Комиссия% + Логистика%) - маржа)
+get_artikul_stats(args={"period":"Март 2026","artikul":"1302"})
+- Обязательные аргументы: period и artikul.
+- Возвращает: stats по одному конкретному артикулу за один период.
+- Используй только для одного артикула.
+- Не используй для годовых сводок по всем артикулам.
 
-# 5) Доступные инструменты (TOOLS)
-Инструменты вызываются ТОЛЬКО через DATA_REQUEST.
+search_artikul(args={"query":"1302"}) или {"query":"часть названия"}
+- Обязательный аргумент: query.
+- Возвращает: results и count.
+- Используй, когда нужно найти артикул по фрагменту текста или когда пользователь не уверен в точном артикуле.
 
-Метаданные:
-- list_reports {}
-- list_abcxyz_reports {}
+get_costs_columns(args={})
+- Аргументы: не нужны.
+- Возвращает: список колонок файла costs.xlsx.
+- Используй, когда нужно понять структуру файла costs.xlsx.
 
-Месячные отчёты:
-- get_month_summary {"period": "2025-12"}
-- get_top_profit {"period": "2025-12", "n": 10}
-- get_top_orders {"period": "2025-12", "n": 10}
-- get_artikul_stats {"period": "2025-12", "artikul": "12345"}
-- search_artikul {"query": "доска круглая"}
+get_artikul_cost(args={"artikul":"1302"})
+- Обязательный аргумент: artikul.
+- Возвращает: строку по артикулу из costs.xlsx.
+- Используй для проверки себестоимости или полей costs.xlsx по одному артикулу.
 
-Costs:
-- get_costs_columns {}
-- get_artikul_cost {"artikul": "12345"}
-- get_costs_bulk {"artikuls": ["12345","67890"]}
+get_costs_bulk(args={"artikuls":["1302","1310"]})
+- Обязательный аргумент: artikuls.
+- Возвращает: results и count по нескольким артикулам из costs.xlsx.
+- Используй, когда нужно получить cost-данные сразу для нескольких артикулов.
 
-ABC&XYZ:
-- get_abcxyz_summary {"period": "Ноябрь 2025-Декабрь 2025"}
-- get_artikul_abcxyz {"period": "...", "artikul": "12345"}
-- get_category_list {"period": "...", "category": "AX"}
+get_abcxyz_summary(args={"period":"Ноябрь 2025-Декабрь 2025"})
+- Обязательный аргумент: period.
+- Возвращает: сводку ABC&XYZ отчёта.
+- Используй, когда вопрос касается ABC/XYZ анализа.
 
-# 6) Нормализация периода
-Если пользователь пишет месяц словами ("Декабрь 2025"), можно использовать его как period.
-Если пользователь пишет "2025-12" — используй этот формат.
+get_artikul_abcxyz(args={"period":"...","artikul":"1302"})
+- Функция пока в разработке и может вернуть error.
+- Не выбирай её без необходимости.
 
-# 7) Стиль ответа в FINAL_ANSWER
-- Коротко и по делу на русском
-- С эмодзи для акцентов (📊 📈 💰 ⚠️ ✅ ❌ 🔍 💡)
-- Если есть ошибки в данных — объясни простыми словами
-- Предлагай конкретные шаги (что сделать на Ozon / в программе)
+get_category_list(args={"period":"...","category":"AX"})
+- Функция пока в разработке и может вернуть error.
+- Не выбирай её без необходимости.
 
+# Правила для годового отчёта
+Если пользователь просит отчёт за год по прибыли или продажам артикулов:
+1. Сначала запроси list_reports.
+2. После получения list_reports выбери только реально существующие месяцы нужного года.
+3. Не запрашивай будущие месяцы, которых нет в list_reports.
+4. Затем верни DATA_REQUEST с несколькими get_month_report_full_data, по одному на каждый доступный месяц.
+5. После получения месячных отчётов верни FINAL_ANSWER и агрегируй данные по артикулам.
+
+Если в list_reports за """ + str(CURRENT_YEAR) + r""" год есть только Январь, Февраль, Март и Апрель, то используй только эти месяцы.
+
+# Few-shot примеры
+Запрос: "Что произошло в марте 2026?"
+Ответ:
+{"type":"DATA_REQUEST","needs":[{"tool":"get_month_summary","args":{"period":"2026-03"}}],"reason":"Нужна месячная сводка"}
+
+Запрос: "Покажи все данные за март 2026"
+Ответ:
+{"type":"DATA_REQUEST","needs":[{"tool":"get_month_report_full_data","args":{"period":"Март 2026"}}],"reason":"Нужен полный месячный отчёт"}
+
+Запрос: "Сделай отчёт по прибыли артикулов за этот год"
+Первый ответ:
+{"type":"DATA_REQUEST","needs":[{"tool":"list_reports","args":{}}],"reason":"Нужно определить доступные месяцы """ + str(CURRENT_YEAR) + r""" года"}
+
+Если после list_reports доступны Январь 2026, Февраль 2026, Март 2026, Апрель 2026, следующий ответ должен быть именно таким:
+{"type":"DATA_REQUEST","needs":[
+  {"tool":"get_month_report_full_data","args":{"period":"Январь 2026"}},
+  {"tool":"get_month_report_full_data","args":{"period":"Февраль 2026"}},
+  {"tool":"get_month_report_full_data","args":{"period":"Март 2026"}},
+  {"tool":"get_month_report_full_data","args":{"period":"Апрель 2026"}}
+],"reason":"Нужны полные месячные отчёты за доступные месяцы """ + str(CURRENT_YEAR) + r""" года"}
+
+# Правила точности
+- Не выдумывай периоды, месяцы и поля.
+- Если tool вернул error, не придумывай причину.
+- Если данных не хватает, запрашивай следующий tool.
+- Если пользователь просит отчёт за год, а доступны только часть месяцев, строй отчёт по доступным месяцам и явно скажи это в FINAL_ANSWER.
+
+# Стиль FINAL_ANSWER
+- На русском.
+- Коротко и по делу.
+- Без раскрытия внутренней механики.
 """
+
+def _extract_ollama_content(data: Dict[str, Any]) -> Optional[str]:
+    """Пытается извлечь текст ответа из разных форматов payload Ollama."""
+    parts: List[str] = []
+
+    message = data.get("message")
+    if isinstance(message, dict):
+        for key in ("content", "text"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+
+    for key in ("response", "content", "text"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+
+    thinking = data.get("thinking")
+    if isinstance(thinking, str) and thinking.strip():
+        parts.append(thinking.strip())
+
+    if not parts and isinstance(message, dict):
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            return json.dumps({"tool_calls": tool_calls}, ensure_ascii=False)
+
+    if not parts:
+        return None
+
+    unique_parts: List[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if part not in seen:
+            unique_parts.append(part)
+            seen.add(part)
+    return "\n".join(unique_parts).strip() or None
+
+
+def _extract_ollama_thinking(data: Dict[str, Any]) -> Optional[str]:
+    """Извлекает reasoning/thinking из payload Ollama, если он доступен."""
+    parts: List[str] = []
+    message = data.get("message")
+    if isinstance(message, dict):
+        for key in ("thinking", "reasoning"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+
+    for key in ("thinking", "reasoning"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+
+    if not parts:
+        return None
+
+    unique_parts: List[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if part not in seen:
+            unique_parts.append(part)
+            seen.add(part)
+    return "\n".join(unique_parts) or None
+
+
+def _extract_ollama_chunk(data: Dict[str, Any]) -> str:
+    """Извлекает сырой текстовый chunk без strip, чтобы не терять пробелы при стриминге."""
+    message = data.get("message")
+    if isinstance(message, dict):
+        for key in ("content", "text"):
+            value = message.get(key)
+            if isinstance(value, str):
+                return value
+    for key in ("response", "content", "text"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _extract_ollama_thinking_chunk(data: Dict[str, Any]) -> str:
+    """Извлекает сырой thinking chunk без strip, чтобы сохранить пробелы и переносы."""
+    message = data.get("message")
+    if isinstance(message, dict):
+        for key in ("thinking", "reasoning"):
+            value = message.get(key)
+            if isinstance(value, str):
+                return value
+    for key in ("thinking", "reasoning"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _send_ollama_chat(
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: Optional[int],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Отправляет запрос в локальный Ollama и возвращает текст ответа.
+    """
+    try:
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+            },
+        }
+        if max_tokens is not None:
+            payload["options"]["num_predict"] = max_tokens
+
+        response = requests.post(
+            OLLAMA_CHAT_URL,
+            json=payload,
+            timeout=120,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        usage_info = {
+            "prompt_eval_count": data.get("prompt_eval_count"),
+            "eval_count": data.get("eval_count"),
+        }
+        runtime_info = {
+            "model": data.get("model", OLLAMA_MODEL),
+            "done_reason": data.get("done_reason"),
+            "host": OLLAMA_HOST,
+            "raw_response": data,
+        }
+        content = _extract_ollama_content(data)
+        if not content:
+            return None, usage_info, runtime_info
+        return content, usage_info, runtime_info
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Ошибка при запросе к Ollama: {e}")
+        return None, None, None
+    except Exception as e:
+        print(f"⚠️ Неожиданная ошибка при работе с Ollama: {e}")
+        return None, None, None
+
+
+def _stream_ollama_chat(
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: Optional[int],
+    on_chunk=None,
+    on_thinking=None,
+    should_cancel=None,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Потоковый запрос к локальному Ollama. Возвращает полный текст ответа.
+    """
+    collected: List[str] = []
+    thinking_collected: List[str] = []
+    final_payload: Optional[Dict[str, Any]] = None
+    try:
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+            },
+        }
+        if max_tokens is not None:
+            payload["options"]["num_predict"] = max_tokens
+
+        with requests.post(
+            OLLAMA_CHAT_URL,
+            json=payload,
+            timeout=120,
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            last_thinking = ""
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if should_cancel and should_cancel():
+                    return None, None, None
+                if not raw_line:
+                    continue
+                data = json.loads(raw_line)
+                final_payload = data
+                chunk = _extract_ollama_chunk(data)
+                thinking_chunk = _extract_ollama_thinking_chunk(data)
+                if chunk:
+                    collected.append(chunk)
+                    if on_chunk:
+                        on_chunk(chunk)
+                if thinking_chunk:
+                    delta = thinking_chunk
+                    if last_thinking and thinking_chunk.startswith(last_thinking):
+                        delta = thinking_chunk[len(last_thinking):]
+                    last_thinking = thinking_chunk
+                    if delta:
+                        thinking_collected.append(delta)
+                        if on_thinking:
+                            on_thinking(delta)
+                if data.get("done"):
+                    break
+
+        usage_info = {
+            "prompt_eval_count": (final_payload or {}).get("prompt_eval_count"),
+            "eval_count": (final_payload or {}).get("eval_count"),
+        }
+        runtime_info = {
+            "model": (final_payload or {}).get("model", OLLAMA_MODEL),
+            "done_reason": (final_payload or {}).get("done_reason"),
+            "host": OLLAMA_HOST,
+            "raw_response": final_payload,
+            "thinking": "".join(thinking_collected).strip() or _extract_ollama_thinking(final_payload or {}),
+        }
+        content = "".join(collected).strip()
+        if not content:
+            content = _extract_ollama_content(final_payload or {}) or ""
+        if not content:
+            return None, usage_info, runtime_info
+        return content, usage_info, runtime_info
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Ошибка при потоковом запросе к Ollama: {e}")
+        return None, None, None
+    except Exception as e:
+        print(f"⚠️ Неожиданная ошибка при потоковом запросе к Ollama: {e}")
+        return None, None, None
+
+
+def check_ollama_model() -> Tuple[bool, str]:
+    """
+    Проверяет доступность Ollama и наличие выбранной модели.
+    """
+    try:
+        response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException:
+        return False, f"Ollama недоступен по адресу {OLLAMA_HOST}"
+
+    models = data.get("models", []) or []
+    available = {
+        item.get("name")
+        for item in models
+        if isinstance(item, dict) and item.get("name")
+    }
+    if OLLAMA_MODEL not in available:
+        return False, (
+            f"Модель {OLLAMA_MODEL} не найдена в Ollama. "
+            f"Скачайте её командой: ollama pull {OLLAMA_MODEL}"
+        )
+
+    return True, ""
 
 
 def load_costs_data(repo_root: Path) -> Optional[Dict[str, Any]]:
@@ -241,7 +487,7 @@ def load_costs_data(repo_root: Path) -> Optional[Dict[str, Any]]:
         return None
     
     try:
-        df = pd.read_excel(costs_path)
+        df = read_costs_dataframe(costs_path)
         
         # Преобразуем DataFrame в словарь для удобной передачи ИИ
         costs_data = {
@@ -272,6 +518,163 @@ def load_costs_data(repo_root: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _normalize_column_name(value: Any) -> str:
+    """Приводит имя колонки к устойчивому виду для поиска по меняющимся отчётам."""
+    if value is None:
+        return ""
+    text = str(value).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_column_key(value: Any) -> str:
+    return _normalize_column_name(value).lower()
+
+
+def _to_json_compatible(value: Any) -> Any:
+    if pd.isna(value):
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    return str(value)
+
+
+def _build_column_lookup(df: pd.DataFrame) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for col in df.columns:
+        normalized = _normalize_column_key(col)
+        if normalized and normalized not in lookup:
+            lookup[normalized] = col
+    return lookup
+
+
+def _find_column(column_lookup: Dict[str, str], *candidates: str, contains: bool = False) -> Optional[str]:
+    normalized_candidates = [_normalize_column_key(candidate) for candidate in candidates if candidate]
+    if not normalized_candidates:
+        return None
+
+    if not contains:
+        for candidate in normalized_candidates:
+            if candidate in column_lookup:
+                return column_lookup[candidate]
+
+    for normalized_name, original_name in column_lookup.items():
+        if any(candidate and candidate in normalized_name for candidate in normalized_candidates):
+            return original_name
+    return None
+
+
+def _serialize_dataframe_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        row_dict: Dict[str, Any] = {}
+        for col in df.columns:
+            row_dict[_normalize_column_name(col)] = _to_json_compatible(row[col])
+        rows.append(row_dict)
+    return rows
+
+
+def _to_float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().replace(",", ".")
+        if not text or text == "-":
+            return None
+        value = text
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(numeric):
+        return None
+    return float(numeric)
+
+
+def _normalize_status_name(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def _normalize_artikul_identifier(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if re.fullmatch(r"\d+\.0", text):
+        return text[:-2]
+    return text
+
+
+def _extract_year_from_text(text: str) -> Optional[int]:
+    return extract_year_from_text_core(text, CURRENT_YEAR)
+
+
+def _is_yearly_artikul_report_request(user_message: Optional[str], results: Dict[str, Any]) -> bool:
+    return is_yearly_artikul_report_request_core(user_message, results, CURRENT_YEAR)
+
+
+def detect_workflow(user_message: Optional[str]) -> WorkflowState:
+    return detect_workflow_core(user_message, CURRENT_YEAR)
+
+
+def _extract_available_year_periods_from_list_reports(
+    results: Dict[str, Any],
+    year: Optional[int],
+) -> List[str]:
+    list_reports_result = results.get("list_reports")
+    if not isinstance(list_reports_result, dict):
+        return []
+    reports = list_reports_result.get("reports")
+    if not isinstance(reports, list):
+        return []
+
+    periods_with_sort_keys: List[Tuple[Tuple[int, int], str]] = []
+    for item in reports:
+        if not isinstance(item, dict):
+            continue
+        period = str(item.get("period") or "").strip()
+        if not period:
+            continue
+        period_year = _extract_year_from_text(period)
+        if year is not None and period_year != year:
+            continue
+
+        month_number = 0
+        for idx, month_name in enumerate(MONTHS_RU, start=1):
+            if period.lower().startswith(month_name.lower()):
+                month_number = idx
+                break
+        if period_year is None:
+            period_year = year or 0
+        periods_with_sort_keys.append(((period_year, month_number), period))
+
+    periods_with_sort_keys.sort()
+    return [period for _, period in periods_with_sort_keys]
+
+
+def build_workflow_state(user_message: Optional[str], results: Dict[str, Any]) -> WorkflowState:
+    return build_workflow_state_core(user_message, results, CURRENT_YEAR, MONTHS_RU)
+
+
+def get_workflow_followup_needs(user_message: Optional[str], results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return get_workflow_followup_needs_core(user_message, results, CURRENT_YEAR, MONTHS_RU)
+
+
+def build_yearly_artikul_profit_summary(
+    results: Dict[str, Any],
+    user_message: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    return build_yearly_artikul_profit_summary_core(results, user_message, CURRENT_YEAR)
+
+
+def build_workflow_fallback_answer(user_message: Optional[str], results: Dict[str, Any]) -> Optional[str]:
+    return build_workflow_fallback_answer_core(user_message, results, CURRENT_YEAR)
+
+
 def load_monthly_report_detailed_data(report_path: Path) -> Optional[Dict[str, Any]]:
     """
     Загружает детальные данные из месячного отчёта (лист "Заказы").
@@ -281,156 +684,200 @@ def load_monthly_report_detailed_data(report_path: Path) -> Optional[Dict[str, A
         Словарь с агрегированными данными или None в случае ошибки
     """
     if not report_path.exists():
-        return None
-    
+        return {"error": f"Файл отчёта не найден: {report_path.name}"}
+
     try:
         df = pd.read_excel(report_path, sheet_name=ORDER_SHEET)
-        
-        if df.empty:
-            return None
-        
-        report_name = report_path.stem
-        detailed_data = {
-            "Период отчёта": report_name,
-            "Всего заказов": len(df),
-            "Колонки": list(df.columns),
-        }
-        
-        # Агрегируем данные по артикулам
-        if "Артикул" in df.columns:
-            artikul_stats = []
-            
-            # Группируем по артикулам
-            for artikul in df["Артикул"].dropna().unique():
-                artikul_df = df[df["Артикул"] == artikul]
-                
-                stats = {
-                    "Артикул": str(artikul),
-                    "Количество заказов": len(artikul_df),
-                }
-                
-                # Суммируем числовые колонки
-                numeric_cols = ["Количество шт.", "Цена продажи", "Комиссия за продажу Ozon", 
-                               "Логистика (Включает операционные ошибки продавца)", 
-                               "Сумма начисления", "Себестоимость", "Прибыль"]
-                
-                for col in numeric_cols:
-                    if col in artikul_df.columns:
-                        total = artikul_df[col].sum()
-                        if pd.notna(total):
-                            stats[f"Сумма {col}"] = float(total)
-                            stats[f"Средняя {col}"] = float(artikul_df[col].mean())
-                
-                # Статистика по статусам
-                if "Статус" in artikul_df.columns:
-                    status_counts = artikul_df["Статус"].value_counts().to_dict()
-                    stats["Распределение по статусам"] = {str(k): int(v) for k, v in status_counts.items()}
-                
-                # Статистика по схемам
-                if "Схема" in artikul_df.columns:
-                    schema_counts = artikul_df["Схема"].value_counts().to_dict()
-                    stats["Распределение по схемам"] = {str(k): int(v) for k, v in schema_counts.items()}
-                
-                artikul_stats.append(stats)
-            
-            detailed_data["Статистика по артикулам"] = artikul_stats
-        
-        # Общая статистика по статусам
-        if "Статус" in df.columns:
-            status_counts = df["Статус"].value_counts().to_dict()
-            detailed_data["Общее распределение по статусам"] = {str(k): int(v) for k, v in status_counts.items()}
-        
-        # Общая статистика по схемам
-        if "Схема" in df.columns:
-            schema_counts = df["Схема"].value_counts().to_dict()
-            detailed_data["Общее распределение по схемам"] = {str(k): int(v) for k, v in schema_counts.items()}
-        
-        # Топ-10 артикулов по прибыли
-        if "Прибыль" in df.columns and "Артикул" in df.columns:
-            top_profit = df.groupby("Артикул")["Прибыль"].sum().nlargest(10)
-            detailed_data["Топ-10 артикулов по прибыли"] = {
-                str(artikul): float(profit) for artikul, profit in top_profit.items()
-            }
-        
-        # Топ-10 артикулов по количеству заказов
-        if "Артикул" in df.columns:
-            top_orders = df["Артикул"].value_counts().head(10)
-            detailed_data["Топ-10 артикулов по количеству заказов"] = {
-                str(artikul): int(count) for artikul, count in top_orders.items()
-            }
-        
-        return detailed_data
-        
+    except ValueError:
+        return {"error": f"Лист '{ORDER_SHEET}' не найден в отчёте {report_path.name}"}
     except Exception as e:
-        return None
+        return {"error": f"Ошибка чтения отчёта {report_path.name}: {e}"}
+
+    if df.empty:
+        return {"error": f"Лист '{ORDER_SHEET}' пуст в отчёте {report_path.name}"}
+
+    df.columns = [_normalize_column_name(col) for col in df.columns]
+    summary_data = load_report_summary(report_path) or {}
+    summary_metric_names = {
+        key for key in summary_data.keys()
+        if key and key != "Период отчёта"
+    }
+
+    row_columns = [
+        col for col in df.columns
+        if col
+        and not _normalize_column_key(col).startswith("unnamed:")
+        and col not in summary_metric_names
+        and not re.fullmatch(r"-?\d+(?:\.\d+)?", str(col))
+    ]
+    work_df = df[row_columns].copy() if row_columns else df.copy()
+    column_lookup = _build_column_lookup(work_df)
+
+    artikul_col = _find_column(column_lookup, "Артикул", "offer_id", "offer id", contains=True)
+    status_col = _find_column(column_lookup, "Статус", contains=True)
+    schema_col = _find_column(column_lookup, "Схема", contains=True)
+    profit_col = _find_column(column_lookup, "Прибыль", contains=True)
+
+    numeric_aliases = [
+        "Количество шт.",
+        "Цена продажи",
+        "Комиссия за продажу Ozon",
+        "Логистика (Включает операционные ошибки продавца)",
+        "Сумма начисления",
+        "Себестоимость",
+        "Прибыль",
+    ]
+    resolved_numeric_cols: List[str] = []
+    for alias in numeric_aliases:
+        col = _find_column(column_lookup, alias, contains=True)
+        if col and col not in resolved_numeric_cols:
+            resolved_numeric_cols.append(col)
+
+    report_name = report_path.stem
+    detailed_data: Dict[str, Any] = {
+        "Период отчёта": report_name,
+        "Всего строк отчёта": int(len(work_df)),
+        "Колонки": list(work_df.columns),
+        "Сводка отчёта": summary_data,
+        "Строки отчёта": _serialize_dataframe_rows(work_df),
+        "Диагностика колонок": {
+            "Артикул": artikul_col,
+            "Статус": status_col,
+            "Схема": schema_col,
+            "Прибыль": profit_col,
+            "Числовые колонки": resolved_numeric_cols,
+            "Отфильтрованные служебные колонки": [col for col in df.columns if col not in work_df.columns],
+        },
+    }
+
+    if artikul_col:
+        artikul_stats = []
+        for artikul in work_df[artikul_col].dropna().unique():
+            artikul_df = work_df[work_df[artikul_col] == artikul]
+            stats: Dict[str, Any] = {
+                "Артикул": str(artikul),
+                "Количество заказов": int(len(artikul_df)),
+                "Строки отчёта": _serialize_dataframe_rows(artikul_df),
+            }
+
+            for col in resolved_numeric_cols:
+                numeric_series = pd.to_numeric(artikul_df[col], errors="coerce")
+                total = numeric_series.sum()
+                avg = numeric_series.mean()
+                if pd.notna(total):
+                    stats[f"Сумма {col}"] = float(total)
+                if pd.notna(avg):
+                    stats[f"Средняя {col}"] = float(avg)
+
+            if status_col:
+                status_counts = artikul_df[status_col].value_counts(dropna=False).to_dict()
+                stats["Распределение по статусам"] = {str(k): int(v) for k, v in status_counts.items()}
+
+            if schema_col:
+                schema_counts = artikul_df[schema_col].value_counts(dropna=False).to_dict()
+                stats["Распределение по схемам"] = {str(k): int(v) for k, v in schema_counts.items()}
+
+            artikul_stats.append(stats)
+
+        detailed_data["Статистика по артикулам"] = artikul_stats
+
+    if status_col:
+        status_counts = work_df[status_col].value_counts(dropna=False).to_dict()
+        detailed_data["Общее распределение по статусам"] = {str(k): int(v) for k, v in status_counts.items()}
+
+    if schema_col:
+        schema_counts = work_df[schema_col].value_counts(dropna=False).to_dict()
+        detailed_data["Общее распределение по схемам"] = {str(k): int(v) for k, v in schema_counts.items()}
+
+    if profit_col and artikul_col:
+        profit_df = work_df[[artikul_col, profit_col]].copy()
+        profit_df[profit_col] = pd.to_numeric(profit_df[profit_col], errors="coerce")
+        top_profit = profit_df.groupby(artikul_col)[profit_col].sum().nlargest(10)
+        detailed_data["Топ-10 артикулов по прибыли"] = {
+            str(artikul): float(profit) for artikul, profit in top_profit.items() if pd.notna(profit)
+        }
+
+    if artikul_col:
+        top_orders = work_df[artikul_col].value_counts().head(10)
+        detailed_data["Топ-10 артикулов по количеству заказов"] = {
+            str(artikul): int(count) for artikul, count in top_orders.items()
+        }
+
+    return detailed_data
 
 
 def load_report_summary(report_path: Path) -> Optional[Dict[str, Any]]:
     """
     Загружает сводку из месячного отчёта.
     Читает итоговые показатели из колонок P и Q листа "Заказы".
+    Блок метрик определяется динамически: берём все подряд идущие
+    бизнес-показатели сверху листа, пока не встретим длинную серию пустых строк.
     
     Returns:
         Словарь с метриками отчёта или None в случае ошибки
     """
-    if not report_path.exists():
-        return None
-    
-    try:
-        wb = load_workbook(report_path, data_only=True)
-        if ORDER_SHEET not in wb.sheetnames:
+    with ExitStack() as books:
+        if not report_path.exists():
             return None
+    
+        try:
+            wb = books.enter_context(closing(load_workbook(report_path, data_only=True)))
+            if ORDER_SHEET not in wb.sheetnames:
+                return None
         
-        ws = wb[ORDER_SHEET]
+            ws = wb[ORDER_SHEET]
         
-        # Читаем итоговые показатели из колонок P и Q
-        # Структура: P1-Q1: Общая выручка, P2-Q2: Чистая прибыль, и т.д.
-        summary = {}
-        
-        # Маппинг строк к названиям метрик
-        metrics_map = {
-            1: "Общая выручка",
-            2: "Чистая прибыль",
-            3: "Итоговая себестоимость",
-            4: "Рентабельность по чистой прибыли (Net Profit Margin) %",
-            5: "COGS (валовая прибыль)",
-            6: "Gross Profit Margin Рентабельность по валовой прибыли %",
-            7: "Операционные расходы",
-            8: "Продвижение Ozon",
-            9: "Звёздные товары",
-            10: "Внешний маркетинг",
-            11: "Средний чек",
-            12: "Общее количество заказов",
-            13: "Количество отменённых заказов",
-            14: "Количество доставленных заказов",
-            15: "Комиссии Ozon %",
-            16: "Логистика %",
-        }
-        
-        for row_num, metric_name in metrics_map.items():
-            value = ws[f"Q{row_num}"].value
-            if value is not None:
+            summary = {}
+
+            def normalize_value(value: Any) -> Any:
                 try:
-                    # Пробуем преобразовать в число
                     if isinstance(value, (int, float)):
-                        summary[metric_name] = float(value)
-                    elif isinstance(value, str):
-                        # Пробуем распарсить строку
+                        return float(value)
+                    if isinstance(value, str):
                         cleaned = value.replace(",", ".").replace(" ", "")
-                        summary[metric_name] = float(cleaned)
-                    else:
-                        summary[metric_name] = value
+                        return float(cleaned)
                 except (ValueError, TypeError):
-                    summary[metric_name] = value
+                    pass
+                return value
+
+            started_metrics = False
+            empty_streak = 0
+            max_scan_rows = 200
+            max_empty_streak = 10
+
+            for row_num in range(1, max_scan_rows + 1):
+                metric_name = ws[f"P{row_num}"].value
+                value = ws[f"Q{row_num}"].value
+
+                metric_name = str(metric_name).strip() if metric_name is not None else ""
+
+                if metric_name:
+                    started_metrics = True
+                    empty_streak = 0
+                    summary[metric_name] = normalize_value(value)
+                    continue
+
+                if value is not None:
+                    # Если у строки почему-то нет подписи, но есть значение,
+                    # сохраняем его с техническим именем, чтобы не потерять показатель.
+                    started_metrics = True
+                    empty_streak = 0
+                    summary[f"Показатель P{row_num}"] = normalize_value(value)
+                    continue
+
+                if started_metrics:
+                    empty_streak += 1
+                    if empty_streak >= max_empty_streak:
+                        break
         
-        # Добавляем информацию о периоде отчёта из имени файла
-        report_name = report_path.stem  # Без расширения
-        summary["Период отчёта"] = report_name
+            # Добавляем информацию о периоде отчёта из имени файла
+            report_name = report_path.stem  # Без расширения
+            summary["Период отчёта"] = report_name
         
-        return summary if summary else None
+            return summary if summary else None
         
-    except Exception as e:
-        return None
+        except Exception as e:
+            return None
 
 
 def list_available_reports(repo_root: Path) -> List[Path]:
@@ -446,7 +893,7 @@ def list_available_reports(repo_root: Path) -> List[Path]:
     
     reports = []
     for file_path in reports_dir.glob("*.xlsx"):
-        if file_path.is_file():
+        if file_path.is_file() and not file_path.name.startswith(("~$", "~tmp_")):
             reports.append(file_path)
     
     # Сортируем по дате изменения (новые первыми)
@@ -468,7 +915,7 @@ def list_abc_xyz_reports(repo_root: Path) -> List[Path]:
     
     reports = []
     for file_path in abc_xyz_dir.glob("*.xlsx"):
-        if file_path.is_file():
+        if file_path.is_file() and not file_path.name.startswith(("~$", "~tmp_")):
             reports.append(file_path)
     
     # Сортируем по дате изменения (новые первыми)
@@ -485,91 +932,92 @@ def load_abc_xyz_summary(report_path: Path) -> Optional[Dict[str, Any]]:
     Returns:
         Словарь с метриками отчёта или None в случае ошибки
     """
-    if not report_path.exists():
-        return None
+    with ExitStack() as books:
+        if not report_path.exists():
+            return None
     
-    try:
-        wb = load_workbook(report_path, data_only=True)
-        summary = {}
+        try:
+            wb = books.enter_context(closing(load_workbook(report_path, data_only=True)))
+            summary = {}
         
-        # Добавляем информацию о периоде отчёта из имени файла
-        report_name = report_path.stem  # Без расширения
-        summary["Период отчёта"] = report_name
-        summary["Тип отчёта"] = "ABC&XYZ"
+            # Добавляем информацию о периоде отчёта из имени файла
+            report_name = report_path.stem  # Без расширения
+            summary["Период отчёта"] = report_name
+            summary["Тип отчёта"] = "ABC&XYZ"
         
-        # Читаем лист "Итог" для получения общей статистики
-        if "Итог" in wb.sheetnames:
-            ws = wb["Итог"]
-            # Подсчитываем количество артикулов в каждой категории ABCXYZ
-            abcxyz_counts = {}
-            total_articles = 0
+            # Читаем лист "Итог" для получения общей статистики
+            if "Итог" in wb.sheetnames:
+                ws = wb["Итог"]
+                # Подсчитываем количество артикулов в каждой категории ABCXYZ
+                abcxyz_counts = {}
+                total_articles = 0
             
-            # Ищем колонку с общей оценкой ABCXYZ (обычно последняя или предпоследняя)
-            # Пробуем найти заголовок
-            header_row = 1
-            abcxyz_col = None
+                # Ищем колонку с общей оценкой ABCXYZ (обычно последняя или предпоследняя)
+                # Пробуем найти заголовок
+                header_row = 1
+                abcxyz_col = None
             
-            for col_idx in range(1, ws.max_column + 1):
-                cell_value = ws.cell(header_row, col_idx).value
-                if cell_value and ("ABCXYZ" in str(cell_value) or "Оценка" in str(cell_value)):
-                    abcxyz_col = col_idx
-                    break
+                for col_idx in range(1, ws.max_column + 1):
+                    cell_value = ws.cell(header_row, col_idx).value
+                    if cell_value and ("ABCXYZ" in str(cell_value) or "Оценка" in str(cell_value)):
+                        abcxyz_col = col_idx
+                        break
             
-            # Если не нашли по заголовку, пробуем последнюю колонку
-            if abcxyz_col is None:
-                abcxyz_col = ws.max_column
+                # Если не нашли по заголовку, пробуем последнюю колонку
+                if abcxyz_col is None:
+                    abcxyz_col = ws.max_column
             
-            # Подсчитываем категории
-            for row in range(2, ws.max_row + 1):
-                cell_value = ws.cell(row, abcxyz_col).value
-                if cell_value:
-                    category = str(cell_value).strip()
-                    if category and category != "Недостаточно данных":
-                        abcxyz_counts[category] = abcxyz_counts.get(category, 0) + 1
-                        total_articles += 1
+                # Подсчитываем категории
+                for row in range(2, ws.max_row + 1):
+                    cell_value = ws.cell(row, abcxyz_col).value
+                    if cell_value:
+                        category = str(cell_value).strip()
+                        if category and category != "Недостаточно данных":
+                            abcxyz_counts[category] = abcxyz_counts.get(category, 0) + 1
+                            total_articles += 1
             
-            summary["Всего артикулов"] = total_articles
-            summary["Распределение по категориям ABCXYZ"] = abcxyz_counts
+                summary["Всего артикулов"] = total_articles
+                summary["Распределение по категориям ABCXYZ"] = abcxyz_counts
         
-        # Читаем лист "ABC" для статистики по прибыли
-        if "ABC" in wb.sheetnames:
-            try:
-                df_abc = pd.read_excel(report_path, sheet_name="ABC")
-                if not df_abc.empty:
-                    # Ищем колонку с прибылью
-                    profit_col = None
-                    for col in df_abc.columns:
-                        if "прибыль" in str(col).lower() or "profit" in str(col).lower():
-                            profit_col = col
-                            break
+            # Читаем лист "ABC" для статистики по прибыли
+            if "ABC" in wb.sheetnames:
+                try:
+                    df_abc = pd.read_excel(report_path, sheet_name="ABC")
+                    if not df_abc.empty:
+                        # Ищем колонку с прибылью
+                        profit_col = None
+                        for col in df_abc.columns:
+                            if "прибыль" in str(col).lower() or "profit" in str(col).lower():
+                                profit_col = col
+                                break
                     
-                    if profit_col is not None:
-                        total_profit = df_abc[profit_col].sum()
-                        summary["Общая прибыль (ABC)"] = float(total_profit)
+                        if profit_col is not None:
+                            total_profit = df_abc[profit_col].sum()
+                            summary["Общая прибыль (ABC)"] = float(total_profit)
                         
-                        # Подсчитываем артикулы по категориям A, B, C
-                        if "ABC" in df_abc.columns:
-                            abc_dist = df_abc["ABC"].value_counts().to_dict()
-                            summary["Распределение ABC"] = {str(k): int(v) for k, v in abc_dist.items()}
-            except Exception:
-                pass
+                            # Подсчитываем артикулы по категориям A, B, C
+                            if "ABC" in df_abc.columns:
+                                abc_dist = df_abc["ABC"].value_counts().to_dict()
+                                summary["Распределение ABC"] = {str(k): int(v) for k, v in abc_dist.items()}
+                except Exception:
+                    pass
         
-        # Читаем лист "XYZ" для статистики по стабильности
-        if "XYZ" in wb.sheetnames:
-            try:
-                df_xyz = pd.read_excel(report_path, sheet_name="XYZ")
-                if not df_xyz.empty:
-                    # Подсчитываем артикулы по категориям X, Y1, Y2, Y3, Y, Z
-                    if "XYZ" in df_xyz.columns:
-                        xyz_dist = df_xyz["XYZ"].value_counts().to_dict()
-                        summary["Распределение XYZ"] = {str(k): int(v) for k, v in xyz_dist.items()}
-            except Exception:
-                pass
+            # Читаем лист "XYZ" для статистики по стабильности
+            if "XYZ" in wb.sheetnames:
+                try:
+                    df_xyz = pd.read_excel(report_path, sheet_name="XYZ")
+                    if not df_xyz.empty:
+                        # Подсчитываем артикулы по категориям X, Y1, Y2, Y3, Y, Z
+                        if "XYZ" in df_xyz.columns:
+                            xyz_dist = df_xyz["XYZ"].value_counts().to_dict()
+                            summary["Распределение XYZ"] = {str(k): int(v) for k, v in xyz_dist.items()}
+                except Exception:
+                    pass
         
-        return summary if summary else None
+            return summary if summary else None
         
-    except Exception as e:
-        return None
+        except Exception as e:
+            return None
 
 
 def format_costs_data_for_ai(costs_data: Dict[str, Any]) -> str:
@@ -882,16 +1330,21 @@ class Tools:
         self.repo_root = repo_root
         self._costs_df = None  # Кеш для costs.xlsx
         self._costs_columns = None
+        self._costs_signature = None
     
     def _get_costs_df(self) -> Optional[pd.DataFrame]:
         """Загружает costs.xlsx с кешированием."""
-        if self._costs_df is None:
-            costs_path = self.repo_root / "costs.xlsx"
-            if costs_path.exists():
-                try:
-                    self._costs_df = pd.read_excel(costs_path)
-                except Exception:
-                    return None
+        costs_path = self.repo_root / "costs.xlsx"
+        try:
+            stat = costs_path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            if self._costs_df is None or signature != self._costs_signature:
+                self._costs_df = read_costs_dataframe(costs_path)
+                self._costs_signature = signature
+        except Exception:
+            self._costs_df = None
+            self._costs_signature = None
+            return None
         return self._costs_df
     
     def _normalize_period(self, period: str) -> Optional[Path]:
@@ -953,6 +1406,21 @@ class Tools:
         if summary:
             return summary
         return {"error": "Не удалось загрузить сводку"}
+
+    def get_month_report_full_data(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Возвращает полный набор данных месячного отчёта."""
+        period = args.get("period", "")
+        if not period:
+            return {"error": "Параметр period обязателен"}
+
+        report_path = self._normalize_period(period)
+        if not report_path:
+            return {"error": f"Отчёт за период '{period}' не найден"}
+
+        detailed = load_monthly_report_detailed_data(report_path)
+        if not detailed:
+            return {"error": "Не удалось загрузить данные отчёта"}
+        return detailed
     
     def get_top_profit(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Возвращает топ-N артикулов по прибыли."""
@@ -969,6 +1437,8 @@ class Tools:
         detailed = load_monthly_report_detailed_data(report_path)
         if not detailed:
             return {"error": "Не удалось загрузить данные"}
+        if detailed.get("error"):
+            return detailed
         
         top_profit = detailed.get("Топ-10 артикулов по прибыли", {})
         # Ограничиваем до n
@@ -990,6 +1460,8 @@ class Tools:
         detailed = load_monthly_report_detailed_data(report_path)
         if not detailed:
             return {"error": "Не удалось загрузить данные"}
+        if detailed.get("error"):
+            return detailed
         
         top_orders = detailed.get("Топ-10 артикулов по количеству заказов", {})
         # Ограничиваем до n
@@ -1011,6 +1483,8 @@ class Tools:
         detailed = load_monthly_report_detailed_data(report_path)
         if not detailed:
             return {"error": "Не удалось загрузить данные"}
+        if detailed.get("error"):
+            return detailed
         
         artikul_stats = detailed.get("Статистика по артикулам", [])
         for stats in artikul_stats:
@@ -1130,11 +1604,210 @@ def parse_ai_response(response_text: str) -> Optional[Dict[str, Any]]:
     # Убираем лишние пробелы в начале и конце
     response_text = response_text.strip()
     
+    def normalize_parsed_response(parsed: Any) -> Optional[Dict[str, Any]]:
+        def coerce_tool_call(item: Any) -> List[Dict[str, Any]]:
+            if not isinstance(item, dict):
+                return []
+
+            tool_name = item.get("tool")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                tool_name = item.get("instrument")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                tool_name = item.get("action")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                tool_name = item.get("method")
+
+            args = item.get("args")
+            if not isinstance(args, dict):
+                args = item.get("parameters")
+            if not isinstance(args, dict):
+                args = item.get("params")
+            if not isinstance(args, dict):
+                args = item.get("arguments")
+            if not isinstance(args, dict):
+                args = {}
+
+            if isinstance(tool_name, str) and tool_name.strip() and not args:
+                reserved = {
+                    "tool", "instrument", "action", "method",
+                    "args", "parameters", "params", "arguments",
+                }
+                args = {
+                    key: value
+                    for key, value in item.items()
+                    if key not in reserved
+                }
+
+            return expand_args_for_tool(tool_name, args)
+
+        def expand_args_for_tool(tool_name: str, args: Any) -> List[Dict[str, Any]]:
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                return []
+            clean_tool = tool_name.strip()
+            if not isinstance(args, dict):
+                args = {}
+
+            months_value = args.get("months")
+            year_value = args.get("year")
+            if clean_tool == "get_month_report_full_data" and isinstance(months_value, list):
+                month_map = {
+                    "january": "Январь",
+                    "february": "Февраль",
+                    "march": "Март",
+                    "april": "Апрель",
+                    "may": "Май",
+                    "june": "Июнь",
+                    "july": "Июль",
+                    "august": "Август",
+                    "september": "Сентябрь",
+                    "october": "Октябрь",
+                    "november": "Ноябрь",
+                    "december": "Декабрь",
+                }
+                expanded: List[Dict[str, Any]] = []
+                for item in months_value:
+                    if not isinstance(item, str):
+                        continue
+                    month_text = item.strip()
+                    if not month_text:
+                        continue
+                    lower_month = month_text.lower()
+                    if re.match(r"^[а-яa-z]+\s+\d{4}$", lower_month):
+                        month_name, year_part = lower_month.split(maxsplit=1)
+                        month_ru = month_map.get(month_name, month_name.capitalize())
+                        expanded.append({"tool": clean_tool, "args": {"period": f"{month_ru} {year_part}"}})
+                        continue
+                    month_ru = month_map.get(lower_month)
+                    if month_ru and year_value is not None:
+                        expanded.append({"tool": clean_tool, "args": {"period": f"{month_ru} {year_value}"}})
+                if expanded:
+                    return expanded
+
+            return [{"tool": clean_tool, "args": args}]
+
+        if not isinstance(parsed, dict):
+            return None
+
+        if "type" not in parsed and isinstance(parsed.get("needs"), list):
+            reason = parsed.get("reason")
+            if not isinstance(reason, str):
+                reason = ""
+            generated_needs: List[Dict[str, Any]] = []
+            for item in parsed.get("needs", []):
+                generated_needs.extend(coerce_tool_call(item))
+            return {"type": "DATA_REQUEST", "needs": generated_needs, "reason": reason}
+
+        if "type" in parsed:
+            parsed_type = parsed.get("type")
+            normalized_type = str(parsed_type).strip().upper() if parsed_type is not None else ""
+            if normalized_type == "FINAL_ANSWER":
+                answer = parsed.get("answer")
+                if not isinstance(answer, str):
+                    answer = parsed.get("content")
+                if not isinstance(answer, str):
+                    answer = parsed.get("text")
+                return {"type": "FINAL_ANSWER", "answer": answer or ""}
+
+            if normalized_type == "DATA_REQUEST":
+                needs = parsed.get("needs")
+                if isinstance(needs, list):
+                    normalized_needs: List[Dict[str, Any]] = []
+                    for item in needs:
+                        normalized_needs.extend(coerce_tool_call(item))
+                    needs = normalized_needs
+                else:
+                    requests_list = parsed.get("requests")
+                    if isinstance(requests_list, list):
+                        needs = []
+                        for item in requests_list:
+                            needs.extend(coerce_tool_call(item))
+                if not isinstance(needs, list):
+                    needs = []
+                if not needs:
+                    data_block = parsed.get("data")
+                    if isinstance(data_block, dict):
+                        months = data_block.get("months")
+                        year = data_block.get("year")
+                        if isinstance(months, list) and year is not None:
+                            month_map = {
+                                "january": "Январь",
+                                "february": "Февраль",
+                                "march": "Март",
+                                "april": "Апрель",
+                                "may": "Май",
+                                "june": "Июнь",
+                                "july": "Июль",
+                                "august": "Август",
+                                "september": "Сентябрь",
+                                "october": "Октябрь",
+                                "november": "Ноябрь",
+                                "december": "Декабрь",
+                            }
+                            generated_needs = []
+                            for month in months:
+                                if not isinstance(month, str):
+                                    continue
+                                month_ru = month_map.get(month.strip().lower())
+                                if not month_ru:
+                                    continue
+                                generated_needs.append(
+                                    {
+                                        "tool": "get_month_report_full_data",
+                                        "args": {"period": f"{month_ru} {year}"},
+                                    }
+                                )
+                            if generated_needs:
+                                needs = generated_needs
+                reason = parsed.get("reason")
+                if not isinstance(reason, str):
+                    reason = ""
+                return {"type": "DATA_REQUEST", "needs": needs, "reason": reason}
+
+        # Fallback для legacy-схемы некоторых моделей:
+        # {"tool":"list_reports","parameters":{}}
+        tool_name = parsed.get("tool")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            tool_name = parsed.get("action")
+        if isinstance(tool_name, str) and tool_name.strip():
+            args = parsed.get("args")
+            if not isinstance(args, dict):
+                args = parsed.get("parameters")
+            if not isinstance(args, dict):
+                args = parsed.get("params")
+            if not isinstance(args, dict):
+                args = parsed.get("arguments")
+            if not isinstance(args, dict):
+                args = {}
+            reason = parsed.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                reason = f"Нужны данные через инструмент {tool_name}"
+            return {"type": "DATA_REQUEST", "needs": expand_args_for_tool(tool_name, args), "reason": reason}
+
+        # Fallback для dict вида {"get_month_report_full_data":[{"period":"Январь 2026"}, ...]}
+        generated_needs: List[Dict[str, Any]] = []
+        for key, value in parsed.items():
+            if not isinstance(key, str) or not key.strip():
+                continue
+            if key in {"type", "reason", "answer", "content", "text", "data", "needs", "requests", "tool", "action", "args", "parameters", "params", "arguments"}:
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    generated_needs.extend(expand_args_for_tool(key, item))
+            elif isinstance(value, dict):
+                generated_needs.extend(expand_args_for_tool(key, value))
+        if generated_needs:
+            reason = parsed.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                reason = "Нужны дополнительные данные из инструментов"
+            return {"type": "DATA_REQUEST", "needs": generated_needs, "reason": reason}
+        return None
+
     # Пробуем распарсить весь текст как JSON (если это чистый JSON)
     try:
         parsed = json.loads(response_text)
-        if isinstance(parsed, dict) and "type" in parsed:
-            return parsed
+        normalized = normalize_parsed_response(parsed)
+        if normalized:
+            return normalized
     except json.JSONDecodeError:
         pass
     
@@ -1143,8 +1816,9 @@ def parse_ai_response(response_text: str) -> Optional[Dict[str, Any]]:
     if json_match:
         try:
             parsed = json.loads(json_match.group(1))
-            if isinstance(parsed, dict) and "type" in parsed:
-                return parsed
+            normalized = normalize_parsed_response(parsed)
+            if normalized:
+                return normalized
         except json.JSONDecodeError:
             pass
     
@@ -1182,8 +1856,9 @@ def parse_ai_response(response_text: str) -> Optional[Dict[str, Any]]:
                         json_str = response_text[start_idx:i+1]
                         try:
                             parsed = json.loads(json_str)
-                            if isinstance(parsed, dict) and "type" in parsed:
-                                return parsed
+                            normalized = normalize_parsed_response(parsed)
+                            if normalized:
+                                return normalized
                         except json.JSONDecodeError:
                             pass
                         break
@@ -1235,227 +1910,101 @@ def execute_tools(tools: Tools, needs: List[Dict[str, Any]]) -> Dict[str, Any]:
     return results
 
 
-def format_tool_results(results: Dict[str, Any]) -> str:
-    """Форматирует результаты выполнения инструментов для передачи ИИ."""
-    lines = [
-        "=" * 70,
-        "✅ ДАННЫЕ УСПЕШНО ПОЛУЧЕНЫ ИЗ ПРОГРАММЫ",
-        "=" * 70,
-        "",
-        "Ты запросил данные через инструменты, и программа их предоставила.",
-        "Теперь используй эти данные для анализа и дай финальный ответ пользователю.",
-        "",
-        "⚠️ КРИТИЧЕСКИ ВАЖНО:",
-        "- Верни ТОЛЬКО FINAL_ANSWER (не DATA_REQUEST)",
-        "- Проанализируй полученные данные",
-        "- Дай конкретный ответ на вопрос пользователя",
-        "",
-        "=" * 70,
-        "РЕЗУЛЬТАТЫ ВЫПОЛНЕНИЯ ИНСТРУМЕНТОВ:",
-        "=" * 70,
-        ""
-    ]
-    
-    for tool_name, result in results.items():
-        lines.append(f"📊 Инструмент: {tool_name}")
-        
-        # Если результат - список (множественные вызовы одного инструмента)
-        if isinstance(result, list):
-            for idx, item in enumerate(result):
-                if idx > 0:
-                    lines.append("")  # Разделитель между результатами
-                if isinstance(item, dict) and "error" in item:
-                    lines.append(f"   ❌ Ошибка (вызов {idx + 1}): {item['error']}")
-                else:
-                    result_str = json.dumps(item, ensure_ascii=False, indent=2)
-                    lines.append(f"   Результат {idx + 1}:")
-                    lines.append(f"   {result_str}")
-        elif isinstance(result, dict) and "error" in result:
-            lines.append(f"   ❌ Ошибка: {result['error']}")
-        else:
-            # Форматируем результат в читаемый вид
-            result_str = json.dumps(result, ensure_ascii=False, indent=2)
-            lines.append(f"   {result_str}")
-        lines.append("")
-    
-    lines.append("=" * 70)
-    lines.append("Используй эти данные для финального ответа. Верни JSON: {\"type\": \"FINAL_ANSWER\", \"answer\": \"...\"}")
-    lines.append("=" * 70)
-    
-    return "\n".join(lines)
+def format_tool_results(
+    results: Dict[str, Any],
+    user_message: Optional[str] = None,
+    workflow_state: Optional[WorkflowState] = None,
+) -> str:
+    """Фасад над payload policy для передачи данных инструментов обратно в модель."""
+    return format_model_payload_core(results, user_message, workflow_state, CURRENT_YEAR)
 
 
-def chat_with_ai(user_message: str, conversation_history: list = None, data_block: Optional[str] = None, context_state: Optional[str] = None, temperature: float = 0.7, max_tokens: int = 2000) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """
-    Отправляет сообщение в чат с ИИ и получает ответ.
-    
-    Args:
-        user_message: Сообщение пользователя
-        conversation_history: История разговора (список сообщений, последние 3-6 сообщений)
-        data_block: Блок данных для передачи ИИ (результаты инструментов)
-        context_state: Состояние контекста (selected_period, selected_artikul и т.д.)
-        temperature: Температура для генерации (0.2 для режима B, 0.7 для режима A)
-        max_tokens: Максимальное количество токенов (400-700 для режима A, 2000 для режима B)
-    
-    Returns:
-        Кортеж (ответ ИИ, информация об использовании токенов, информация о лимитах) или (None, None, None) в случае ошибки
-    """
-    if not GROQ_API_KEY:
-        print("⚠️ GROQ_API_KEY не настроен в .env файле.")
-        print("   Добавьте GROQ_API_KEY=ваш_ключ в файл .env")
-        return None, None, None
-    
-    # Формируем сообщения для API
+def build_chat_messages(
+    user_message: str,
+    conversation_history: list = None,
+    data_block: Optional[str] = None,
+    context_state: Optional[str] = None,
+    allow_followup_data_requests: bool = True,
+) -> List[Dict[str, str]]:
     system_prompt = SYSTEM_PROMPT
-    
-    # Добавляем состояние контекста, если есть
+
     if context_state:
-        system_prompt += f"\n\n## ТЕКУЩЕЕ СОСТОЯНИЕ:\n{context_state}\n"
-    
+        system_prompt += f"\n\n## Контекст состояния:\n{context_state}\n"
+
     messages = [{"role": "system", "content": system_prompt}]
-    
-    # Добавляем историю разговора (только последние 3-6 сообщений для экономии токенов)
+
     if conversation_history:
-        # Берём последние 6 сообщений (3 пары вопрос-ответ)
         recent_history = conversation_history[-6:] if len(conversation_history) > 6 else conversation_history
         messages.extend(recent_history)
-    
-    # Добавляем блок данных, если есть
+
     if data_block:
-        # Когда передаём данные, явно указываем, что нужен финальный ответ
-        messages.append({
-            "role": "user", 
-            "content": f"""⚠️ ВАЖНО: Ты получил запрошенные данные. Теперь ты ДОЛЖЕН дать FINAL_ANSWER.
-
-ДАННЫЕ:
-{data_block}
-
-ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}
-
-ИНСТРУКЦИЯ: 
-- Используй полученные данные для анализа
-- Верни ТОЛЬКО JSON с type="FINAL_ANSWER" и полным ответом пользователю
-- НЕ возвращай DATA_REQUEST - данные уже получены
-- Если данных недостаточно - скажи об этом в FINAL_ANSWER"""
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    (
+                        "Ниже переданы данные, уже полученные из инструментов.\n"
+                        "Если этих данных достаточно, верни FINAL_ANSWER.\n"
+                        "Если данных всё ещё недостаточно, верни DATA_REQUEST только с дополнительными нужными инструментами.\n"
+                        if allow_followup_data_requests
+                        else "Данные уже получены. На их основе верни только FINAL_ANSWER.\n"
+                    )
+                    + f"Вопрос пользователя: {user_message}\n"
+                    + f"Данные инструментов: {data_block}"
+                ),
+            }
+        )
     else:
-        # Добавляем текущее сообщение пользователя
         messages.append({"role": "user", "content": user_message})
-    
-    max_retries = 2  # при 429 повторяем до 2 раз (всего 3 попытки)
-    last_error = None
-    
-    try:
-        for attempt in range(max_retries + 1):
-            try:
-                response = requests.post(
-                    GROQ_API_URL,
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": GROQ_MODEL,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens
-                    },
-                    timeout=60
-                )
-                
-                response.raise_for_status()
-                data = response.json()
-                
-                ai_response = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                usage_info = data.get("usage", {})
-                
-                # Извлекаем информацию о лимитах из заголовков ответа
-                rate_limit_info = {}
-                headers = response.headers
-                
-                rate_limit_info["limit"] = (
-                    headers.get("x-ratelimit-limit-tokens") or 
-                    headers.get("x-ratelimit-limit") or
-                    headers.get("ratelimit-limit-tokens") or
-                    headers.get("x-ratelimit-limit-tpm") or
-                    headers.get("x-ratelimit-limit-tpd") or
-                    None
-                )
-                rate_limit_info["remaining"] = (
-                    headers.get("x-ratelimit-remaining-tokens") or 
-                    headers.get("x-ratelimit-remaining") or
-                    headers.get("ratelimit-remaining-tokens") or
-                    headers.get("x-ratelimit-remaining-tpm") or
-                    headers.get("x-ratelimit-remaining-tpd") or
-                    None
-                )
-                rate_limit_info["reset"] = (
-                    headers.get("x-ratelimit-reset-tokens") or 
-                    headers.get("x-ratelimit-reset") or
-                    headers.get("ratelimit-reset-tokens") or
-                    headers.get("x-ratelimit-reset-tpm") or
-                    headers.get("x-ratelimit-reset-tpd") or
-                    None
-                )
-                
-                if rate_limit_info["limit"] is None:
-                    rate_limit_info["limit"] = headers.get("x-ratelimit-limit-requests") or headers.get("x-ratelimit-limit-rpm")
-                    rate_limit_info["remaining"] = headers.get("x-ratelimit-remaining-requests") or headers.get("x-ratelimit-remaining-rpm")
-                    rate_limit_info["reset"] = headers.get("x-ratelimit-reset-requests") or headers.get("x-ratelimit-reset-rpm")
-                
-                rate_limit_info["model"] = GROQ_MODEL
-                
-                if ai_response:
-                    return ai_response, usage_info, rate_limit_info
-                else:
-                    print("⚠️ ИИ не вернул ответ.")
-                    return None, None, None
-                    
-            except requests.exceptions.RequestException as e:
-                last_error = e
-                if hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
-                    try:
-                        error_data = e.response.json()
-                        error_msg = error_data.get('error', {}).get('message', '')
-                        wait_time_match = re.search(r'(\d+\.?\d*)\s*s', error_msg)
-                        wait_sec = float(wait_time_match.group(1)) + 2.0 if wait_time_match else 10.0
-                        wait_sec = min(wait_sec, 60.0)
-                        if attempt < max_retries:
-                            print(f"\n   ⚠ 429, повтор через {wait_sec:.0f} с…", end="\r")
-                            time.sleep(wait_sec)
-                            continue
-                    except Exception:
-                        pass
-                # Не 429 или кончились попытки — выводим ошибку и выходим
-                print(f"⚠️ Ошибка при запросе к Groq API: {e}")
-                if hasattr(e, 'response') and e.response is not None:
-                    try:
-                        error_data = e.response.json()
-                        error_msg = error_data.get('error', {}).get('message', '')
-                        if e.response.status_code == 429:
-                            print(f"\n   ⚠ Лимит TPM. В .env задайте GROQ_MODEL=groq/compound-mini или подождите минуту.")
-                        else:
-                            print(f"   Детали ошибки: {error_data}")
-                    except Exception:
-                        print(f"   Ответ сервера: {getattr(e.response, 'text', '')[:200]}")
-                return None, None, None
-        
-        return None, None, None
-    
-    except Exception as e:
-        print(f"⚠️ Неожиданная ошибка: {e}")
-        return None, None, None
 
+    return messages
+
+
+def chat_with_ai(user_message: str, conversation_history: list = None, data_block: Optional[str] = None, context_state: Optional[str] = None, temperature: float = 0.7, max_tokens: Optional[int] = None, allow_followup_data_requests: bool = True) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    ?????????? ????????? ? ????????? Ollama ? ???????? ?????.
+    """
+    messages = build_chat_messages(user_message, conversation_history, data_block, context_state, allow_followup_data_requests=allow_followup_data_requests)
+    return _send_ollama_chat(messages, temperature, max_tokens)
+
+
+def stream_chat_with_ai(
+    user_message: str,
+    conversation_history: list = None,
+    data_block: Optional[str] = None,
+    context_state: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: Optional[int] = None,
+    allow_followup_data_requests: bool = True,
+    on_chunk=None,
+    on_thinking=None,
+    should_cancel=None,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    messages = build_chat_messages(
+        user_message,
+        conversation_history,
+        data_block,
+        context_state,
+        allow_followup_data_requests=allow_followup_data_requests,
+    )
+    return _stream_ollama_chat(
+        messages,
+        temperature,
+        max_tokens,
+        on_chunk=on_chunk,
+        on_thinking=on_thinking,
+        should_cancel=should_cancel,
+    )
 
 def start_chat_session():
     """
     Запускает интерактивную сессию чата с ИИ.
     """
     print("\n· OzonReportX AI — чат с ИИ. Вопросы по бизнесу Ozon. Выход: выход / exit / quit\n")
-    
-    if not GROQ_API_KEY:
-        print("⚠️ GROQ_API_KEY не настроен в .env файле.")
-        print("   Добавьте GROQ_API_KEY=ваш_ключ в файл .env")
+
+    ok, message = check_ollama_model()
+    if not ok:
+        print(f"⚠️ {message}")
         return
     
     # Определяем корень репозитория
@@ -1473,7 +2022,7 @@ def start_chat_session():
         "last_comparison_periods": []
     }
     
-    print(f"✅ Готов. Модель: {GROQ_MODEL}\n")
+    print(f"✅ Готов. Модель: {OLLAMA_MODEL} | Ollama: {OLLAMA_HOST}\n")
     
     conversation_history = []
     
@@ -1496,6 +2045,9 @@ def start_chat_session():
                 context_state_lines.append(f"selected_period={session_memory['selected_period']}")
             if session_memory["selected_artikul"]:
                 context_state_lines.append(f"selected_artikul={session_memory['selected_artikul']}")
+            workflow_state = detect_workflow(user_input)
+            if workflow_state.name != "generic":
+                context_state_lines.append(f"workflow={workflow_state.name}")
             context_state = "\n".join(context_state_lines) if context_state_lines else None
             
             # РЕЖИМ A: План/Уточнение
@@ -1506,7 +2058,7 @@ def start_chat_session():
                 data_block=None,
                 context_state=context_state,
                 temperature=0.7,
-                max_tokens=600  # Ограничиваем для режима A
+                max_tokens=None
             )
             
             print(" " * 50, end="\r")
@@ -1538,26 +2090,11 @@ def start_chat_session():
                 ]
                 
                 try:
-                    retry_response = requests.post(
-                        GROQ_API_URL,
-                        headers={
-                            "Authorization": f"Bearer {GROQ_API_KEY}",
-                            "Content-Type": "application/json"
-                        },
-                        json={
-                            "model": GROQ_MODEL,
-                            "messages": retry_messages,
-                            "temperature": 0.2,  # Низкая температура для точного формата
-                            "max_tokens": 500
-                        },
-                        timeout=30
-                    )
-                    retry_response.raise_for_status()
-                    retry_data = retry_response.json()
-                    retry_ai_response = retry_data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    parsed_response = parse_ai_response(retry_ai_response)
-                    if parsed_response:
-                        ai_response = retry_ai_response
+                    retry_ai_response, _, _ = _send_ollama_chat(retry_messages, 0.2, 500)
+                    if retry_ai_response:
+                        parsed_response = parse_ai_response(retry_ai_response)
+                        if parsed_response:
+                            ai_response = retry_ai_response
                 except Exception:
                     pass
                 
@@ -1577,7 +2114,30 @@ def start_chat_session():
                 
                 # Выполняем инструменты
                 tool_results = execute_tools(tools, needs)
-                data_block = format_tool_results(tool_results)
+                merged_results = dict(tool_results)
+
+                deterministic_needs = get_workflow_followup_needs(user_input, merged_results)
+                if deterministic_needs:
+                    additional_prefetch_results = execute_tools(tools, deterministic_needs)
+                    for key, value in additional_prefetch_results.items():
+                        if key not in merged_results:
+                            merged_results[key] = value
+                        else:
+                            existing = merged_results[key]
+                            if isinstance(existing, list):
+                                if isinstance(value, list):
+                                    existing.extend(value)
+                                else:
+                                    existing.append(value)
+                            else:
+                                merged_results[key] = [existing, value] if not isinstance(value, list) else [existing, *value]
+
+                workflow_state = build_workflow_state(user_input, merged_results)
+                data_block = format_tool_results(
+                    merged_results,
+                    user_message=user_input,
+                    workflow_state=workflow_state,
+                )
                 
                 # Обновляем память сессии на основе запросов
                 # Если запрошено несколько периодов - сохраняем последний
@@ -1605,7 +2165,8 @@ def start_chat_session():
                     data_block=data_block,
                     context_state=context_state,
                     temperature=0.2,  # Низкая температура для режима B
-                    max_tokens=2000
+                    max_tokens=None,
+                    allow_followup_data_requests=not workflow_state.force_final_answer,
                 )
                 
                 print(" " * 50, end="\r")
@@ -1626,7 +2187,12 @@ def start_chat_session():
                         # Выполняем дополнительные запросы
                         additional_needs = current_parsed.get("needs", [])
                         additional_results = execute_tools(tools, additional_needs)
-                        additional_data = format_tool_results(additional_results)
+                        additional_workflow_state = build_workflow_state(user_input, additional_results)
+                        additional_data = format_tool_results(
+                            additional_results,
+                            user_message=user_input,
+                            workflow_state=additional_workflow_state,
+                        )
                         
                         # Объединяем с предыдущими данными
                         combined_data = f"{data_block}\n\nДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ:\n{additional_data}"
@@ -1638,7 +2204,8 @@ def start_chat_session():
                             data_block=combined_data,
                             context_state=context_state,
                             temperature=0.2,  # Низкая температура для режима B
-                            max_tokens=2000
+                            max_tokens=None,
+                            allow_followup_data_requests=not additional_workflow_state.force_final_answer,
                         )
                         
                         if current_response:
@@ -1653,7 +2220,7 @@ def start_chat_session():
                         final_answer = current_parsed.get("answer", current_response)
                     elif current_parsed and current_parsed.get("type") == "DATA_REQUEST":
                         # Если ИИ всё ещё запрашивает данные после всех итераций - принудительно извлекаем ответ
-                        final_answer = current_response
+                        final_answer = build_workflow_fallback_answer(user_input, merged_results) or current_response
                         # Убираем JSON из ответа
                         if "{" in final_answer and '"type"' in final_answer:
                             json_start = final_answer.find('{')
@@ -1665,9 +2232,9 @@ def start_chat_session():
                                     final_answer = final_answer[json_end+1:].strip()
                         
                         if not final_answer or len(final_answer) < 10:
-                            final_answer = "Проанализировал полученные данные. Пожалуйста, уточните ваш вопрос или запросите конкретные метрики."
+                            final_answer = build_workflow_fallback_answer(user_input, merged_results) or "Проанализировал полученные данные. Пожалуйста, уточните ваш вопрос или запросите конкретные метрики."
                     else:
-                        final_answer = current_response
+                        final_answer = current_response or build_workflow_fallback_answer(user_input, merged_results)
                     
                     # Показываем только финальный ответ пользователю
                     print(f"\n🤖 ИИ: {final_answer}\n")
@@ -1710,21 +2277,12 @@ def start_chat_session():
             if len(conversation_history) > 6:
                 conversation_history = conversation_history[-6:]
             
-            # Выводим информацию о модели и лимитах из Groq API
-            model = rate_limit_info.get("model", GROQ_MODEL) if rate_limit_info else GROQ_MODEL
-            limit = rate_limit_info.get("limit") if rate_limit_info else None
-            remaining = rate_limit_info.get("remaining") if rate_limit_info else None
-            
-            info_lines = [f"🤖 Модель: {model}"]
-            
-            if limit is not None and remaining is not None:
-                try:
-                    limit_val = int(limit)
-                    remaining_val = int(remaining)
-                    info_lines.append(f"📊 Лимит: {remaining_val:,}/{limit_val:,}")
-                except (ValueError, TypeError):
-                    pass
-            
+            # Выводим информацию о модели и лимитах из ?????????? Ollama
+            model = rate_limit_info.get("model", OLLAMA_MODEL) if rate_limit_info else OLLAMA_MODEL
+            info_lines = [f"?? ??????: {model}"]
+            host = rate_limit_info.get("host") if rate_limit_info else OLLAMA_HOST
+            if host:
+                info_lines.append(f"Host: {host}")
             print(" | ".join(info_lines) + "\n")
                 
         except KeyboardInterrupt:
@@ -1744,3 +2302,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -14,6 +14,7 @@ import os
 import sys
 import subprocess
 import json
+from contextlib import ExitStack, closing
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, List, Any, Tuple
@@ -26,6 +27,14 @@ from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
+try:
+    from scripts.file_lock import locked_costs
+except ModuleNotFoundError:
+    from file_lock import locked_costs
+try:
+    from scripts.file_io import costs_excel_writer, save_workbook_atomic, write_costs_dataframe, read_costs_dataframe
+except ModuleNotFoundError:
+    from file_io import costs_excel_writer, save_workbook_atomic, write_costs_dataframe, read_costs_dataframe
 
 # Загружаем переменные окружения для API Ozon
 load_dotenv()
@@ -933,93 +942,94 @@ def load_rates_from_report(report_path: Path) -> float:
     Читает значения «Комиссии Ozon %» (Q15) и «Логистика %» (Q16) из листа «Заказы»
     месячного отчёта и возвращает их сумму в виде десятичной доли (например, 0.15 для 15%).
     """
-    if not report_path.exists():
-        raise FileNotFoundError(f"Файл отчёта не найден: {report_path}")
+    with ExitStack() as books:
+        if not report_path.exists():
+            raise FileNotFoundError(f"Файл отчёта не найден: {report_path}")
 
-    # Пробуем сначала с data_only=True (для вычисленных значений)
-    # Если не получится, попробуем без него (для формул)
-    wb = None
-    try:
-        wb = load_workbook(report_path, data_only=True)
-    except Exception:
-        pass
-    
-    if wb is None:
+        # Пробуем сначала с data_only=True (для вычисленных значений)
+        # Если не получится, попробуем без него (для формул)
+        wb = None
         try:
-            wb = load_workbook(report_path, data_only=False)
-        except Exception as e:
-            raise ValueError(f"Не удалось открыть файл отчёта: {e}")
-    
-    if ORDER_SHEET not in wb.sheetnames:
-        raise ValueError(f"В файле отчёта нет листа «{ORDER_SHEET}».")
-
-    ws = wb[ORDER_SHEET]
-
-    # Читаем значения из ячеек Q15 (Комиссии Ozon %) и Q16 (Логистика %)
-    commission_pct = ws["Q15"].value
-    logistics_pct = ws["Q16"].value
-    
-    # Если значения не прочитались, пробуем альтернативный способ через pandas
-    if commission_pct is None or logistics_pct is None:
-        try:
-            df_summary = pd.read_excel(report_path, sheet_name=ORDER_SHEET, header=None, usecols="P:Q", skiprows=14, nrows=2)
-            if len(df_summary) >= 2:
-                if pd.notna(df_summary.iloc[0, 1]):
-                    commission_pct = df_summary.iloc[0, 1]
-                if pd.notna(df_summary.iloc[1, 1]):
-                    logistics_pct = df_summary.iloc[1, 1]
+            wb = books.enter_context(closing(load_workbook(report_path, data_only=True)))
         except Exception:
             pass
-
-    def to_float(val):
-        """Преобразует значение в float, обрабатывая None и строки."""
-        if val is None:
-            return 0.0
-        if isinstance(val, str):
-            val = val.strip().replace(",", ".")
-            if val in ("-", ""):
-                return 0.0
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return 0.0
-
-    commission_pct_raw = commission_pct
-    logistics_pct_raw = logistics_pct
     
-    commission_pct = to_float(commission_pct)
-    logistics_pct = to_float(logistics_pct)
+        if wb is None:
+            try:
+                wb = books.enter_context(closing(load_workbook(report_path, data_only=False)))
+            except Exception as e:
+                raise ValueError(f"Не удалось открыть файл отчёта: {e}")
+    
+        if ORDER_SHEET not in wb.sheetnames:
+            raise ValueError(f"В файле отчёта нет листа «{ORDER_SHEET}».")
 
-    # Значения в процентах, преобразуем в десятичную долю (15% -> 0.15)
-    commission_rate = commission_pct / 100.0
-    logistics_rate = logistics_pct / 100.0
+        ws = wb[ORDER_SHEET]
 
-    # Общая доля комиссии + логистики
-    total_rate = commission_rate + logistics_rate
+        # Читаем значения из ячеек Q15 (Комиссии Ozon %) и Q16 (Логистика %)
+        commission_pct = ws["Q15"].value
+        logistics_pct = ws["Q16"].value
+    
+        # Если значения не прочитались, пробуем альтернативный способ через pandas
+        if commission_pct is None or logistics_pct is None:
+            try:
+                df_summary = pd.read_excel(report_path, sheet_name=ORDER_SHEET, header=None, usecols="P:Q", skiprows=14, nrows=2)
+                if len(df_summary) >= 2:
+                    if pd.notna(df_summary.iloc[0, 1]):
+                        commission_pct = df_summary.iloc[0, 1]
+                    if pd.notna(df_summary.iloc[1, 1]):
+                        logistics_pct = df_summary.iloc[1, 1]
+            except Exception:
+                pass
 
-    # Проверка: если комиссия и логистика равны 0 или очень малы, значит отчёт неполный
-    if total_rate < 0.01:  # Меньше 1% - подозрительно мало
-        # Пытаемся определить месяц и год из имени файла
-        report_name = report_path.stem  # без расширения
-        period_info = report_name  # например "Декабрь 2025"
+        def to_float(val):
+            """Преобразует значение в float, обрабатывая None и строки."""
+            if val is None:
+                return 0.0
+            if isinstance(val, str):
+                val = val.strip().replace(",", ".")
+                if val in ("-", ""):
+                    return 0.0
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return 0.0
+
+        commission_pct_raw = commission_pct
+        logistics_pct_raw = logistics_pct
+    
+        commission_pct = to_float(commission_pct)
+        logistics_pct = to_float(logistics_pct)
+
+        # Значения в процентах, преобразуем в десятичную долю (15% -> 0.15)
+        commission_rate = commission_pct / 100.0
+        logistics_rate = logistics_pct / 100.0
+
+        # Общая доля комиссии + логистики
+        total_rate = commission_rate + logistics_rate
+
+        # Проверка: если комиссия и логистика равны 0 или очень малы, значит отчёт неполный
+        if total_rate < 0.01:  # Меньше 1% - подозрительно мало
+            # Пытаемся определить месяц и год из имени файла
+            report_name = report_path.stem  # без расширения
+            period_info = report_name  # например "Декабрь 2025"
         
-        error_msg = (
-            f"\n❌ ОШИБКА: Не удалось прочитать значения комиссии и логистики из отчёта.\n"
-            f"   Файл: {report_path.name}\n"
-            f"   Комиссия Ozon % (Q15): {commission_pct_raw}\n"
-            f"   Логистика % (Q16): {logistics_pct_raw}\n\n"
-            f"   Возможные причины:\n"
-            f"   1. Отчёт не был сохранён после генерации (формулы не вычислены)\n"
-            f"   2. В отчёте отсутствуют данные о комиссиях и логистике\n"
-            f"   3. Отчёт был повреждён или изменён вручную\n\n"
-            f"   РЕШЕНИЕ: Запустите генерацию месячного отчёта заново для периода\n"
-            f"   «{period_info}» и убедитесь, что отчёт сохранён корректно.\n"
-            f"   После генерации откройте файл отчёта в Excel и сохраните его,\n"
-            f"   чтобы формулы вычислились, затем повторите расчёт цен.\n"
-        )
-        raise ValueError(error_msg)
+            error_msg = (
+                f"\n❌ ОШИБКА: Не удалось прочитать значения комиссии и логистики из отчёта.\n"
+                f"   Файл: {report_path.name}\n"
+                f"   Комиссия Ozon % (Q15): {commission_pct_raw}\n"
+                f"   Логистика % (Q16): {logistics_pct_raw}\n\n"
+                f"   Возможные причины:\n"
+                f"   1. Отчёт не был сохранён после генерации (формулы не вычислены)\n"
+                f"   2. В отчёте отсутствуют данные о комиссиях и логистике\n"
+                f"   3. Отчёт был повреждён или изменён вручную\n\n"
+                f"   РЕШЕНИЕ: Запустите генерацию месячного отчёта заново для периода\n"
+                f"   «{period_info}» и убедитесь, что отчёт сохранён корректно.\n"
+                f"   После генерации откройте файл отчёта в Excel и сохраните его,\n"
+                f"   чтобы формулы вычислились, затем повторите расчёт цен.\n"
+            )
+            raise ValueError(error_msg)
 
-    return total_rate
+        return total_rate
 
 
 def load_costs_df(costs_path: Path) -> pd.DataFrame:
@@ -1027,7 +1037,7 @@ def load_costs_df(costs_path: Path) -> pd.DataFrame:
     if not costs_path.exists():
         raise FileNotFoundError(f"Файл себестоимости не найден: {costs_path}")
 
-    df = pd.read_excel(costs_path)
+    df = read_costs_dataframe(costs_path)
     lower_cols = {c.lower(): c for c in df.columns}
     key_col = None
     cost_col = None
@@ -1144,343 +1154,10 @@ def generate_monthly_report(repo_root: Path, month: int, year: int) -> Path:
     return report_path
 
 
-def run(
-    repo_root: Path,
-    min_margin: float = MIN_MARGIN_DEFAULT,
-    desired_margin: float = DESIRED_MARGIN_DEFAULT,
-) -> None:
-    prev_year, prev_month = get_prev_month_year()
-    report_path = get_report_path(repo_root, prev_year, prev_month)
-    costs_path = repo_root / COSTS_FILENAME
-
-    print(f"Используется отчёт за предыдущий месяц: {MONTHS_RU[prev_month - 1]} {prev_year}")
-    
-    # Если файл отчёта не существует, генерируем его
-    if not report_path.exists():
-        print(f"⚠ Файл отчёта не найден: {report_path.name}")
-        try:
-            report_path = generate_monthly_report(repo_root, prev_month, prev_year)
-        except Exception as e:
-            raise RuntimeError(
-                f"Не удалось сгенерировать отчёт за {MONTHS_RU[prev_month - 1]} {prev_year}.\n"
-                f"Ошибка: {e}\n\n"
-                f"Попробуйте запустить генерацию отчёта вручную через меню программы."
-            )
-    
-    log_verbose(f"Отчёт: {report_path}")
-    total_rate = load_rates_from_report(report_path)
-    log_verbose(f"Комиссия+логистика: {total_rate*100:.2f}%")
-    df, key_col, cost_col = load_costs_df(costs_path)
-    log_verbose(f"Загружено записей: {len(df)}")
-
-    # Получаем текущие цены с Ozon
-    log_verbose("Получение цен с Ozon...")
-    offer_ids_list = []
-    for _, row in df.iterrows():
-        art = _artikul_normalize(row.get(key_col))
-        if art:
-            offer_ids_list.append(art)
-    
-    prices_map, marketing_prices_map = get_product_prices_from_ozon(offer_ids_list)
-    if prices_map:
-        print(f"✅ Получено цен для {len(prices_map)} артикулов")
-    else:
-        print("⚠️ Не удалось получить цены с Ozon (возможно, не настроены API ключи).")
-    
-    # Получаем информацию об акциях для артикулов
-    actions_map, actions_info_list, offer_id_to_product_id = get_actions_for_products(offer_ids_list)
-    if actions_map:
-        log_verbose(f"Акции: {len(actions_map)} артикулов")
-    else:
-        print("⚠️ Не удалось получить информацию об акциях.")
-        actions_info_list = []
-        offer_id_to_product_id = {}
-    
-    # Создаём маппинг product_id -> offer_id для использования в добавлении товаров
-    product_id_to_offer_id: Dict[int, str] = {}
-    for offer_id, product_id in offer_id_to_product_id.items():
-        product_id_to_offer_id[product_id] = offer_id
-    
-    # Создаём множество нормализованных offer_id для проверки кандидатов
-    offer_ids_set_for_candidates = set()
-    for oid in offer_ids_list:
-        normalized = _normalize_offer_id(oid)
-        if normalized:
-            offer_ids_set_for_candidates.add(normalized)
-            offer_ids_set_for_candidates.add(oid)
-
-    min_prices = []
-    desired_prices = []
-    current_prices = []
-    marketing_prices = []
-    current_margins = []
-    
-    # Создаём словари для цен в каждой акции: {название_акции: [список цен]}
-    action_prices_dicts = {}
-    for action_info in actions_info_list:
-        action_name = action_info["name"]
-        action_prices_dicts[action_name] = []
-    for _, row in df.iterrows():
-        try:
-            cost_val = float(row.get(cost_col, 0) or 0)
-        except (TypeError, ValueError):
-            cost_val = 0.0
-        min_p, des_p = compute_prices(cost_val, total_rate, min_margin, desired_margin)
-        min_prices.append(min_p)
-        desired_prices.append(des_p)
-        
-        # Получаем текущую цену с Ozon
-        art = _artikul_normalize(row.get(key_col))
-        if art:
-            # Пробуем найти по исходному артикулу и по нормализованному
-            art_normalized = _normalize_offer_id(art)
-            current_price = prices_map.get(art) or prices_map.get(art_normalized)
-            marketing_price = marketing_prices_map.get(art) or marketing_prices_map.get(art_normalized)
-        else:
-            current_price = None
-            marketing_price = None
-        current_prices.append(round(current_price) if current_price is not None else None)
-        marketing_prices.append(round(marketing_price) if marketing_price is not None else None)
-        
-        # Рассчитываем текущую ожидаемую рентабельность
-        # Используем цену с акциями, если она есть, иначе обычную цену
-        price_for_margin = marketing_price if marketing_price is not None else current_price
-        margin = compute_current_margin(price_for_margin, cost_val, total_rate)
-        # Преобразуем в проценты и округляем до 2 знаков
-        current_margins.append(round(margin * 100, 2) if margin is not None else None)
-        
-        # Получаем информацию об акциях для этого артикула
-        if art:
-            art_normalized = _normalize_offer_id(art)
-            art_actions = actions_map.get(art) or actions_map.get(art_normalized) or {}
-        else:
-            art_actions = {}
-        
-        # Заполняем цены для каждой акции
-        for action_info in actions_info_list:
-            action_name = action_info["name"]
-            action_price = art_actions.get(action_name)
-            if action_price is not None:
-                action_prices_dicts[action_name].append(round(action_price))
-            else:
-                action_prices_dicts[action_name].append(None)
-
-    # Удаляем старые колонки с такими именами, если есть
-    cols_to_remove = [COL_MIN_PRICE, COL_DESIRED_PRICE, COL_CURRENT_PRICE, COL_MARKETING_PRICE, COL_CURRENT_MARGIN]
-    # Также удаляем старые колонки акций (если они есть)
-    for action_info in actions_info_list:
-        cols_to_remove.append(action_info["name"])
-    
-    for c in cols_to_remove:
-        if c in df.columns:
-            df = df.drop(columns=[c])
-    
-    df[COL_MIN_PRICE] = min_prices
-    df[COL_DESIRED_PRICE] = desired_prices
-    df[COL_CURRENT_PRICE] = current_prices
-    df[COL_MARKETING_PRICE] = marketing_prices
-    df[COL_CURRENT_MARGIN] = current_margins
-    
-    # Сохраняем основной лист без колонок акций
-    # Используем ExcelWriter для создания нескольких листов
-    if actions_info_list:
-        print("\n📋 Создание листа «Акции»...")
-        try:
-            # Создаём DataFrame для листа акций
-            actions_df_data = {}
-            
-            # Добавляем колонку с артикулами
-            actions_df_data[key_col] = df[key_col].values
-            
-            # Добавляем колонку с минимальной ценой
-            actions_df_data[COL_MIN_PRICE] = df[COL_MIN_PRICE].values
-            
-            # Добавляем колонки для каждой акции
-            for action_info in actions_info_list:
-                action_name = action_info["name"]
-                actions_df_data[action_name] = action_prices_dicts[action_name]
-            
-            # Создаём DataFrame для листа акций
-            actions_df = pd.DataFrame(actions_df_data)
-            
-            # Сохраняем оба листа через ExcelWriter
-            with pd.ExcelWriter(costs_path, engine='openpyxl', mode='w') as writer:
-                df.to_excel(writer, sheet_name='Sheet1', index=False)
-                actions_df.to_excel(writer, sheet_name='Акции', index=False)
-            
-            # Применяем условное форматирование
-            wb = load_workbook(costs_path)
-            
-            # Переименовываем Sheet1 в более понятное имя (если нужно)
-            if 'Sheet1' in wb.sheetnames:
-                wb['Sheet1'].title = 'Основной'
-            
-            ws_actions = wb['Акции']
-            
-            # Находим колонки для условного форматирования
-            min_price_col_idx = None
-            for col_idx, col_name in enumerate(actions_df.columns, start=1):
-                if col_name == COL_MIN_PRICE:
-                    min_price_col_idx = col_idx
-                    break
-            
-            # Применяем условное форматирование к колонкам акций
-            if min_price_col_idx:
-                min_price_col_letter = get_column_letter(min_price_col_idx)
-                
-                for col_idx, col_name in enumerate(actions_df.columns, start=1):
-                    # Пропускаем колонки артикула и минимальной цены
-                    if col_name == key_col or col_name == COL_MIN_PRICE:
-                        continue
-                    
-                    action_col_letter = get_column_letter(col_idx)
-                    
-                    # Зелёная заливка: цена в акции >= минимальной цены
-                    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-                    green_formula = f"AND({action_col_letter}2<>\"\", {action_col_letter}2>0, {action_col_letter}2>={min_price_col_letter}2)"
-                    green_rule = FormulaRule(formula=[green_formula], fill=green_fill, stopIfTrue=False)
-                    
-                    # Красная заливка: цена в акции < минимальной цены (и не пустая)
-                    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-                    red_formula = f"AND({action_col_letter}2<>\"\", {action_col_letter}2>0, {action_col_letter}2<{min_price_col_letter}2)"
-                    red_rule = FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False)
-                    
-                    # Применяем правила к диапазону колонки (начиная со 2-й строки, где данные)
-                    data_range = f"{action_col_letter}2:{action_col_letter}{len(actions_df) + 1}"
-                    
-                    # Применяем правила условного форматирования
-                    ws_actions.conditional_formatting.add(data_range, red_rule)
-                    ws_actions.conditional_formatting.add(data_range, green_rule)
-            
-            # Удаляем товары из акций, где цена ниже минимальной
-            action_name_to_id = {a["name"]: a["id"] for a in actions_info_list}
-            if offer_id_to_product_id and action_name_to_id:
-                candidates = collect_deactivation_candidates_from_sheet(
-                    ws_actions,
-                    key_col,
-                    COL_MIN_PRICE,
-                    action_name_to_id,
-                    offer_id_to_product_id,
-                )
-                if candidates:
-                    print("\n🧹 Удаление товаров из акций с ценой ниже минимальной...")
-                    for action_id, product_ids in candidates.items():
-                        print(f"   Акция {action_id}: удаляем {len(product_ids)} товаров")
-                        result = deactivate_products_in_action(action_id, product_ids)
-                        removed = result.get("product_ids", []) or []
-                        rejected = result.get("rejected", []) or []
-                        if removed:
-                            print(f"      ✅ Удалено: {len(removed)}")
-                        if rejected:
-                            print(f"      ⚠️ Не удалено: {len(rejected)}")
-                else:
-                    print("✅ Товары с ценой ниже минимальной не найдены.")
-            else:
-                print("⚠️ Недостаточно данных для удаления из акций.")
-            
-            # Добавляем товары в акции, если можно установить цену в диапазоне [min_price, desired_price]
-            print("\n➕ Проверка кандидатов для добавления в акции...")
-            
-            # Создаём маппинг product_id -> (min_price, desired_price, offer_id)
-            product_id_to_prices: Dict[int, tuple[float, float, str]] = {}
-            for _, row in df.iterrows():
-                art = _artikul_normalize(row.get(key_col))
-                if not art:
-                    continue
-                
-                art_normalized = _normalize_offer_id(art)
-                product_id = offer_id_to_product_id.get(art_normalized) or offer_id_to_product_id.get(art)
-                
-                if product_id:
-                    min_p = row.get(COL_MIN_PRICE)
-                    des_p = row.get(COL_DESIRED_PRICE)
-                    if min_p is not None and des_p is not None:
-                        try:
-                            min_price_val = float(min_p)
-                            des_price_val = float(des_p)
-                            if min_price_val > 0 and des_price_val > 0:
-                                product_id_to_prices[product_id] = (min_price_val, des_price_val, art_normalized)
-                        except (TypeError, ValueError):
-                            pass
-            
-            # Для каждой акции проверяем кандидатов
-            for action_info in actions_info_list:
-                action_id = action_info["id"]
-                action_name = action_info["name"]
-                
-                print(f"   Проверка акции: {action_name} (ID: {action_id})...")
-                
-                # Получаем кандидатов для этой акции
-                candidates = get_action_candidates(action_id, product_id_to_offer_id, offer_ids_set_for_candidates)
-                
-                if not candidates:
-                    continue
-                
-                # Фильтруем кандидатов: проверяем, можно ли установить цену в диапазоне [min_price, desired_price]
-                products_to_add = []
-                
-                for product_id, product_info in candidates.items():
-                    if product_id not in product_id_to_prices:
-                        continue
-                    
-                    min_price, desired_price, offer_id = product_id_to_prices[product_id]
-                    
-                    # Получаем максимальную цену в акции
-                    max_action_price = product_info.get("max_action_price")
-                    if max_action_price is None:
-                        continue
-                    
-                    try:
-                        max_action_price_val = float(max_action_price)
-                    except (TypeError, ValueError):
-                        continue
-                    
-                    # Проверяем, можно ли установить цену в диапазоне [min_price, desired_price]
-                    # Цена должна быть не меньше min_price и не больше min(desired_price, max_action_price)
-                    target_price = min(desired_price, max_action_price_val)
-                    
-                    if target_price >= min_price:
-                        # Проверяем, не участвует ли уже товар в акции
-                        current_action_price = product_info.get("action_price", 0)
-                        if current_action_price == 0 or current_action_price is None:
-                            # Товар не участвует в акции, добавляем
-                            stock = product_info.get("stock", 0) or 0
-                            products_to_add.append({
-                                "product_id": product_id,
-                                "action_price": int(target_price),  # Используем целевую цену
-                                "stock": int(stock) if stock else 0
-                            })
-                
-                # Добавляем товары в акцию
-                if products_to_add:
-                    print(f"      Найдено {len(products_to_add)} товаров для добавления")
-                    result = activate_products_in_action(action_id, products_to_add)
-                    added = result.get("product_ids", []) or []
-                    rejected = result.get("rejected", []) or []
-                    if added:
-                        print(f"      ✅ Добавлено: {len(added)} товаров")
-                    if rejected:
-                        print(f"      ⚠️ Не добавлено: {len(rejected)} товаров")
-                else:
-                    print(f"      Товары для добавления не найдены")
-
-            wb.save(costs_path)
-            print(f"✅ Создан лист «Акции» с {len(actions_info_list)} колонками акций")
-            print(f"   Применено условное форматирование: 🟢 зелёный если >= минимальной цены, 🔴 красный если < минимальной цены")
-        except Exception as e:
-            print(f"⚠️ Не удалось создать лист «Акции»: {e}")
-            import traceback
-            print(traceback.format_exc())
-            # Если не удалось создать лист акций, сохраняем хотя бы основной лист
-            df.to_excel(costs_path, index=False)
-    else:
-        # Если нет акций, просто сохраняем основной лист
-        df.to_excel(costs_path, index=False)
-    
+def _format_main_costs_sheet(wb, df, min_margin, desired_margin):
     # Применяем условное форматирование к колонке рентабельности
     try:
-        wb = load_workbook(costs_path)
-        ws = wb.active
+        ws = wb["Основной"] if "Основной" in wb.sheetnames else wb.active
         
         # Находим колонку с рентабельностью
         margin_col_idx = None
@@ -1518,7 +1195,6 @@ def run(
             ws.conditional_formatting.add(data_range, green_rule)
             ws.conditional_formatting.add(data_range, red_rule)
             
-            wb.save(costs_path)
             print(f"✅ Применено условное форматирование к колонке «{COL_CURRENT_MARGIN}»:")
             print(f"   🟢 Зелёный: рентабельность от {min_margin_pct:.1f}% до {desired_margin_pct:.1f}%")
             print(f"   🔴 Красный: рентабельность меньше {min_margin_pct:.1f}%")
@@ -1527,8 +1203,7 @@ def run(
     
     # Применяем условное форматирование к колонке "Текущая цена"
     try:
-        wb = load_workbook(costs_path)
-        ws = wb.active
+        ws = wb["Основной"] if "Основной" in wb.sheetnames else wb.active
         
         # Находим колонки с текущей ценой и минимальной ценой
         current_price_col_idx = None
@@ -1564,7 +1239,6 @@ def run(
             ws.conditional_formatting.add(data_range, red_rule)
             ws.conditional_formatting.add(data_range, green_rule)
             
-            wb.save(costs_path)
             print(f"✅ Применено условное форматирование к колонке «{COL_CURRENT_PRICE}»:")
             print(f"   🟢 Зелёный: текущая цена >= минимальной цены")
             print(f"   🔴 Красный: текущая цена < минимальной цены")
@@ -1573,8 +1247,7 @@ def run(
     
     # Применяем условное форматирование к колонке "Цена с учётом акций и скидок"
     try:
-        wb = load_workbook(costs_path)
-        ws = wb.active
+        ws = wb["Основной"] if "Основной" in wb.sheetnames else wb.active
         
         # Находим колонки с ценой с акциями и минимальной ценой
         marketing_price_col_idx = None
@@ -1607,19 +1280,373 @@ def run(
             ws.conditional_formatting.add(data_range, red_rule)
             ws.conditional_formatting.add(data_range, green_rule)
             
-            wb.save(costs_path)
             print(f"✅ Применено условное форматирование к колонке «{COL_MARKETING_PRICE}»:")
             print(f"   🟢 Зелёный: цена с акциями >= минимальной цены")
             print(f"   🔴 Красный: цена с акциями < минимальной цены")
     except Exception as e:
         print(f"⚠️ Не удалось применить условное форматирование к колонке «{COL_MARKETING_PRICE}»: {e}")
     
-    action_names_str = ", ".join([f"«{a['name']}»" for a in actions_info_list])
-    if action_names_str:
-        print(f"В файл {COSTS_FILENAME} добавлены колонки «{COL_MIN_PRICE}», «{COL_DESIRED_PRICE}», «{COL_CURRENT_PRICE}», «{COL_MARKETING_PRICE}», «{COL_CURRENT_MARGIN}» и колонки акций: {action_names_str}.")
-    else:
-        print(f"В файл {COSTS_FILENAME} добавлены колонки «{COL_MIN_PRICE}», «{COL_DESIRED_PRICE}», «{COL_CURRENT_PRICE}», «{COL_MARKETING_PRICE}» и «{COL_CURRENT_MARGIN}».")
-    print("Готово.")
+
+
+@locked_costs
+def run(
+    repo_root: Path,
+    min_margin: float = MIN_MARGIN_DEFAULT,
+    desired_margin: float = DESIRED_MARGIN_DEFAULT,
+    include_actions: bool = True,
+) -> None:
+    with ExitStack() as books:
+        prev_year, prev_month = get_prev_month_year()
+        report_path = get_report_path(repo_root, prev_year, prev_month)
+        costs_path = repo_root / COSTS_FILENAME
+
+        print(f"Используется отчёт за предыдущий месяц: {MONTHS_RU[prev_month - 1]} {prev_year}")
+    
+        # Если файл отчёта не существует, генерируем его
+        if not report_path.exists():
+            print(f"⚠ Файл отчёта не найден: {report_path.name}")
+            try:
+                report_path = generate_monthly_report(repo_root, prev_month, prev_year)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Не удалось сгенерировать отчёт за {MONTHS_RU[prev_month - 1]} {prev_year}.\n"
+                    f"Ошибка: {e}\n\n"
+                    f"Попробуйте запустить генерацию отчёта вручную через меню программы."
+                )
+    
+        log_verbose(f"Отчёт: {report_path}")
+        total_rate = load_rates_from_report(report_path)
+        log_verbose(f"Комиссия+логистика: {total_rate*100:.2f}%")
+        df, key_col, cost_col = load_costs_df(costs_path)
+        log_verbose(f"Загружено записей: {len(df)}")
+
+        # Получаем текущие цены с Ozon
+        log_verbose("Получение цен с Ozon...")
+        offer_ids_list = []
+        for _, row in df.iterrows():
+            art = _artikul_normalize(row.get(key_col))
+            if art:
+                offer_ids_list.append(art)
+    
+        prices_map, marketing_prices_map = get_product_prices_from_ozon(offer_ids_list)
+        if prices_map:
+            print(f"✅ Получено цен для {len(prices_map)} артикулов")
+        else:
+            print("⚠️ Не удалось получить цены с Ozon (возможно, не настроены API ключи).")
+    
+        # Получаем информацию об акциях только когда это явно требуется.
+        if include_actions:
+            actions_map, actions_info_list, offer_id_to_product_id = get_actions_for_products(offer_ids_list)
+            if actions_map:
+                log_verbose(f"Акции: {len(actions_map)} артикулов")
+            else:
+                print("⚠️ Не удалось получить информацию об акциях.")
+                actions_info_list = []
+                offer_id_to_product_id = {}
+        else:
+            actions_map = {}
+            actions_info_list = []
+            offer_id_to_product_id = {}
+    
+        # Создаём маппинг product_id -> offer_id для использования в добавлении товаров
+        product_id_to_offer_id: Dict[int, str] = {}
+        for offer_id, product_id in offer_id_to_product_id.items():
+            product_id_to_offer_id[product_id] = offer_id
+    
+        # Создаём множество нормализованных offer_id для проверки кандидатов
+        offer_ids_set_for_candidates = set()
+        for oid in offer_ids_list:
+            normalized = _normalize_offer_id(oid)
+            if normalized:
+                offer_ids_set_for_candidates.add(normalized)
+                offer_ids_set_for_candidates.add(oid)
+
+        min_prices = []
+        desired_prices = []
+        current_prices = []
+        marketing_prices = []
+        current_margins = []
+    
+        # Создаём словари для цен в каждой акции: {название_акции: [список цен]}
+        action_prices_dicts = {}
+        for action_info in actions_info_list:
+            action_name = action_info["name"]
+            action_prices_dicts[action_name] = []
+        for _, row in df.iterrows():
+            try:
+                cost_val = float(row.get(cost_col, 0) or 0)
+            except (TypeError, ValueError):
+                cost_val = 0.0
+            min_p, des_p = compute_prices(cost_val, total_rate, min_margin, desired_margin)
+            min_prices.append(min_p)
+            desired_prices.append(des_p)
+        
+            # Получаем текущую цену с Ozon
+            art = _artikul_normalize(row.get(key_col))
+            if art:
+                # Пробуем найти по исходному артикулу и по нормализованному
+                art_normalized = _normalize_offer_id(art)
+                current_price = prices_map.get(art) or prices_map.get(art_normalized)
+                marketing_price = marketing_prices_map.get(art) or marketing_prices_map.get(art_normalized)
+            else:
+                current_price = None
+                marketing_price = None
+            current_prices.append(round(current_price) if current_price is not None else None)
+            marketing_prices.append(round(marketing_price) if marketing_price is not None else None)
+        
+            # Рассчитываем текущую ожидаемую рентабельность
+            # Используем цену с акциями, если она есть, иначе обычную цену
+            price_for_margin = marketing_price if marketing_price is not None else current_price
+            margin = compute_current_margin(price_for_margin, cost_val, total_rate)
+            # Преобразуем в проценты и округляем до 2 знаков
+            current_margins.append(round(margin * 100, 2) if margin is not None else None)
+        
+            # Получаем информацию об акциях для этого артикула
+            if art:
+                art_normalized = _normalize_offer_id(art)
+                art_actions = actions_map.get(art) or actions_map.get(art_normalized) or {}
+            else:
+                art_actions = {}
+        
+            # Заполняем цены для каждой акции
+            for action_info in actions_info_list:
+                action_name = action_info["name"]
+                action_price = art_actions.get(action_name)
+                if action_price is not None:
+                    action_prices_dicts[action_name].append(round(action_price))
+                else:
+                    action_prices_dicts[action_name].append(None)
+
+        # Удаляем старые колонки с такими именами, если есть
+        cols_to_remove = [COL_MIN_PRICE, COL_DESIRED_PRICE, COL_CURRENT_PRICE, COL_MARKETING_PRICE, COL_CURRENT_MARGIN]
+        # Также удаляем старые колонки акций (если они есть)
+        for action_info in actions_info_list:
+            cols_to_remove.append(action_info["name"])
+    
+        for c in cols_to_remove:
+            if c in df.columns:
+                df = df.drop(columns=[c])
+    
+        df[COL_MIN_PRICE] = min_prices
+        df[COL_DESIRED_PRICE] = desired_prices
+        df[COL_CURRENT_PRICE] = current_prices
+        df[COL_MARKETING_PRICE] = marketing_prices
+        df[COL_CURRENT_MARGIN] = current_margins
+    
+        # Сохраняем основной лист без колонок акций.
+        # При расчёте без акций обновляем только лист «Основной» и не трогаем остальные листы книги.
+        if not include_actions:
+            with costs_excel_writer(costs_path) as writer:
+                df.to_excel(writer, sheet_name='Основной', index=False)
+        elif actions_info_list:
+            print("\n📋 Создание листа «Акции»...")
+            try:
+                # Создаём DataFrame для листа акций
+                actions_df_data = {}
+            
+                # Добавляем колонку с артикулами
+                actions_df_data[key_col] = df[key_col].values
+            
+                # Добавляем колонку с минимальной ценой
+                actions_df_data[COL_MIN_PRICE] = df[COL_MIN_PRICE].values
+            
+                # Добавляем колонки для каждой акции
+                for action_info in actions_info_list:
+                    action_name = action_info["name"]
+                    actions_df_data[action_name] = action_prices_dicts[action_name]
+            
+                # Создаём DataFrame для листа акций
+                actions_df = pd.DataFrame(actions_df_data)
+            
+                # Сохраняем оба листа через ExcelWriter
+                with costs_excel_writer(costs_path) as writer:
+                    df.to_excel(writer, sheet_name='Основной', index=False)
+                    actions_df.to_excel(writer, sheet_name='Акции', index=False)
+            
+                # Применяем условное форматирование
+                wb = books.enter_context(closing(load_workbook(costs_path)))
+            
+                # Переименовываем Sheet1 в более понятное имя (если нужно)
+                if 'Sheet1' in wb.sheetnames:
+                    wb['Sheet1'].title = 'Основной'
+            
+                ws_actions = wb['Акции']
+            
+                # Находим колонки для условного форматирования
+                min_price_col_idx = None
+                for col_idx, col_name in enumerate(actions_df.columns, start=1):
+                    if col_name == COL_MIN_PRICE:
+                        min_price_col_idx = col_idx
+                        break
+            
+                # Применяем условное форматирование к колонкам акций
+                if min_price_col_idx:
+                    min_price_col_letter = get_column_letter(min_price_col_idx)
+                
+                    for col_idx, col_name in enumerate(actions_df.columns, start=1):
+                        # Пропускаем колонки артикула и минимальной цены
+                        if col_name == key_col or col_name == COL_MIN_PRICE:
+                            continue
+                    
+                        action_col_letter = get_column_letter(col_idx)
+                    
+                        # Зелёная заливка: цена в акции >= минимальной цены
+                        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                        green_formula = f"AND({action_col_letter}2<>\"\", {action_col_letter}2>0, {action_col_letter}2>={min_price_col_letter}2)"
+                        green_rule = FormulaRule(formula=[green_formula], fill=green_fill, stopIfTrue=False)
+                    
+                        # Красная заливка: цена в акции < минимальной цены (и не пустая)
+                        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                        red_formula = f"AND({action_col_letter}2<>\"\", {action_col_letter}2>0, {action_col_letter}2<{min_price_col_letter}2)"
+                        red_rule = FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False)
+                    
+                        # Применяем правила к диапазону колонки (начиная со 2-й строки, где данные)
+                        data_range = f"{action_col_letter}2:{action_col_letter}{len(actions_df) + 1}"
+                    
+                        # Применяем правила условного форматирования
+                        ws_actions.conditional_formatting.add(data_range, red_rule)
+                        ws_actions.conditional_formatting.add(data_range, green_rule)
+            
+                # Удаляем товары из акций, где цена ниже минимальной
+                action_name_to_id = {a["name"]: a["id"] for a in actions_info_list}
+                if offer_id_to_product_id and action_name_to_id:
+                    candidates = collect_deactivation_candidates_from_sheet(
+                        ws_actions,
+                        key_col,
+                        COL_MIN_PRICE,
+                        action_name_to_id,
+                        offer_id_to_product_id,
+                    )
+                    if candidates:
+                        print("\n🧹 Удаление товаров из акций с ценой ниже минимальной...")
+                        for action_id, product_ids in candidates.items():
+                            print(f"   Акция {action_id}: удаляем {len(product_ids)} товаров")
+                            result = deactivate_products_in_action(action_id, product_ids)
+                            removed = result.get("product_ids", []) or []
+                            rejected = result.get("rejected", []) or []
+                            if removed:
+                                print(f"      ✅ Удалено: {len(removed)}")
+                            if rejected:
+                                print(f"      ⚠️ Не удалено: {len(rejected)}")
+                    else:
+                        print("✅ Товары с ценой ниже минимальной не найдены.")
+                else:
+                    print("⚠️ Недостаточно данных для удаления из акций.")
+            
+                # Добавляем товары в акции, если можно установить цену в диапазоне [min_price, desired_price]
+                print("\n➕ Проверка кандидатов для добавления в акции...")
+            
+                # Создаём маппинг product_id -> (min_price, desired_price, offer_id)
+                product_id_to_prices: Dict[int, tuple[float, float, str]] = {}
+                for _, row in df.iterrows():
+                    art = _artikul_normalize(row.get(key_col))
+                    if not art:
+                        continue
+                
+                    art_normalized = _normalize_offer_id(art)
+                    product_id = offer_id_to_product_id.get(art_normalized) or offer_id_to_product_id.get(art)
+                
+                    if product_id:
+                        min_p = row.get(COL_MIN_PRICE)
+                        des_p = row.get(COL_DESIRED_PRICE)
+                        if min_p is not None and des_p is not None:
+                            try:
+                                min_price_val = float(min_p)
+                                des_price_val = float(des_p)
+                                if min_price_val > 0 and des_price_val > 0:
+                                    product_id_to_prices[product_id] = (min_price_val, des_price_val, art_normalized)
+                            except (TypeError, ValueError):
+                                pass
+            
+                # Для каждой акции проверяем кандидатов
+                for action_info in actions_info_list:
+                    action_id = action_info["id"]
+                    action_name = action_info["name"]
+                
+                    print(f"   Проверка акции: {action_name} (ID: {action_id})...")
+                
+                    # Получаем кандидатов для этой акции
+                    candidates = get_action_candidates(action_id, product_id_to_offer_id, offer_ids_set_for_candidates)
+                
+                    if not candidates:
+                        continue
+                
+                    # Фильтруем кандидатов: проверяем, можно ли установить цену в диапазоне [min_price, desired_price]
+                    products_to_add = []
+                
+                    for product_id, product_info in candidates.items():
+                        if product_id not in product_id_to_prices:
+                            continue
+                    
+                        min_price, desired_price, offer_id = product_id_to_prices[product_id]
+                    
+                        # Получаем максимальную цену в акции
+                        max_action_price = product_info.get("max_action_price")
+                        if max_action_price is None:
+                            continue
+                    
+                        try:
+                            max_action_price_val = float(max_action_price)
+                        except (TypeError, ValueError):
+                            continue
+                    
+                        # Проверяем, можно ли установить цену в диапазоне [min_price, desired_price]
+                        # Цена должна быть не меньше min_price и не больше min(desired_price, max_action_price)
+                        target_price = min(desired_price, max_action_price_val)
+                    
+                        if target_price >= min_price:
+                            # Проверяем, не участвует ли уже товар в акции
+                            current_action_price = product_info.get("action_price", 0)
+                            if current_action_price == 0 or current_action_price is None:
+                                # Товар не участвует в акции, добавляем
+                                stock = product_info.get("stock", 0) or 0
+                                products_to_add.append({
+                                    "product_id": product_id,
+                                    "action_price": int(target_price),  # Используем целевую цену
+                                    "stock": int(stock) if stock else 0
+                                })
+                
+                    # Добавляем товары в акцию
+                    if products_to_add:
+                        print(f"      Найдено {len(products_to_add)} товаров для добавления")
+                        result = activate_products_in_action(action_id, products_to_add)
+                        added = result.get("product_ids", []) or []
+                        rejected = result.get("rejected", []) or []
+                        if added:
+                            print(f"      ✅ Добавлено: {len(added)} товаров")
+                        if rejected:
+                            print(f"      ⚠️ Не добавлено: {len(rejected)} товаров")
+                    else:
+                        print(f"      Товары для добавления не найдены")
+
+                save_workbook_atomic(wb, costs_path)
+                wb.close()
+                print(f"✅ Создан лист «Акции» с {len(actions_info_list)} колонками акций")
+                print(f"   Применено условное форматирование: 🟢 зелёный если >= минимальной цены, 🔴 красный если < минимальной цены")
+            except Exception as e:
+                print(f"⚠️ Не удалось создать лист «Акции»: {e}")
+                import traceback
+                print(traceback.format_exc())
+                # Если не удалось создать лист акций, сохраняем хотя бы основной лист
+                write_costs_dataframe(df, costs_path)
+        else:
+            # Если акций нет, обновляем только основной лист и сохраняем остальные листы книги.
+            with costs_excel_writer(costs_path) as writer:
+                df.to_excel(writer, sheet_name='Основной', index=False)
+    
+        try:
+            with closing(load_workbook(costs_path)) as wb:
+                _format_main_costs_sheet(wb, df, min_margin, desired_margin)
+                save_workbook_atomic(wb, costs_path)
+        except Exception as e:
+            print(f"⚠️ Не удалось сохранить оформление основного листа: {e}")
+
+        action_names_str = ", ".join([f"«{a['name']}»" for a in actions_info_list])
+        if action_names_str:
+            print(f"В файл {COSTS_FILENAME} добавлены колонки «{COL_MIN_PRICE}», «{COL_DESIRED_PRICE}», «{COL_CURRENT_PRICE}», «{COL_MARKETING_PRICE}», «{COL_CURRENT_MARGIN}» и колонки акций: {action_names_str}.")
+        else:
+            print(f"В файл {COSTS_FILENAME} добавлены колонки «{COL_MIN_PRICE}», «{COL_DESIRED_PRICE}», «{COL_CURRENT_PRICE}», «{COL_MARKETING_PRICE}» и «{COL_CURRENT_MARGIN}».")
+        print("Готово.")
 
 
 def get_discount_requests(status: str = "ALL", limit: int = 50) -> List[Dict[str, Any]]:

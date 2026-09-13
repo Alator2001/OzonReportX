@@ -12,6 +12,10 @@ from datetime import date, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
+try:
+    from scripts.file_io import atomic_output_path
+except ModuleNotFoundError:
+    from file_io import atomic_output_path
 import numpy as np
 
 script_dir = Path(__file__).resolve().parent
@@ -123,8 +127,9 @@ def _artikul_canonical(s: str) -> str:
 
 def _load_abc_xyz_itog_and_orders(abc_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Загружает листы Итог и Заказы из ABC&XYZ отчёта."""
-    itog = pd.read_excel(abc_path, sheet_name="Итог")
-    orders = pd.read_excel(abc_path, sheet_name="Заказы")
+    with pd.ExcelFile(abc_path) as workbook:
+        itog = workbook.parse("Итог")
+        orders = workbook.parse("Заказы")
     return itog, orders
 
 
@@ -245,7 +250,8 @@ def run(repo_root_path: Optional[Path] = None) -> bool:
     now = date.today()
     out_name = f"Расчёт поставок {MONTHS_RU[now.month - 1]} {now.year}.xlsx"
     out_path = out_dir / out_name
-    df.to_excel(out_path, index=False, sheet_name="Главная")
+    with atomic_output_path(out_path) as temporary:
+        df.to_excel(temporary, index=False, sheet_name="Главная")
     print(f"✅ Отчёт сохранён: {out_path}")
     return True
 

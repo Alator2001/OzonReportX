@@ -9,6 +9,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+try:
+    from scripts.file_io import excel_writer, atomic_output_path
+except ModuleNotFoundError:
+    from file_io import excel_writer, atomic_output_path
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -137,8 +141,8 @@ def find_columns(df: pd.DataFrame) -> Dict[str, str]:
 def read_all_sheets(path: str) -> Dict[str, pd.DataFrame]:
     """Читает ВСЕ листы книги в dict {sheet_name: df}. Для .xls нужна библиотека xlrd."""
     try:
-        xls = pd.ExcelFile(path, engine=None)  # pandas сам подберёт движок (openpyxl/xlrd)
-        dfs = {sheet: xls.parse(sheet) for sheet in xls.sheet_names}
+        with pd.ExcelFile(path, engine=None) as xls:
+            dfs = {sheet: xls.parse(sheet) for sheet in xls.sheet_names}
         return dfs
     except Exception as e:
         raise RuntimeError(f"Не удалось открыть файл '{path}': {e}")
@@ -170,7 +174,7 @@ def merge_folder(
         f for f in os.listdir(input_dir)
         if os.path.isfile(os.path.join(input_dir, f))
         and os.path.splitext(f)[1].lower() in EXCEL_EXT
-        and not f.startswith("~$")
+        and not f.startswith(("~$", "~tmp_"))
     ]
     # Фильтр по диапазону месяцев: только файлы «Месяц Год.xlsx» в [from_..to_]
     if from_month is not None and from_year is not None and to_month is not None and to_year is not None:
@@ -216,62 +220,65 @@ def merge_folder(
             print(f"⚠️ Не удалось открыть файл '{fname}': {e}")
             continue
 
-        # Обрабатываем только листы заказов; «Кампании» и прочие листы пропускаем
-        for sheet_name in (s for s in xls.sheet_names if s in ORDER_SHEET_NAMES):
-            try:
-                df = xls.parse(sheet_name)
-            except Exception as e:
-                report_missing.append((fname, sheet_name, str(e)))
-                continue
-            if df is None or df.empty:
-                report_missing.append((fname, sheet_name, "лист пустой"))
-                continue
+        try:
+            # Обрабатываем только листы заказов; «Кампании» и прочие листы пропускаем
+            for sheet_name in (s for s in xls.sheet_names if s in ORDER_SHEET_NAMES):
+                try:
+                    df = xls.parse(sheet_name)
+                except Exception as e:
+                    report_missing.append((fname, sheet_name, str(e)))
+                    continue
+                if df is None or df.empty:
+                    report_missing.append((fname, sheet_name, "лист пустой"))
+                    continue
 
-            # Оставляем только заказы со статусом «delivered»
-            status_col = None
-            for c in df.columns:
-                if norm(str(c)) in ("статус", "status"):
-                    status_col = c
-                    break
-            if status_col is not None:
-                df = df[
-                    df[status_col].astype(str).str.strip().str.lower() == DELIVERED_STATUS
-                ].copy()
-            if df.empty:
-                continue
+                # Оставляем только заказы со статусом «delivered»
+                status_col = None
+                for c in df.columns:
+                    if norm(str(c)) in ("статус", "status"):
+                        status_col = c
+                        break
+                if status_col is not None:
+                    df = df[
+                        df[status_col].astype(str).str.strip().str.lower() == DELIVERED_STATUS
+                    ].copy()
+                if df.empty:
+                    continue
 
-            col_map = find_columns(df)
-            found_keys = set(col_map.keys())
-            required_keys = set(CANON.keys())
+                col_map = find_columns(df)
+                found_keys = set(col_map.keys())
+                required_keys = set(CANON.keys())
 
-            if not found_keys:
-                report_missing.append((fname, sheet_name, "ни один столбец не найден"))
-                continue
+                if not found_keys:
+                    report_missing.append((fname, sheet_name, "ни один столбец не найден"))
+                    continue
 
-            if found_keys != required_keys:
-                missing = required_keys - found_keys
-                # Если вообще ничего не найдено — уже учтено выше; здесь частичное совпадение
-                if missing:
-                    report_partial.append((fname, sheet_name, f"нет столбцов: {', '.join(CANON[k] for k in missing)}"))
+                if found_keys != required_keys:
+                    missing = required_keys - found_keys
+                    # Если вообще ничего не найдено — уже учтено выше; здесь частичное совпадение
+                    if missing:
+                        report_partial.append((fname, sheet_name, f"нет столбцов: {', '.join(CANON[k] for k in missing)}"))
 
-            # Берём только найденные столбцы, переименовываем в канон
-            use_cols = {col_map[k]: CANON[k] for k in found_keys}
-            sub = df[list(use_cols.keys())].rename(columns=use_cols)
+                # Берём только найденные столбцы, переименовываем в канон
+                use_cols = {col_map[k]: CANON[k] for k in found_keys}
+                sub = df[list(use_cols.keys())].rename(columns=use_cols)
 
-            # Приведём типы слегка (опционально)
-            # Даты
-            if "Дата отгрузки" in sub.columns:
-                sub["Дата отгрузки"] = pd.to_datetime(sub["Дата отгрузки"], errors="coerce").dt.date
-            # Числа
-            for num_col in ["Цена продажи", "Количество шт.", "Прибыль"]:
-                if num_col in sub.columns:
-                    sub[num_col] = pd.to_numeric(sub[num_col], errors="coerce")
+                # Приведём типы слегка (опционально)
+                # Даты
+                if "Дата отгрузки" in sub.columns:
+                    sub["Дата отгрузки"] = pd.to_datetime(sub["Дата отгрузки"], errors="coerce").dt.date
+                # Числа
+                for num_col in ["Цена продажи", "Количество шт.", "Прибыль"]:
+                    if num_col in sub.columns:
+                        sub[num_col] = pd.to_numeric(sub[num_col], errors="coerce")
 
-            # Добавим источник
-            sub["Источник файл"] = fname
-            sub["Лист"] = sheet_name
+                # Добавим источник
+                sub["Источник файл"] = fname
+                sub["Лист"] = sheet_name
 
-            rows.append(sub)
+                rows.append(sub)
+        finally:
+            xls.close()
 
     if not rows:
         print("Нечего объединять — нужные столбцы не найдены ни в одном листе.")
@@ -299,7 +306,7 @@ def merge_folder(
     # Сохраняем (pivot_abc, pivot_xyz — для листа «Итог», строятся в блоках ниже)
     pivot_abc = None
     pivot_xyz = None
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    with atomic_output_path(output_path) as temporary, excel_writer(temporary) as writer:
         merged_export.to_excel(writer, sheet_name="Заказы", index=False)
         _set_artikul_number_format(writer.sheets["Заказы"], 1, len(merged_export))
 
@@ -711,14 +718,12 @@ def merge_folder(
             rep_df.to_excel(writer, sheet_name="Отчёт", index=False)
 
     # Лист «Итог» — первым и активным при открытии файла
-    if pivot_abc is not None and pivot_xyz is not None:
-        from openpyxl import load_workbook
-        wb = load_workbook(output_path)
-        if "Итог" in wb.sheetnames:
-            idx = wb.sheetnames.index("Итог")
-            wb.move_sheet("Итог", offset=-idx)
-            wb.active = wb["Итог"]
-            wb.save(output_path)
+        if pivot_abc is not None and pivot_xyz is not None:
+            wb = writer.book
+            if "Итог" in wb.sheetnames:
+                idx = wb.sheetnames.index("Итог")
+                wb.move_sheet("Итог", offset=-idx)
+                wb.active = wb["Итог"]
 
     print(f"Готово. Сохранено: {output_path}")
 

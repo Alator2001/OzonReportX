@@ -4,3 +4,6 @@ openpyxl>=3.1.2
 python-dateutil>=2.9.0
 python-dotenv>=1.0.1
 packaging
+flet>=0.28.0
+matplotlib>=3.10.0
+plotly>=6.0.0
