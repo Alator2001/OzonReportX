@@ -10,6 +10,8 @@ scripts/__pycache__/performance_api.cpython-314.pyc
 /stocks reports
 margin_settings.json
 /balance reports
+/wb reports/
+/wb_costs.xlsx
 
 # Local environment and secrets (keep example configs versioned)
 .env.*

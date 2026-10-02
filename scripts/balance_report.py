@@ -115,6 +115,49 @@ def get_product_placement_in_ozon_warehouses_for_month(month: int, year: int, re
     return total
 
 
+def _all_services(reports: list[dict]) -> dict[str, float]:
+    """Every named cashflows.services line item, summed by name across all monthly segments."""
+    totals: dict[str, float] = {}
+    for data in reports:
+        for service in (data.get("cashflows") or {}).get("services") or []:
+            name = service.get("name")
+            amount = (service.get("amount") or {}).get("value")
+            if not name or amount is None:
+                continue
+            totals[name] = totals.get(name, 0.0) + float(amount)
+    return totals
+
+
+def summarize_month(month: int, year: int, reports: list[dict] | None = None) -> dict | None:
+    """Ozon's own official numbers for the month: opening/closing balance, what was actually
+    accrued and paid out, and every itemized service fee (including early_payment — the
+    early-withdrawal commission). Used to reconcile against our own computed totals."""
+    if reports is None:
+        reports = get_monthly_balance_reports(month, year)
+    if not reports:
+        return None
+    opening = ((reports[0].get("total") or {}).get("opening_balance") or {}).get("value")
+    closing = ((reports[-1].get("total") or {}).get("closing_balance") or {}).get("value")
+    accrued = sum(float(((data.get("total") or {}).get("accrued") or {}).get("value") or 0) for data in reports)
+    payments = sum(float(p.get("value") or 0) for data in reports
+                  for p in (data.get("total") or {}).get("payments") or [])
+    sales_fee = sum(float(((((data.get("cashflows") or {}).get("sales") or {}).get("fee")) or {}).get("value") or 0)
+                    for data in reports)
+    returns_fee = sum(float(((((data.get("cashflows") or {}).get("returns") or {}).get("fee")) or {}).get("value") or 0)
+                      for data in reports)
+    services = _all_services(reports)
+    return {
+        "opening_balance": float(opening) if opening is not None else None,
+        "closing_balance": float(closing) if closing is not None else None,
+        "accrued": accrued,
+        "payments": payments,
+        "sales_fee": sales_fee,
+        "returns_fee": returns_fee,
+        "services": services,
+        "early_payment_fee": services.get("early_payment", 0.0),
+    }
+
+
 def get_balance_report(date_from: str, date_to: str) -> dict:
     """Запрашивает отчёт о балансе за период. date_from/date_to в формате YYYY-MM-DD (без времени)."""
     url = "https://api-seller.ozon.ru/v1/finance/balance"

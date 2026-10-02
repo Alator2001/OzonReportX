@@ -54,6 +54,14 @@ OZON_HEADERS = {
     'Content-Type': 'application/json'
 }
 
+
+def refresh_api_credentials():
+    """Apply credentials saved by the desktop settings without restarting."""
+    global OZON_CLIENT_ID, OZON_API_KEY
+    OZON_CLIENT_ID = os.getenv('OZON_CLIENT_ID')
+    OZON_API_KEY = os.getenv('OZON_API_KEY')
+    OZON_HEADERS.update({'Client-Id': OZON_CLIENT_ID or '', 'Api-Key': OZON_API_KEY or ''})
+
 # Названия месяцев на русском (для имени файла отчёта)
 MONTHS_RU = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",

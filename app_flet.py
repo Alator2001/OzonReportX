@@ -21,9 +21,12 @@ from openpyxl import load_workbook
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scripts import balance_report
 from scripts.file_io import save_workbook_atomic
 from scripts.file_lock import exclusive_file, file_signature
 from scripts.ui_log import SessionLog
+from scripts.wb_dashboard import build_dashboard as build_wb_dashboard
+from scripts.marketplace_settings import FIELDS, HELP, read_settings, save_settings, needs_setup
 
 try:
     import scripts.ai_chat as ai_chat_module
@@ -547,7 +550,7 @@ def read_business_metrics(report_path: Path) -> tuple[dict[str, object], str | N
     try:
         ws = wb["Заказы"] if "Заказы" in wb.sheetnames else wb.active
         metrics: dict[str, object] = {}
-        for label, value in ws.iter_rows(min_row=1, max_row=49, min_col=16, max_col=17, values_only=True):
+        for label, value in ws.iter_rows(min_row=1, max_row=70, min_col=16, max_col=17, values_only=True):
             if label:
                 metrics[str(label).strip()] = value
         needs_fallback = any(
@@ -2515,6 +2518,9 @@ def main(page: ft.Page) -> None:
             "Gross Margin": "Рентабельность по валовой прибыли. Формула: валовая прибыль / выручка × 100%.",
             "Опер. расходы": "Операционные расходы периода, влияющие на чистую прибыль.",
             "В доставке": "Количество заказов, которые ещё находятся в логистической цепочке.",
+            "Выплачено Ozon": "Реальный перевод от Ozon за период — из отчёта о балансе (Финансы → Баланс), а не расчётная величина.",
+            "Начислено Ozon": "Сумма начислений Ozon за период по календарным дням (отчёт о балансе). Сравните со строкой «Наш расчёт» — методика группировки разная, поэтому небольшое расхождение нормально.",
+            "Ранний вывод": "Комиссия Ozon за досрочный вывод средств (если вы им пользовались в этом периоде).",
         }
 
         if not metrics:
@@ -2628,6 +2634,21 @@ def main(page: ft.Page) -> None:
                             kv_row_compact("Внешний маркетинг", _format_currency(metrics.get("Внешний маркетинг")), tooltip=business_metric_help["Внешний маркетинг"]),
                         ],
                         tone=semantic_surface("neutral_alt", dark=dark_ui),
+                        width=290,
+                        col=4,
+                    ),
+                    card(
+                        "Выплаты Ozon",
+                        "Из отчёта о балансе — реальные переводы, а не наш расчёт.",
+                        [
+                            kv_row_compact("Выплачено", _format_currency(metrics.get("Выплачено Ozon за период (реальный перевод)")), tooltip=business_metric_help["Выплачено Ozon"]),
+                            kv_row_compact("Начислено (Ozon)", _format_currency(metrics.get("Начислено Ozon за период (по балансу, календарные дни)")), tooltip=business_metric_help["Начислено Ozon"]),
+                            kv_row_compact("Наш расчёт", _format_currency(metrics.get("Сумма начисления по нашему расчёту (по датам отгрузки)"))),
+                            kv_row_compact("Расхождение", _format_currency(metrics.get("Расхождение: баланс Ozon минус наш расчёт"))),
+                            kv_row_compact("Комиссия за ранний вывод", _format_currency(metrics.get("Комиссия за ранний вывод средств")), tooltip=business_metric_help["Ранний вывод"]),
+                            kv_row_compact("Баланс на начало → конец", f"{_format_currency(metrics.get('Входящий баланс на начало периода'))} → {_format_currency(metrics.get('Исходящий баланс на конец периода'))}"),
+                        ],
+                        tone=semantic_surface("neutral", dark=dark_ui),
                         width=290,
                         col=4,
                     ),
@@ -5027,6 +5048,188 @@ def main(page: ft.Page) -> None:
         ),
     )
 
+    def open_marketplace_settings(_e=None):
+        current = read_settings(ROOT)
+        fields = {
+            key: ft.TextField(
+                label=label, value=current.get(key) or "", password=secret,
+                can_reveal_password=secret,
+            ) for key, label, secret in FIELDS
+        }
+        feedback = ft.Text(color="#C62828")
+
+        def close_setup(_e=None):
+            setup_dialog.open = False
+            page.update()
+            page.overlay.remove(setup_dialog)
+
+        def save_setup(_e):
+            if job_lock.locked() or discount_dialog_state["busy"] or ai_state["busy"]:
+                feedback.value = "Дождитесь завершения текущей операции перед сменой ключей."
+                page.update()
+                return
+            try:
+                save_settings(ROOT, {key: field.value or "" for key, field in fields.items()})
+            except ValueError as exc:
+                feedback.value = str(exc)
+                page.update()
+                return
+            except Exception:
+                feedback.value = "Не удалось сохранить настройки. Проверьте доступ к .env и повторите."
+                page.update()
+                return
+            for module_name in ("recommended_prices", "scripts.recommended_prices"):
+                module = sys.modules.get(module_name)
+                if module is not None:
+                    module.refresh_api_credentials()
+            close_setup()
+            set_status("Настройки сохранены", "Ключи Ozon и WB сохранены. Проверка подключения не выполнялась.", PRIMARY, busy=False)
+
+        setup_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Подключение Ozon и Wildberries"),
+            content=ft.Column(
+                [ft.Text(HELP, size=13),
+                 ft.Text("Заполните данные нужных маркетплейсов. Остальные поля можно оставить пустыми. Ключи сохраняются локально в .env.", size=13),
+                 *fields.values(), feedback],
+                width=600, height=490, scroll=ft.ScrollMode.AUTO, spacing=12,
+            ),
+            actions=[ft.TextButton("Позже", on_click=close_setup),
+                     ft.Button("Сохранить", on_click=save_setup)],
+        )
+        page.overlay.append(setup_dialog)
+        setup_dialog.open = True
+        page.update()
+
+    def open_balance_check(_e=None):
+        today = date.today()
+        month_field = ft.Dropdown(label="Месяц", value=str(today.month), width=200,
+                                  options=[ft.dropdown.Option(str(i), title) for i, title in enumerate(MONTHS, 1)])
+        year_field = ft.Dropdown(label="Год", value=str(today.year), width=140,
+                                 options=[ft.dropdown.Option(str(y)) for y in range(today.year, 2023, -1)])
+        result_column = ft.Column(spacing=6)
+        status_text = ft.Text("Выберите месяц и нажмите «Проверить».", size=12, color=MUTED)
+        checking = {"value": False}
+        recent_column = ft.Column(spacing=10)
+        recent_status = ft.Text("Загружаем последние 3 месяца…", size=12, color=MUTED)
+        recent_checking = {"value": False}
+
+        def render_result(summary):
+            if not summary:
+                result_column.controls = [ft.Text("Ozon не вернул данных о балансе за этот период.", size=13, color=MUTED)]
+                return
+            def row(label, value):
+                return ft.Text(f"{label}: {_format_currency(value)}", size=13)
+            result_column.controls = [
+                row("Входящий баланс на начало периода", summary.get("opening_balance")),
+                row("Начислено Ozon за период", summary.get("accrued")),
+                row("Выплачено Ozon (реальный перевод)", summary.get("payments")),
+                row("Исходящий баланс на конец периода", summary.get("closing_balance")),
+                row("Комиссия за ранний вывод средств", summary.get("early_payment_fee")),
+            ]
+
+        async def check_balance():
+            if checking["value"]:
+                return
+            checking["value"] = True
+            check_button.disabled = True
+            status_text.value = "Запрашиваем баланс Ozon…"
+            result_column.controls = []
+            page.update()
+            try:
+                month, year = int(month_field.value), int(year_field.value)
+                summary = await asyncio.to_thread(balance_report.summarize_month, month, year)
+                render_result(summary)
+                status_text.value = f"{MONTHS[month - 1]} {year} · из раздела Ozon «Финансы → Баланс»."
+            except Exception as exc:
+                status_text.value = f"Не удалось получить баланс: {exc}"
+                result_column.controls = []
+            finally:
+                checking["value"] = False
+                check_button.disabled = False
+            page.update()
+
+        def load_one_period(month: int, year: int) -> dict:
+            try:
+                summary = balance_report.summarize_month(month, year) or {}
+            except Exception as exc:
+                summary = {"error": str(exc)}
+            path = report_path_for_period(month, year)
+            metrics, built_at = read_business_metrics(path) if path.exists() else ({}, None)
+            return {"month": month, "year": year, "summary": summary, "metrics": metrics, "built_at": built_at}
+
+        async def load_recent_periods():
+            if recent_checking["value"]:
+                return
+            recent_checking["value"] = True
+            recent_status.value = "Загружаем последние 3 месяца…"
+            recent_column.controls = []
+            page.update()
+            try:
+                periods = iter_periods(today.month, today.year, 3)
+                results = await asyncio.to_thread(lambda: [load_one_period(m, y) for m, y in periods])
+                cards = []
+                for entry in reversed(results):
+                    summary = entry["summary"]
+                    metrics = entry["metrics"]
+                    title = f"{MONTHS[entry['month'] - 1]} {entry['year']}"
+                    if summary.get("error"):
+                        cards.append(ft.Text(f"{title}: не удалось получить баланс ({summary['error']})", size=13, color=DANGER))
+                        continue
+                    received = summary.get("payments")
+                    cost = metrics.get("Итоговая себестоимость")
+                    profit = metrics.get("Чистая прибыль")
+                    lines = [
+                        ft.Text(title, size=15, weight=ft.FontWeight.W_700, color=TEXT),
+                        ft.Text(f"Получено от Ozon (реальный перевод): {_format_currency(received)}", size=13),
+                    ]
+                    if metrics:
+                        lines.append(ft.Text(f"Себестоимость к отправке (по отчёту): {_format_currency(abs(as_float(cost) or 0.0) if cost is not None else None)}", size=13))
+                        lines.append(ft.Text(f"Прибыль оставить себе (по отчёту): {_format_currency(profit)}", size=13))
+                        pending = metrics.get("Заказы, ожидающие расчёта Ozon (не учтены в прибыли/себестоимости)")
+                        if pending:
+                            lines.append(ft.Text(f"⚠ Ещё {pending} заказ(ов) не досчитаны Ozon — цифры за месяц могут подрасти позже.", size=12, color=ACCENT))
+                    else:
+                        lines.append(ft.Text("Отчёт за этот месяц не сформирован — себестоимость и прибыль неизвестны. Сформируйте отчёт на вкладке «Бизнес-сводка».", size=12, color=ACCENT))
+                    cards.append(ft.Container(
+                        content=ft.Column(lines, spacing=4),
+                        padding=12, border_radius=10, bgcolor=semantic_surface("neutral", dark=current_dark["value"]),
+                    ))
+                recent_column.controls = cards
+                recent_status.value = "Готово. «Получено от Ozon» — реальные деньги; себестоимость/прибыль — из уже сформированных месячных отчётов."
+            except Exception as exc:
+                recent_status.value = f"Не удалось загрузить последние месяцы: {exc}"
+            finally:
+                recent_checking["value"] = False
+            page.update()
+
+        def close_balance_dialog(_e=None):
+            balance_dialog.open = False
+            page.update()
+            page.overlay.remove(balance_dialog)
+
+        check_button = ft.Button("Проверить", on_click=lambda _e: page.run_task(check_balance))
+        balance_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Баланс Ozon и сверка по месяцам"),
+            content=ft.Column(
+                [
+                    ft.Text("Последние 3 месяца: сколько реально пришло от Ozon и сколько из этого — себестоимость к отправке, а сколько — ваша прибыль.", size=12, color=MUTED),
+                    recent_status, recent_column,
+                    ft.Divider(),
+                    ft.Text("Проверить конкретный месяц отдельно (только баланс Ozon, без отчёта):", size=12, color=MUTED),
+                    ft.Row([month_field, year_field, check_button], wrap=True),
+                    status_text, result_column,
+                ],
+                width=560, height=560, scroll=ft.ScrollMode.AUTO, spacing=12,
+            ),
+            actions=[ft.TextButton("Закрыть", on_click=close_balance_dialog)],
+        )
+        page.overlay.append(balance_dialog)
+        balance_dialog.open = True
+        page.update()
+        page.run_task(load_recent_periods)
+
     settings = ft.Column(
         [
             ft.Text("Настройки", size=26, weight=ft.FontWeight.W_800, color=TEXT),
@@ -5036,11 +5239,13 @@ def main(page: ft.Page) -> None:
                 spacing=14,
                 controls=[
                     card(
-                        ".env и ключи",
-                        "Если API не настроен, начните с подготовки .env и ключей Ozon.",
+                        "Ozon и Wildberries",
+                        "Подключение маркетплейсов и настройка ключей API.",
                         [
                             ft.Button("Открыть корень проекта", on_click=lambda _e: reveal_path(ROOT, "корень проекта")),
-                            ft.Text("Файл .env редактируется вручную в корне проекта.", size=12, color=MUTED),
+                            ft.Button("Настроить подключения", on_click=open_marketplace_settings),
+                            ft.TextButton("Проверить баланс Ozon", on_click=open_balance_check),
+                            ft.Text("Для бизнес-сводки WB нужен доступ токена к категории «Финансы».", size=12, color=MUTED),
                         ],
                         width=320,
                     ),
@@ -5076,13 +5281,44 @@ def main(page: ft.Page) -> None:
     )
 
     views = [dash, ai_view, reports, pricing, actions, supply, finance, settings, file_view]
+    active_store = {"value": "ozon"}
+    store_sections = {"ozon": 0, "wb": 0}
+    section_names = ["Бизнес-сводка", "AI-ассистент", "Отчёты", "Цены и скидки", "Акции", "Поставки", "Финансы", "Настройки", "Файлы"]
+
+    wb_dashboard = build_wb_dashboard(
+        months=MONTHS, metric=metric, hero_metric=hero_metric, card=card,
+        text_color=TEXT, muted_color=MUTED,
+        primary=PRIMARY, accent=ACCENT, surface=semantic_surface("neutral", dark=False),
+        page=page, root=ROOT, reveal=reveal_path,
+        log=lambda message: ui_queue.put(("log_append", message)),
+        theme=lambda control: apply_control_theme(control, current_dark["value"]),
+    )
+
+    def wb_section(index):
+        if index == 0:
+            return wb_dashboard
+        if index == 7:
+            return settings
+        return ft.Column(
+            [
+                ft.Text("Wildberries", size=13, weight=ft.FontWeight.W_600, color=MUTED),
+                ft.Text(section_names[index], size=26, weight=ft.FontWeight.W_800, color=TEXT),
+                card(
+                    "Раздел Wildberries готовится",
+                    "Здесь появятся данные вашего магазина Wildberries. Сейчас можно сохранить API-токен в настройках.",
+                    [ft.Button("Настроить Wildberries", on_click=open_marketplace_settings)],
+                ),
+            ], spacing=18,
+        )
+
     host = ft.Column([views[0]], expand=True, spacing=0, scroll=ft.ScrollMode.AUTO)
 
-    def nav_change(e: ft.ControlEvent) -> None:
-        selected_index = e.control.selected_index
-        host.controls = [views[selected_index]]
-        is_ai_view = selected_index == 1
-        header.visible = not is_ai_view
+    def show_store_section(selected_index: int) -> None:
+        store_sections[active_store["value"]] = selected_index
+        is_ozon = active_store["value"] == "ozon"
+        host.controls = [views[selected_index] if is_ozon else wb_section(selected_index)]
+        is_ai_view = is_ozon and selected_index == 1
+        header.visible = is_ozon and not is_ai_view
         host.scroll = ft.ScrollMode.HIDDEN if is_ai_view else ft.ScrollMode.AUTO
         host_shell.padding = 0 if is_ai_view else ft.Padding.only(left=8, right=10, top=20, bottom=20)
         host_shell.bgcolor = ai_surface_tokens()["canvas"] if is_ai_view else ("#FBFCFF" if not current_dark["value"] else "#1E2328")
@@ -5096,9 +5332,13 @@ def main(page: ft.Page) -> None:
         apply_control_theme(host.controls[0], current_dark["value"])
         if is_ai_view:
             ai_apply_chat_theme()
-        section_names = ["Бизнес-сводка", "AI-ассистент", "Отчёты", "Цены и скидки", "Акции", "Supply", "Finance", "Settings", "Files"]
-        set_status("Раздел открыт", section_names[selected_index], PRIMARY, busy=False)
+        store_name = "Ozon" if is_ozon else "Wildberries"
+        page.title = f"{store_name} — OzonReportX"
+        set_status("Раздел открыт", f"{store_name} · {section_names[selected_index]}", PRIMARY, busy=False)
         page.update()
+
+    def nav_change(e: ft.ControlEvent) -> None:
+        show_store_section(e.control.selected_index)
 
     theme_button = ft.IconButton(
         icon=ft.Icons.DARK_MODE_OUTLINED,
@@ -5107,41 +5347,48 @@ def main(page: ft.Page) -> None:
         selected=True,
     )
 
+    store_buttons = {}
+
+    def style_store_tabs():
+        dark = current_dark["value"]
+        rail_brand_card.bgcolor = "#252A2F" if dark else "#F7F7FA"
+        rail_brand_card.border = ft.Border.all(1, "#394247" if dark else BORDER)
+        for key, button in store_buttons.items():
+            selected = active_store["value"] == key
+            button.bgcolor = ("#0D6B5B" if dark else "#DCEFE9") if selected else "transparent"
+            button.content.controls[0].color = ("#FFFFFF" if dark else PRIMARY) if selected else ("#A1A1A6" if dark else MUTED)
+            button.content.controls[1].color = ("#FFFFFF" if dark else TEXT) if selected else ("#A1A1A6" if dark else MUTED)
+            button.content.controls[2].visible = selected
+            button.content.controls[2].color = "#FFFFFF" if dark else PRIMARY
+
+    def select_store(key):
+        if active_store["value"] == key:
+            return
+        active_store["value"] = key
+        rail.selected_index = store_sections[key]
+        show_store_section(rail.selected_index)
+        style_store_tabs()
+        page.update()
+
+    for key, title in (("ozon", "Ozon"), ("wb", "Wildberries")):
+        store_buttons[key] = ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.Icons.STOREFRONT_OUTLINED, size=20),
+                ft.Text(title, size=16, weight=ft.FontWeight.W_700, expand=True),
+                ft.Icon(ft.Icons.CHECK_ROUNDED, size=16, color="white", visible=key == "ozon"),
+            ], spacing=10),
+            padding=ft.Padding.symmetric(horizontal=12, vertical=11),
+            border_radius=16,
+            on_click=lambda _e, store=key: select_store(store),
+            tooltip=f"Открыть магазин {title}",
+        )
     rail_brand_card = ft.Container(
-        padding=16,
+        width=240,
+        padding=7,
         border_radius=22,
         bgcolor="#F7F7FA",
         border=ft.Border.all(1, BORDER),
-        content=ft.Column(
-            [
-                ft.Row(
-                    [
-                        ft.Container(
-                            content=ft.Image(
-                                src=str((ROOT / "img" / "ozonreportx-mark.svg").resolve()),
-                                width=36,
-                                height=36,
-                            ),
-                            width=52,
-                            height=52,
-                            bgcolor="#0D6B5B",
-                            border_radius=18,
-                            alignment=ft.Alignment(0, 0),
-                        ),
-                        ft.Column(
-                            [
-                                ft.Text("OzonReportX", size=18, weight=ft.FontWeight.W_800, color=TEXT),
-                                ft.Text("Контроль. Аналитика. Автоматизация.", size=11, color=MUTED),
-                            ],
-                            spacing=2,
-                            expand=True,
-                        ),
-                    ],
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                ),
-            ],
-            spacing=10,
-        ),
+        content=ft.Column(list(store_buttons.values()), spacing=4),
     )
 
     rail = ft.NavigationRail(
@@ -5238,12 +5485,12 @@ def main(page: ft.Page) -> None:
             color="#22000000" if dark else "#14000000",
             offset=ft.Offset(0, 12),
         )
-        host_shell.bgcolor = ai_surface_tokens()["canvas"] if rail.selected_index == 1 else ("#1E2328" if dark else "#FBFCFF")
+        host_shell.bgcolor = ai_surface_tokens()["canvas"] if active_store["value"] == "ozon" and rail.selected_index == 1 else ("#1E2328" if dark else "#FBFCFF")
         host_shell.gradient = ft.LinearGradient(
             begin=ft.Alignment(0, -1),
             end=ft.Alignment(0, 1),
             colors=[ai_surface_tokens()["canvas"], ai_surface_tokens()["canvas"]]
-            if rail.selected_index == 1
+            if active_store["value"] == "ozon" and rail.selected_index == 1
             else (["#1F252A", "#191D21"] if dark else ["#FBFCFF", "#F3F6FB"]),
         )
         host_shell.border = ft.Border.all(1, "#2C2C2E" if dark else "#ECECF1")
@@ -5290,6 +5537,7 @@ def main(page: ft.Page) -> None:
         for root_control in page.controls:
             apply_control_theme(root_control, dark)
         ai_apply_chat_theme()
+        style_store_tabs()
         set_status(state.value, status_detail.value, state.color if isinstance(state.color, str) else PRIMARY, busy=spin.visible)
         page.update()
 
@@ -5445,6 +5693,8 @@ def main(page: ft.Page) -> None:
         splash_overlay.visible = False
         set_status("Готово", "Интерфейс готов к работе.", PRIMARY, busy=False)
         page.update()
+        if needs_setup(ROOT):
+            open_marketplace_settings()
 
     page.run_task(ui_event_loop)
     page.run_task(initialize_app)

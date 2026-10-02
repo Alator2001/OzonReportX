@@ -1,5 +1,6 @@
 import os
 import json
+import sys
 import time
 import shutil
 import importlib
@@ -164,12 +165,12 @@ except ImportError:
 
 # Импорт функций для получения расходов из отчёта о балансе
 try:
-    from scripts.balance_report import get_star_products_for_month, get_product_placement_in_ozon_warehouses_for_month, get_monthly_balance_reports  # type: ignore
+    from scripts.balance_report import get_star_products_for_month, get_product_placement_in_ozon_warehouses_for_month, get_monthly_balance_reports, summarize_month as summarize_balance_month  # type: ignore
 except ImportError:
     from pathlib import Path
     import sys
     sys.path.append(str(Path(__file__).resolve().parent))
-    from balance_report import get_star_products_for_month, get_product_placement_in_ozon_warehouses_for_month, get_monthly_balance_reports  # type: ignore
+    from balance_report import get_star_products_for_month, get_product_placement_in_ozon_warehouses_for_month, get_monthly_balance_reports, summarize_month as summarize_balance_month  # type: ignore
 
 # 📥 Получаем список заказов FBS (Fulfillment by Seller)
 def _fetch_fbs_page(session: requests.Session, date_from: str, date_to: str, status: str, limit: int, offset: int) -> List[Dict[str, Any]]:
@@ -331,15 +332,27 @@ def get_transactions_by_posting(date_from, date_to, session: Optional[requests.S
                         raise ValueError("Некорректный номер отправления в начислении.")
                     sale = Decimal(0)
                     commission = Decimal(0)
+                    has_commission_data = False
                     for product in (accrual.get("posting") or {}).get("products", []) or []:
                         details = product.get("commission")
                         if details:
+                            has_commission_data = True
                             sale += _accrual_money(details["seller_price"])
                             commission += _accrual_money(details["sale_commission"])
                     result.setdefault(number, []).append({
                         "amount": _accrual_money(accrual["total_amount"]),
                         "sale_commission": commission,
                         "accruals_for_sale": sale,
+                        # A return/reversal accrual carries a negative seller_price (Ozon books it
+                        # as its own "Возврат" entry). The posting's own status stays "delivered"
+                        # forever in this case — Ozon does not reflect post-delivery returns there —
+                        # so this is the only reliable signal that the item came back.
+                        "is_return": sale < 0,
+                        # Whether this accrual actually carried commission data at all, as opposed to
+                        # being a delivery/service-fee-only entry (commission: null). Distinguishes a
+                        # sale genuinely netted to zero by a same-period return from a posting whose
+                        # sale accrual simply fell in a different month.
+                        "has_commission_data": has_commission_data,
                     })
                 next_id = data["last_id"]
                 if not next_id:
@@ -425,11 +438,19 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
 
     # карта себестоимости: ключ может быть точным offer_id или префиксом
     cost_map = load_cost_map()
-    transactions_by_posting = get_transactions_by_posting(date_from, date_to, session) if postings else {}
+    # Ozon's sale-with-commission accrual typically lands 2-19 days after shipment (median ~6,
+    # verified against real August data) — not just for orders shipped at month-end. Postings stay
+    # scoped to the calendar month (date_from/date_to below), but accruals are fetched with a lookahead
+    # past month-end so a posting shipped this month isn't reported as "ожидает расчёта" just because
+    # Ozon's own commission bookkeeping runs behind the shipment date. get_transactions_by_posting
+    # already clamps to "today", so this is a no-op when the report is generated soon after month-end.
+    ACCRUAL_LOOKAHEAD_DAYS = 21
+    accrual_date_to = (isoparse(date_to) + timedelta(days=ACCRUAL_LOOKAHEAD_DAYS)).isoformat()
+    transactions_by_posting = get_transactions_by_posting(date_from, accrual_date_to, session) if postings else {}
 
     for idx, post in enumerate(postings, start=1):
         posting_number = post.get("posting_number", "")
-        status = post.get("status", "")                         # Статус
+        status = str(post.get("status") or "").strip().lower()
         schema = post.get("__schema", "")
         
         # Дата отгрузки - для FBS используется shipment_date, для FBO может быть другое поле
@@ -495,6 +516,23 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
             amount += float(trans.get("amount") or 0)
             sale_commission += float(trans.get("sale_commission") or 0)
             price += float(trans.get("accruals_for_sale") or 0)
+        has_commission_data = any(trans.get("has_commission_data") for trans in transactions or [])
+        was_returned = any(trans.get("is_return") for trans in transactions or [])
+        # Cross-border postings (Ozon settles with the seller on customs/currency-conversion timing,
+        # not the usual schedule) can sit with commission_amount/payout at 0 in Ozon's own live
+        # snapshot for a long time — this is not a request-window gap like the case below.
+        is_pending_buyout = not has_commission_data and any(it.get("is_marketplace_buyout") for it in items)
+        PENDING_BUYOUT_LABEL = "Ожидает расчёта Ozon (трансграничный заказ)"
+        PENDING_MONTH_GAP_LABEL = "Ожидает расчёта Ozon (начисление ещё не пришло)"
+
+        if price == 0 and not has_commission_data:
+            # Accruals are split per service/day by /v1/finance/accrual/by-day; a posting whose
+            # sale-with-commission accrual fell in a different month (late-arriving delivery/return
+            # fee corrections, common near month boundaries) has none with a seller_price this month.
+            # The posting itself always carries the per-unit retail price regardless of accrual timing.
+            # Skipped when has_commission_data is True: there price==0 means a sale was fully offset
+            # by its own return within the period (see was_returned below) — a genuine zero, not a gap.
+            price = sum(float(it.get("price") or 0) * int(it.get("quantity", 0) or 0) for it in items)
 
         # Формируем значения в зависимости от статуса
         if status == "delivering":
@@ -515,24 +553,52 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
             delivery_cost_cell = "-"
             profit_cell = amount
             cost_price = 0.0   # ← себестоимость обнуляем при отмене
+        elif status == "delivered" and was_returned:
+            # Ozon never updates posting status for a post-delivery return — it stays "delivered"
+            # forever, with the return visible only in the accruals (see was_returned above). Report
+            # it as "returned" so the cost of goods isn't charged for stock that came back, and so it
+            # counts correctly in calc_business_indicators()'s per-status totals below.
+            status = "returned"
+            amount_cell = amount
+            sale_commission_cell = sale_commission
+            delivery_cost_cell = -amount + price + sale_commission
+            cost_price = 0.0
+            profit_cell = amount
+        elif status == "delivered" and not has_commission_data:
+            # No sale-with-commission accrual for this posting fell inside the requested period —
+            # either it's simply dated into a different month (common near month boundaries: shipped
+            # late in the month, accrual posts a few days into the next one — see the real example
+            # 0250581479-0070-1, shipped 2026-08-20, accrual posted 2026-09-03), or it's a cross-border
+            # posting (is_marketplace_buyout) that Ozon settles on its own customs/currency timing and
+            # which can show commission_amount=payout=0 in Ozon's own live snapshot for a long time.
+            # Either way we do not yet know the real revenue, so profit must not be computed from a
+            # payout that hasn't happened, and cost of goods must not be charged before revenue is
+            # recognized (matching principle) — reported instead as its own status so it's easy to
+            # find and re-check once Ozon actually posts the accrual (it will show up as a normal
+            # "delivered" row in whatever month that turns out to be).
+            status = "ожидает расчёта"
+            amount_cell = amount
+            sale_commission_cell = PENDING_BUYOUT_LABEL if is_pending_buyout else PENDING_MONTH_GAP_LABEL
+            delivery_cost_cell = sale_commission_cell
+            cost_price = 0.0
+            profit_cell = sale_commission_cell
         elif status == "delivered":
             amount_cell = amount
             sale_commission_cell = sale_commission
             delivery_cost_cell = - amount + price + sale_commission
             profit_cell = amount + cost_price
-            # Если при доставленном заказе прибыль получилась отрицательной —
-            # считаем, что заказ по сути возврат: убыток = минус стоимость логистики,
-            # себестоимость = 0, статус меняем на returned.
-            if profit_cell < 0:
-                status = "returned"
-                cost_price = 0.0
-                # Итоговая прибыль при возврате — всегда со знаком минус (убыток)
-                profit_cell = -abs(delivery_cost_cell)
+        elif status == "returned":
+            amount_cell = amount
+            sale_commission_cell = sale_commission
+            delivery_cost_cell = -amount + price + sale_commission
+            cost_price = 0.0
+            profit_cell = amount
         else:
             amount_cell = "-"
             sale_commission_cell = "-"
             delivery_cost_cell = "-"
             profit_cell = "-"
+            cost_price = 0.0  # Себестоимость списываем только для доставленной продажи.
 
         artikul_val = _artikul_to_number(offer_ids_joined) if len(offer_ids_list) == 1 else offer_ids_joined
         rows.append({
@@ -696,6 +762,7 @@ def calc_business_indicators(
         # В отчёте показываем со знаком плюс (как Продвижение Ozon)
         star_products_cost = 0.0
         fbo_storage_cost = 0.0
+        payout_summary = None
         if date_from and date_to:
             try:
                 # date_from вида "2025-02-01T00:00:00Z"
@@ -712,6 +779,9 @@ def calc_business_indicators(
                     fbo_storage_cost = abs(float(raw_storage))
                     if fbo_storage_cost > 0:
                         print(f"💰 Расход хранения FBO (из отчёта о балансе): {fbo_storage_cost:.2f} ₽")
+                    payout_summary = summarize_balance_month(month, year, reports=balance_reports)
+                    if payout_summary:
+                        print(f"💰 Ozon выплатил за период: {payout_summary['payments']:.2f} ₽")
             except Exception as e:
                 raise RuntimeError(f"Не удалось получить данные из баланса: {e}") from e
 
@@ -765,12 +835,14 @@ def calc_business_indicators(
         returned_count = 0
         delivering_count = 0
         cancelled_count = 0
+        pending_count = 0
         ratios_commission_pct = []   # Комиссия Ozon / Цена продажи, %
         ratios_logistics_pct = []   # Логистика / Цена продажи, %
         commission_total = 0.0
         logistics_total = 0.0
         revenue_for_avg_check = 0.0
         orders_nonzero_price = 0
+        our_amount_total = 0.0
 
         for row in range(2, ws.max_row + 1):
             status_val = ws.cell(row=row, column=1).value
@@ -783,10 +855,15 @@ def calc_business_indicators(
                 delivering_count += 1
             if status == "cancelled":
                 cancelled_count += 1
+            if status == "ожидает расчёта":
+                pending_count += 1
 
             price_val = ws.cell(row=row, column=6).value
             comm_val = ws.cell(row=row, column=7).value
             log_val = ws.cell(row=row, column=8).value
+            amount_val = ws.cell(row=row, column=9).value
+            if isinstance(amount_val, (int, float)):
+                our_amount_total += amount_val
 
             try:
                 price = float(price_val) if price_val is not None and str(price_val).strip() not in ("-", "") else None
@@ -867,6 +944,40 @@ def calc_business_indicators(
         ws["Q20"] = commission_total
         ws["P21"] = "Логистика сумма"
         ws["Q21"] = logistics_total
+        ws["P22"] = "Заказы, ожидающие расчёта Ozon (не учтены в прибыли/себестоимости)"
+        ws["Q22"] = pending_count
+
+        row_cursor = 23
+        if payout_summary:
+            pairs = [
+                ("Выплачено Ozon за период (реальный перевод)", payout_summary["payments"]),
+                ("Входящий баланс на начало периода", payout_summary["opening_balance"]),
+                ("Исходящий баланс на конец периода", payout_summary["closing_balance"]),
+                ("Начислено Ozon за период (по балансу, календарные дни)", payout_summary["accrued"]),
+                ("Сумма начисления по нашему расчёту (по датам отгрузки)", our_amount_total),
+                ("Расхождение: баланс Ozon минус наш расчёт", payout_summary["accrued"] - our_amount_total),
+                ("Комиссия за ранний вывод средств", payout_summary["early_payment_fee"]),
+            ]
+            for label, value in pairs:
+                ws.cell(row=row_cursor, column=16, value=label)
+                ws.cell(row=row_cursor, column=17, value=value if value is not None else "—")
+                row_cursor += 1
+            ws.cell(row=row_cursor, column=16, value="Справка")
+            ws.cell(row=row_cursor, column=17,
+                   value="«Начислено Ozon» считает по календарным дням месяца из отчёта о балансе; наш расчёт — "
+                         "по заказам, отгруженным в этом месяце (с доборкой начислений задним числом). "
+                         "Небольшое расхождение — это нормально: разная методика группировки, не ошибка. "
+                         "Большое расхождение стоит проверить — смотрите строку «Заказы, ожидающие расчёта Ozon» выше.")
+            row_cursor += 2
+            other_services = {name: amount for name, amount in payout_summary["services"].items()
+                              if name not in ("star_products", "product_placement_in_ozon_warehouses") and amount}
+            if other_services:
+                ws.cell(row=row_cursor, column=16, value="Прочие комиссии и услуги Ozon за период (баланс)")
+                row_cursor += 1
+                for name, amount in sorted(other_services.items(), key=lambda item: abs(item[1]), reverse=True)[:12]:
+                    ws.cell(row=row_cursor, column=16, value=name)
+                    ws.cell(row=row_cursor, column=17, value=amount)
+                    row_cursor += 1
 
         # Сохраняем изменения
         save_workbook_atomic(wb, filename)

@@ -121,6 +121,39 @@ class OfflineTests(unittest.TestCase):
             self.assertEqual(api.call_count, 2)
             self.assertEqual(api.call_args_list[1].args, ("2026-08-31", "2026-08-31"))
 
+    def test_summarize_month_reconciles_payments_against_balance_and_finds_early_payment_fee(self):
+        def response(start, end):
+            first = start.endswith("-01")
+            return {
+                "total": {
+                    "opening_balance": {"value": 5603.9 if first else 2208.34, "currency_code": "RUB"},
+                    "closing_balance": {"value": 2208.34 if first else 3645.5, "currency_code": "RUB"},
+                    "accrued": {"value": 25171.61 if first else 1437.16, "currency_code": "RUB"},
+                    "payments": [{"value": -28567.17 if first else 0, "currency_code": "RUB"}],
+                },
+                "cashflows": {
+                    "sales": {"amount": {"value": 95101}, "fee": {"value": -46782.55 if first else -2063.31}},
+                    "returns": {"amount": {"value": -7313}, "fee": {"value": 3617.37 if first else 0}},
+                    "services": [
+                        {"name": "early_payment", "amount": {"value": -862.43 if first else 0}},
+                        {"name": "acquiring", "amount": {"value": -949 if first else -10.56}},
+                        {"name": "star_products", "amount": {"value": -1500.44 if first else -62.34}},
+                    ],
+                },
+            }
+        with patch.object(balance, "get_balance_report", side_effect=response):
+            reports = balance.get_monthly_balance_reports(8, 2026)
+            summary = balance.summarize_month(8, 2026, reports)
+        self.assertEqual(summary["opening_balance"], 5603.9)
+        self.assertEqual(summary["closing_balance"], 3645.5)
+        self.assertAlmostEqual(summary["accrued"], 25171.61 + 1437.16)
+        self.assertAlmostEqual(summary["payments"], -28567.17)
+        self.assertAlmostEqual(summary["early_payment_fee"], -862.43)
+        self.assertAlmostEqual(summary["services"]["acquiring"], -949 - 10.56)
+        # Opening + accrued + payments should reconcile to closing, matching Ozon's own ledger.
+        self.assertAlmostEqual(summary["opening_balance"] + summary["accrued"] + summary["payments"],
+                               summary["closing_balance"], places=2)
+
     def test_failed_balance_segment_is_not_zero(self):
         with patch.object(balance, "get_balance_report", side_effect=[{}, RuntimeError("failed")]):
             with self.assertRaises(RuntimeError):

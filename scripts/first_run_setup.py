@@ -80,28 +80,19 @@ def ensure_deps(venv_python: Path, repo_root: Path):
         pass
 
 
-def ensure_env(repo_root: Path) -> bool:
+def ensure_env(repo_root: Path, force: bool = False) -> bool:
     env_path = repo_root / ".env"
-    if env_path.exists():
-        return False
-    print_step("Создание .env")
-    client_id = input("Введите OZON_CLIENT_ID: ").strip()
-    api_key = input("Введите OZON_API_KEY: ").strip()
-
-    env_content = f"OZON_CLIENT_ID={client_id}\nOZON_API_KEY={api_key}\n"
-    if prompt_yes_no("Добавить Performance API credentials для рекламы? (опционально)", default_yes=False):
-        print("\nДля рекламы нужны отдельные ключи из раздела Продвижение -> API в кабинете Ozon.")
-        perf_client_id = input("Введите OZON_PERF_CLIENT_ID (или Enter для пропуска): ").strip()
-        perf_api_key = input("Введите OZON_PERF_API_KEY (или Enter для пропуска): ").strip()
-        if perf_client_id and perf_api_key:
-            env_content += f"OZON_PERF_CLIENT_ID={perf_client_id}\nOZON_PERF_API_KEY={perf_api_key}\n"
-            print("Performance API credentials добавлены.")
-        else:
-            print("Performance API credentials пропущены.")
-
-    env_path.write_text(env_content, encoding="utf-8")
-    print("Файл .env создан.")
-    return True
+    before = env_path.read_bytes() if env_path.exists() else None
+    python = repo_root / ".venv" / "Scripts" / "python.exe"
+    if not python.exists():
+        python = repo_root / ".venv" / "bin" / "python"
+    command = [str(python if python.exists() else sys.executable), "-X", "utf8",
+               str(repo_root / "scripts" / "marketplace_settings.py"), "--root", str(repo_root)]
+    if force:
+        command.append("--force")
+    run(command, cwd=repo_root)
+    after = env_path.read_bytes() if env_path.exists() else None
+    return before != after
 
 
 def ensure_costs(venv_python, repo_root: Path) -> bool:
@@ -168,6 +159,7 @@ def read_env_flags(repo_root: Path) -> dict:
         "ozon_api_key": False,
         "perf_client_id": False,
         "perf_api_key": False,
+        "wb_api_token": False,
     }
     if not env_path.exists():
         return flags
@@ -181,7 +173,7 @@ def read_env_flags(repo_root: Path) -> dict:
             continue
         key, value = raw.split("=", 1)
         key = key.strip()
-        value = value.strip()
+        value = value.strip().strip("\"' ")
         if key == "OZON_CLIENT_ID" and value:
             flags["ozon_client_id"] = True
         elif key == "OZON_API_KEY" and value:
@@ -190,6 +182,8 @@ def read_env_flags(repo_root: Path) -> dict:
             flags["perf_client_id"] = True
         elif key == "OZON_PERF_API_KEY" and value:
             flags["perf_api_key"] = True
+        elif key == "WB_API_TOKEN" and value:
+            flags["wb_api_token"] = True
     return flags
 
 
@@ -208,6 +202,7 @@ def print_system_status(repo_root: Path):
     reports_count = len(list_report_files(repo_root, "reports"))
 
     print("Статус системы")
+    print(f"[{'OK' if env_flags['wb_api_token'] else 'WARN'}] WB API-токен: {'сохранён' if env_flags['wb_api_token'] else 'не задан'}")
     print(f"[{'OK' if ozon_ok else 'WARN'}] Ozon API {'настроен' if ozon_ok else 'не настроен'}")
     print(f"[{'OK' if costs_exists else 'WARN'}] costs.xlsx {'найден' if costs_exists else 'не найден'}")
     print(f"[OK] Monthly reports: {reports_count}")
@@ -574,7 +569,7 @@ def show_settings_menu(venv_python: Path, repo_root: Path):
             "НАСТРОЙКИ",
             [
                 "Проверить статус системы",
-                "Создать или проверить .env",
+                "Настроить Ozon и Wildberries",
                 "Открыть costs.xlsx",
                 "Проверить обновления",
             ],
@@ -584,7 +579,7 @@ def show_settings_menu(venv_python: Path, repo_root: Path):
         if choice == "1":
             print_system_status(repo_root)
         elif choice == "2":
-            ensure_env(repo_root)
+            ensure_env(repo_root, force=True)
         elif choice == "3":
             ensure_costs(venv_python, repo_root)
             open_local_file(repo_root / "costs.xlsx")
@@ -612,6 +607,7 @@ def main():
     ensure_deps(venv_python, repo_root)
     if args.setup_only:
         return
+    ensure_env(repo_root)
     check_for_updates(venv_python, repo_root)
 
     while True:
