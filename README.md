@@ -67,7 +67,7 @@
 python -m venv .venv
 .venv\Scripts\activate
 pip install -U pip
-pip install requests pandas openpyxl python-dateutil python-dotenv packaging
+pip install -r config\requirements.lock.txt
 python scripts\first_run_setup.py
 ```
 
@@ -362,6 +362,25 @@ python scripts\balance_report.py --date_from 2026-03-01 --date_to 2026-03-30
 - используется также как источник для:
   - `star_products`;
   - `product_placement_in_ozon_warehouses`.
+
+## Перенос на другой компьютер
+
+В git не попадают личные данные: ключи API (`.env`), себестоимость (`costs.xlsx`, `wb_costs.xlsx`), настройки рентабельности (`margin_settings.json`) и папки с отчётами. Чтобы программа на новом компьютере работала так же:
+
+**На старом компьютере**
+
+1. Запустите `Export_Data.bat` — в папке проекта появится `OzonReportX_transfer_ГГГГММДД_ЧЧММ.zip`.
+2. Перенесите архив на новый компьютер (флешка, личное облако). Архив содержит ключи API — не публикуйте его и удалите после переноса.
+
+**На новом компьютере**
+
+1. Установите [Python 3.14](https://www.python.org/downloads/) (при установке отметьте *Add python.exe to PATH*) и Git.
+2. Склонируйте репозиторий: `git clone <адрес репозитория>`.
+3. Положите архив в папку проекта и запустите `Import_Data.bat` (или перетащите архив на него).
+4. Запустите `OzonReportX_UI.bat` — создастся `.venv` и установятся зависимости точных версий из `config/requirements.lock.txt`.
+5. Для AI-аналитики установите [Ollama](https://ollama.com/download) и скачайте модель: `ollama pull qwen3:4b`. Другая модель или адрес задаются в `.env` через `OLLAMA_MODEL` / `OLLAMA_HOST`.
+
+Чтобы обновить lock-файл после изменения зависимостей: `.venv\Scripts\python.exe -m pip freeze`, результат записать в `config/requirements.lock.txt`.
 
 ## Основные папки
 

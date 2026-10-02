@@ -66,7 +66,10 @@ def ensure_venv(repo_root: Path) -> tuple[Path, bool]:
 def ensure_deps(venv_python: Path, repo_root: Path):
     venv_dir = Path(venv_python).resolve().parent.parent
     bootstrap_marker = venv_dir / ".bootstrap_done"
-    req = repo_root / "config" / "requirements.txt"
+    # Lock-файл с точными версиями даёт одинаковое окружение на разных компьютерах.
+    req = repo_root / "config" / "requirements.lock.txt"
+    if not req.exists():
+        req = repo_root / "config" / "requirements.txt"
     fingerprint = hashlib.sha256(req.read_bytes()).hexdigest()
     if bootstrap_marker.exists() and bootstrap_marker.read_text(encoding="utf-8").strip() == fingerprint:
         log_verbose("Зависимости уже установлены.")

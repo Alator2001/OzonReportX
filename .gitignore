@@ -42,3 +42,6 @@ htmlcov/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Transfer archives with secrets (scripts/transfer_data.py)
+/OzonReportX_transfer_*.zip
