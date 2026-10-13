@@ -361,7 +361,8 @@ def build_month_summary_payload_core(results: Dict[str, Any]) -> Optional[Dict[s
                 "revenue": summary.get("Общая выручка"),
                 "net_profit": summary.get("Чистая прибыль"),
                 "cost_of_goods": summary.get("Итоговая себестоимость"),
-                "gross_profit": summary.get("COGS (валовая прибыль)"),
+                "gross_profit": summary.get("Валовая прибыль", summary.get("COGS (валовая прибыль)")),
+                "ozon_charges_outside_orders": summary.get("Расходы Ozon вне заказов"),
                 "operating_expenses": summary.get("Операционные расходы"),
             },
             "orders": {

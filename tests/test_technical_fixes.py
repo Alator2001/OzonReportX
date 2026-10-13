@@ -333,7 +333,10 @@ class OfflineTests(unittest.TestCase):
         state = {"job_lock": threading.Lock(), "job_cancel_event": threading.Event(),
             "cancel_state": {}, "active_proc": {"proc": None}, "ui_queue": events,
             "set_status": Mock(), "set_log": Mock(), "toast": Mock(), "page": page,
-            "ACCENT": "", "stream_process": Mock(side_effect=OSError("start failed"))}
+            "ACCENT": "", "stream_process": Mock(side_effect=OSError("start failed")),
+            "PRICING_SYNC_TITLE": "Текущие цены и акции",
+            "DASHBOARD_REFRESH_TITLE": "Обновление бизнес-сводки",
+            "ABC_JOB_TITLE": "ABC/XYZ", "WB_SUPPLY_TITLE": "План запасов WB"}
         job = ui_function("job", state)
         job("first", ["python"])
         job("second", ["python"])
@@ -351,7 +354,10 @@ class OfflineTests(unittest.TestCase):
             "set_log": Mock(), "refresh_dashboard": Mock(side_effect=ValueError("bad workbook")),
             "refresh_pricing_costs_preview": Mock(), "append_log": Mock(), "set_status": Mock(),
             "PRIMARY": "green", "DANGER": "red", "chart_pending_action": {"type": None},
-            "dashboard_chart_state": {"built": False}, "refresh_files": Mock(), "page": page}
+            "dashboard_chart_state": {"built": False}, "refresh_files": Mock(), "page": page,
+            "PRICING_SYNC_TITLE": "Текущие цены и акции",
+            "DASHBOARD_REFRESH_TITLE": "Обновление бизнес-сводки",
+            "ABC_JOB_TITLE": "ABC/XYZ", "WB_SUPPLY_TITLE": "План запасов WB"}
         finish = ui_function("finish", namespace)
         finish("report", 1, "failed")
         self.assertFalse(lock.locked())

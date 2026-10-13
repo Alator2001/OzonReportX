@@ -26,6 +26,11 @@ from scripts.file_io import save_workbook_atomic
 from scripts.file_lock import exclusive_file, file_signature
 from scripts.ui_log import SessionLog
 from scripts.wb_dashboard import build_dashboard as build_wb_dashboard
+try:
+    from scripts import auto_actions
+except Exception:  # модуль автоакций необязателен для запуска интерфейса
+    auto_actions = None
+from scripts.abc_view import load_abc_report as abc_load_report, matrix_counts as abc_matrix_counts, report_period_title as abc_period_title, xyz_group as abc_xyz_group
 from scripts.marketplace_settings import FIELDS, HELP, read_settings, save_settings, needs_setup
 
 try:
@@ -63,17 +68,56 @@ except Exception as exc:
 
 try:
     from scripts.price_management import (
+        build_action_add_plan,
+        build_action_removal_plan,
         build_discount_request_plan,
+        build_upcoming_actions_plan,
+        execute_action_plan,
+        execute_upcoming_actions_plan,
+        load_actions_calendar,
         process_discount_request_item,
         process_discount_request_plan,
+        BOOST_COLUMN_SUFFIX,
     )
     PRICING_IMPORT_ERROR = None
 except Exception as exc:
+    BOOST_COLUMN_SUFFIX = " — бустинг, %"
+    build_action_add_plan = None
+    build_action_removal_plan = None
     build_discount_request_plan = None
+    build_upcoming_actions_plan = None
+    execute_action_plan = None
+    execute_upcoming_actions_plan = None
+    load_actions_calendar = None
     process_discount_request_item = None
     process_discount_request_plan = None
     PRICING_IMPORT_ERROR = str(exc)
 
+
+try:
+    from scripts.ads_cpc import (
+        build_ads_plan,
+        execute_ads_plan,
+        list_cpc_campaigns,
+        load_settings as ads_load_settings,
+        save_settings as ads_save_settings,
+    )
+    ADS_IMPORT_ERROR = None
+except Exception as exc:
+    build_ads_plan = None
+    execute_ads_plan = None
+    list_cpc_campaigns = None
+    ads_load_settings = None
+    ads_save_settings = None
+    ADS_IMPORT_ERROR = str(exc)
+
+try:
+    from scripts.organic_analysis import load_last_result as organic_load_last, run_analysis as organic_run_analysis
+    ORGANIC_IMPORT_ERROR = None
+except Exception as exc:
+    organic_load_last = None
+    organic_run_analysis = None
+    ORGANIC_IMPORT_ERROR = str(exc)
 
 ROOT = Path(__file__).resolve().parent
 SCRIPTS = ROOT / "scripts"
@@ -100,7 +144,10 @@ COSTS_MAIN_COLUMNS = [
     "Текущая цена на Ozon",
     "Цена с учётом акций и скидок",
     "Текущая ожидаемая рентабельность",
+    "Ожидаемая чистая прибыль",
 ]
+# Колонки, которых может не быть в старом costs.xlsx до первой синхронизации.
+COSTS_OPTIONAL_COLUMNS = {"Ожидаемая чистая прибыль"}
 COSTS_MAIN_COLUMN_EXPANDS = {
     "Артикул": 12,
     "Себестоимость": 11,
@@ -109,9 +156,26 @@ COSTS_MAIN_COLUMN_EXPANDS = {
     "Текущая цена на Ozon": 14,
     "Цена с учётом акций и скидок": 16,
     "Текущая ожидаемая рентабельность": 14,
+    "Ожидаемая чистая прибыль": 13,
+    "Бустинг в акциях": 12,
 }
+# Колонка только для отображения: берётся с листа «Акции», в «Основной» не пишется.
+PRICING_BOOST_COLUMN = "Бустинг в акциях"
+COSTS_TABLE_COLUMNS = [*COSTS_MAIN_COLUMNS, PRICING_BOOST_COLUMN]
+COSTS_ACTIONS_SHEET = "Акции"
+# Название задачи синхронизации цен: по нему таблица показывает загрузку и блокируется.
+PRICING_SYNC_TITLE = "Текущие цены и акции"
+DASHBOARD_REFRESH_TITLE = "Обновление бизнес-сводки"
+ABC_JOB_TITLE = "ABC/XYZ"
+WB_SUPPLY_TITLE = "План запасов WB"
 PRICING_CALCULATED_COLUMNS = ("Минимальная цена продажи", "Желательная цена продажи")
-PRICING_SYNC_COLUMNS = ("Текущая цена на Ozon", "Цена с учётом акций и скидок", "Текущая ожидаемая рентабельность")
+PRICING_SYNC_COLUMNS = (
+    "Текущая цена на Ozon",
+    "Цена с учётом акций и скидок",
+    "Текущая ожидаемая рентабельность",
+    "Ожидаемая чистая прибыль",
+    PRICING_BOOST_COLUMN,
+)
 EDITABLE_COSTS_COLUMNS = {"Артикул", "Себестоимость"}
 MONTHS = [
     "Январь",
@@ -373,6 +437,7 @@ def _build_costs_cell(column: str, cell_payload: dict[str, object] | None, dark:
         padding=ft.Padding.symmetric(horizontal=10, vertical=8),
         border_radius=10,
         bgcolor=fill_color,
+        tooltip=payload.get("tooltip") if isinstance(payload.get("tooltip"), str) else None,
         data="preserve_excel_fill" if fill_color else None,
         content=ft.Text(
             _format_costs_preview_value(column, value),
@@ -409,6 +474,9 @@ def _pricing_conditional_fill(
             return "#FFC7CE"
         if min_margin_pct <= profitability <= desired_margin_pct:
             return "#C6EFCE"
+
+    if column == "Ожидаемая чистая прибыль" and value < 0:
+        return "#FFC7CE"
     return None
 
 
@@ -428,6 +496,49 @@ def _apply_costs_conditional_formats(
             conditional_fill = _pricing_conditional_fill(column, typed_row, min_margin_pct=min_margin_pct, desired_margin_pct=desired_margin_pct)
             if conditional_fill:
                 payload["fill_color"] = conditional_fill
+
+
+def _read_action_boosts(wb) -> dict[str, list[tuple[str, float]]] | None:
+    """
+    {артикул: [(акция, бустинг %)]} с листа «Акции» (колонки «<акция> — бустинг, %»).
+    None, если бустинг ещё не загружался (нет листа или колонок бустинга).
+    """
+    if COSTS_ACTIONS_SHEET not in wb.sheetnames:
+        return None
+    ws = wb[COSTS_ACTIONS_SHEET]
+    header = [str(cell.value or "") for cell in next(ws.iter_rows(min_row=1, max_row=1), [])]
+    boost_columns = [
+        (index, name[: -len(BOOST_COLUMN_SUFFIX)])
+        for index, name in enumerate(header)
+        if name.endswith(BOOST_COLUMN_SUFFIX)
+    ]
+    if not boost_columns:
+        return None
+    result: dict[str, list[tuple[str, float]]] = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        article = _format_costs_preview_value("Артикул", row[0] if row else None)
+        for index, action_name in boost_columns:
+            boost = as_float(row[index]) if index < len(row) else None
+            if boost is not None:
+                result.setdefault(article, []).append((action_name, boost))
+    return result
+
+
+def _boost_cell_payload(boosts: list[tuple[str, float]] | None) -> dict[str, object]:
+    """Максимальный бустинг товара; во всплывающей подсказке — все акции."""
+    if boosts is None:
+        return {"value": None, "fill_color": None, "font_color": None, "tooltip": "Нажмите «Синхронизировать», чтобы загрузить бустинг"}
+    if not boosts:
+        return {"value": None, "fill_color": None, "font_color": None, "tooltip": "Товар не участвует в акциях"}
+    ordered = sorted(boosts, key=lambda pair: pair[1], reverse=True)
+
+    def percent(boost: float) -> str:
+        return f"{boost:g}%".replace(".", ",")
+
+    best = percent(ordered[0][1])
+    value = best if len(ordered) == 1 else f"{best} (+{len(ordered) - 1})"
+    tooltip = "\n".join(f"{name}: {percent(boost)}" for name, boost in ordered)
+    return {"value": value, "fill_color": None, "font_color": None, "tooltip": tooltip}
 
 
 def read_costs_main_rows(
@@ -456,7 +567,7 @@ def read_costs_main_rows(
             for idx, cell in enumerate(header_cells)
             if cell.value is not None and str(cell.value).strip()
         }
-        missing = [column for column in COSTS_MAIN_COLUMNS if column.lower() not in header_map]
+        missing = [column for column in COSTS_MAIN_COLUMNS if column.lower() not in header_map and column not in COSTS_OPTIONAL_COLUMNS]
         if missing:
             return [], f"В листе «Основной» нет колонок: {', '.join(missing)}."
 
@@ -466,8 +577,8 @@ def read_costs_main_rows(
             item["__row_number"] = row[0].row if row else None
             has_payload = False
             for column in COSTS_MAIN_COLUMNS:
-                cell_index = header_map[column.lower()]
-                cell = row[cell_index] if cell_index < len(row) else None
+                cell_index = header_map.get(column.lower())
+                cell = row[cell_index] if cell_index is not None and cell_index < len(row) else None
                 value = cell.value if cell is not None else None
                 if value not in (None, ""):
                     has_payload = True
@@ -479,6 +590,10 @@ def read_costs_main_rows(
             if has_payload:
                 rows.append(item)
         _apply_costs_conditional_formats(rows, min_margin_pct=min_margin_pct, desired_margin_pct=desired_margin_pct)
+        boosts = _read_action_boosts(wb)
+        for item in rows:
+            article = _format_costs_preview_value("Артикул", item["Артикул"]["value"])
+            item[PRICING_BOOST_COLUMN] = _boost_cell_payload(None if boosts is None else boosts.get(article, []))
         return rows, None
     except Exception as exc:
         return [], f"Не удалось прочитать лист «Основной»: {exc}"
@@ -755,6 +870,36 @@ def margin_defaults() -> tuple[str, str]:
         return f"{float(data.get('min_margin', 0.25)):.2f}", f"{float(data.get('desired_margin', 0.30)):.2f}"
     except Exception:
         return "0.25", "0.30"
+
+
+def supply_defaults() -> tuple[str, str, str]:
+    """Срок поставки, цикл и уровень сервиса из fbo_supply_settings.json."""
+    lead, cover, level = "14", "30", "0.9"
+    path = ROOT / "fbo_supply_settings.json"
+    if path.exists():
+        try:
+            import json
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+            lead = str(int(data.get("lead_days", 14)))
+            cover = str(int(data.get("cover_days", 30)))
+            level = f"{float(data.get('service_level', 0.9)):g}"
+        except Exception:
+            pass
+    return lead, cover, level
+
+
+def valid_supply(lead: str, cover: str, level: str) -> str | None:
+    try:
+        lead_days, cover_days = int(lead), int(cover)
+        service = float(level.replace(",", "."))
+    except ValueError:
+        return "Срок и цикл — целые дни, уровень сервиса — число вроде 0.9."
+    if not 1 <= lead_days <= 120 or not 7 <= cover_days <= 180:
+        return "Срок поставки — от 1 до 120 дней, цикл — от 7 до 180 дней."
+    if not 0.5 <= service <= 0.99:
+        return "Уровень сервиса должен быть от 0.5 до 0.99."
+    return None
 
 
 def valid_month_year(month: str, year: str) -> str | None:
@@ -1128,7 +1273,7 @@ def main(page: ft.Page) -> None:
     page.title = "OzonReportX"
     page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = "#1A1F23"
-    page.padding = 24
+    page.padding = 16
     try:
         page.window.maximized = True
         page.window.resizable = True
@@ -1139,9 +1284,10 @@ def main(page: ft.Page) -> None:
         page.window_resizable = True
     except Exception:
         pass
-    page.window_min_width = 1200
-    page.window_min_height = 860
-    page.scroll = ft.ScrollMode.HIDDEN
+    page.window_min_width = 1100
+    page.window_min_height = 640
+    # Страница не прокручивается: прокрутка внутри разделов и меню.
+    page.scroll = None
     current_dark = {"value": True}
 
     today = date.today()
@@ -1161,15 +1307,15 @@ def main(page: ft.Page) -> None:
             ft.dropdown.Option("revenue", "Оборот / Месяц"),
             ft.dropdown.Option("margin", "Рентабельность / Месяц"),
         ],
-        value=None,
-        width=250,
+        value="profit",
+        width=230,
     )
     chart_from_month_value = prev.month - 4 if prev.month > 4 else prev.month + 8
     chart_from_year_value = prev.year if prev.month > 4 else prev.year - 1
-    dashboard_chart_from_m = ft.Dropdown(label="С месяца", options=month_opts, value=str(chart_from_month_value), width=190)
-    dashboard_chart_from_y = ft.Dropdown(label="Год", options=[ft.dropdown.Option(y) for y in years], value=str(chart_from_year_value), width=150)
-    dashboard_chart_to_m = ft.Dropdown(label="По месяц", options=month_opts, value=str(prev.month), width=190)
-    dashboard_chart_to_y = ft.Dropdown(label="Год", options=[ft.dropdown.Option(y) for y in years], value=str(prev.year), width=150)
+    dashboard_chart_from_m = ft.Dropdown(label="С месяца", options=month_opts, value=str(chart_from_month_value), width=180)
+    dashboard_chart_from_y = ft.Dropdown(label="Год", options=[ft.dropdown.Option(y) for y in years], value=str(chart_from_year_value), width=120)
+    dashboard_chart_to_m = ft.Dropdown(label="По месяц", options=month_opts, value=str(prev.month), width=180)
+    dashboard_chart_to_y = ft.Dropdown(label="Год", options=[ft.dropdown.Option(y) for y in years], value=str(prev.year), width=120)
     for chart_control in [
         dashboard_chart_type,
         dashboard_chart_from_m,
@@ -1189,9 +1335,16 @@ def main(page: ft.Page) -> None:
     bal_from = ft.TextField(label="Дата от", value=today.replace(day=1).isoformat(), width=210)
     bal_to = ft.TextField(label="Дата до", value=today.isoformat(), width=210)
     margin_min = ft.TextField(label="Минимальная маржа", value=m_min, width=210)
+    supply_lead_default, supply_cover_default, supply_level_default = supply_defaults()
+    supply_lead = ft.TextField(label="Срок поставки, дней", value=supply_lead_default, width=190,
+                               tooltip="От решения о поставке до продажи на складе Ozon: сборка, слот, дорога, приёмка")
+    supply_cover = ft.TextField(label="Цикл, дней", value=supply_cover_default, width=150,
+                                tooltip="На сколько дней продаж должна хватать поставка")
+    supply_level = ft.TextField(label="Уровень сервиса", value=supply_level_default, width=170,
+                                tooltip="Вероятность не уйти в ноль на FBO за цикл: 0.8 — меньше товара, 0.95 — больше")
     margin_des = ft.TextField(label="Желаемая маржа", value=m_des, width=210)
-    state = ft.Text("Готово", color=PRIMARY, weight=ft.FontWeight.W_700, size=12)
-    status_detail = ft.Text("Интерфейс готов к работе.", color=MUTED, size=9)
+    state = ft.Text("Готово", color=PRIMARY, weight=ft.FontWeight.W_700, size=12, expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+    status_detail = ft.Text("Интерфейс готов к работе.", color=MUTED, size=11, max_lines=3, overflow=ft.TextOverflow.ELLIPSIS)
     status_indicator = ft.Container(width=8, height=8, border_radius=999, bgcolor=PRIMARY)
     spin = ft.ProgressRing(visible=False, width=18, height=18, stroke_width=2.4)
     cancel_button = ft.Button("Отмена", visible=False, bgcolor=DANGER, color="white", height=30)
@@ -1208,11 +1361,7 @@ def main(page: ft.Page) -> None:
     log_store = SessionLog(ROOT / ".cache" / "logs" / f"ui-{datetime.now():%Y%m%d-%H%M%S}-{uuid4().hex}.log")
     log_store.reset("Интерфейс готов к работе.")
     log_state = {"lines": log_store.lines}
-    dashboard_freshness = ft.Text("Актуальность данных: —", size=12, color=MUTED)
-    dashboard_summary = ft.Column(spacing=10)
-    dashboard_metric_wrap = ft.ResponsiveRow(run_spacing=14, spacing=14)
-    dashboard_details = ft.Column(spacing=12)
-    dashboard_promotion = ft.Column(spacing=12)
+    dashboard_freshness = ft.Text("—", size=13, color=MUTED)
     dashboard_chart = ft.Image(src="", visible=False, border_radius=18)
     dashboard_chart_note = ft.Text("Выберите метрику и период, затем постройте график.", size=11, color=MUTED, visible=False)
     dashboard_chart_state_indicator = ft.Container(width=40, height=40, border_radius=14, alignment=ft.Alignment(0, 0))
@@ -1264,8 +1413,20 @@ def main(page: ft.Page) -> None:
     job_cancel_event = threading.Event()
     cancel_state = {"requested": False, "title": ""}
     status_ui_ready = {"value": False}
-    monthly_reports_list = ft.Column(spacing=10, scroll=ft.ScrollMode.AUTO, height=360)
-    abc_reports_list = ft.Column(spacing=10, scroll=ft.ScrollMode.AUTO, height=360)
+    abc_state: dict[str, object] = {"files": [], "selected": None, "data": None, "error": None, "filter": "all", "cell": None, "creating": False}
+    abc_report_pick = ft.Dropdown(label="Отчёт", width=380, options=[])
+    abc_subtitle = ft.Text("", size=13, color=MUTED)
+    abc_body = ft.Column(spacing=16)
+    abc_sync_label = ft.Text("Строю ABC/XYZ-анализ по месячным отчётам…", size=13, weight=ft.FontWeight.W_600, text_align=ft.TextAlign.CENTER)
+    abc_sync_overlay = ft.Container(
+        left=0, top=0, right=0, bottom=0, visible=False, border_radius=18, alignment=ft.Alignment(0, -1),
+        padding=ft.Padding.only(top=150), data="preserve_excel_fill",
+        content=ft.Container(
+            padding=ft.Padding.symmetric(horizontal=28, vertical=20), border_radius=18, data="preserve_excel_fill",
+            content=ft.Column([ft.ProgressRing(width=36, height=36, stroke_width=3), abc_sync_label],
+                              spacing=14, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        ),
+    )
     files_col = ft.Column(spacing=14)
     pricing_costs_status = ft.Text("Читаю лист «Основной»...", size=11, color=MUTED, weight=ft.FontWeight.W_600)
     pricing_costs_status_shell = ft.Container(
@@ -1420,13 +1581,18 @@ def main(page: ft.Page) -> None:
     def get_full_log_text() -> str:
         return log_store.full_text().strip() or "Лог пока пуст."
 
-    def set_status(title: str, detail: str = "", color: str | None = None, busy: bool = False) -> None:
+    # Тёмные тона статуса нечитаемы на тёмной подложке — в тёмной теме берём светлые аналоги.
+    status_title_dark = {PRIMARY: "#70D4BC", ACCENT: "#E0A15F", DANGER: "#FF9C8F", MUTED: "#A1A1A6"}
+    status_tone = {"value": PRIMARY}
+
+    def set_status(title: str, detail: str = "", color: str | None = None, busy: bool = False, cancellable: bool = True) -> None:
         tone = color or PRIMARY
+        status_tone["value"] = tone
         state.value = title
-        state.color = tone
+        state.color = status_title_dark.get(tone, tone) if current_dark["value"] else tone
         detail_text = (detail or "").replace("\n", " ").strip()
-        if len(detail_text) > 52:
-            detail_text = detail_text[:49].rstrip() + "..."
+        if len(detail_text) > 140:
+            detail_text = detail_text[:137].rstrip() + "..."
         status_detail.value = detail_text
         status_indicator.bgcolor = tone
         if tone == DANGER:
@@ -1442,9 +1608,10 @@ def main(page: ft.Page) -> None:
             status_shell.bgcolor = "#1F252A" if current_dark["value"] else "#FBFCFF"
             status_shell.border = ft.Border.all(1, "#353D42" if current_dark["value"] else "#E1E5EE")
         spin.visible = busy
-        cancel_button.visible = busy or active_proc["proc"] is not None
+        cancel_button.visible = (busy and cancellable) or active_proc["proc"] is not None
+        cancel_row.visible = cancel_button.visible
         if status_ui_ready["value"] and page.controls:
-            page.update(status_shell, status_indicator, state, status_detail, spin, cancel_button)
+            page.update(status_shell, status_indicator, state, status_detail, spin, cancel_row)
 
     def ai_surface_tokens() -> dict[str, str]:
         dark = current_dark["value"]
@@ -1935,7 +2102,7 @@ def main(page: ft.Page) -> None:
         ai_sync_layout()
         ai_set_busy(True, "Ассистент читает вопрос и строит план анализа.")
         set_status("AI анализирует запрос", prompt, ACCENT, busy=True)
-        page.update(ai_body, ai_messages, ai_messages_shell, ai_welcome_shell, ai_composer_shell, ai_input, state, status_detail, spin, cancel_button)
+        page.update(ai_body, ai_messages, ai_messages_shell, ai_welcome_shell, ai_composer_shell, ai_input, state, status_detail, spin, cancel_row)
 
         def worker() -> None:
             def is_cancelled() -> bool:
@@ -2150,7 +2317,7 @@ def main(page: ft.Page) -> None:
             ai_debug_log("Пользователь отменил AI-запрос", {"request_id": request_id})
             set_status("AI остановлен", "Текущий запрос отменён пользователем.", DANGER, busy=False)
             if status_ui_ready["value"] and page.controls:
-                page.update(ai_messages, ai_busy_label, state, status_detail, spin, cancel_button)
+                page.update(ai_messages, ai_busy_label, state, status_detail, spin, cancel_row)
             return
         if proc is None and not job_lock.locked():
             set_status("Нет задачи", "Нечего отменять.", MUTED, busy=False)
@@ -2245,7 +2412,7 @@ def main(page: ft.Page) -> None:
             year_value = int(monthly_y.value or today.year)
             return f"{MONTHS[month_value - 1]} {year_value}"
 
-        if cancel_state["title"] == "Обновление бизнес-сводки":
+        if cancel_state["title"] == DASHBOARD_REFRESH_TITLE:
             month_value = int(dashboard_m.value or today.month)
             year_value = int(dashboard_y.value or today.year)
             return f"{MONTHS[month_value - 1]} {year_value}"
@@ -2480,6 +2647,282 @@ def main(page: ft.Page) -> None:
         if page.controls:
             page.update(dashboard_chart_panel)
 
+    # ---------------------------------------------------------------- Бизнес-сводка
+    dashboard_state: dict[str, object] = {"metrics": None, "promo": {}, "campaigns": [], "built_at": None, "period": ""}
+    DASHBOARD_HELP = {
+        "Выручка": "Общая выручка за период по месячному отчёту. Основной показатель оборота.",
+        "Чистая прибыль": "Прибыль после вычета себестоимости, комиссий, логистики, маркетинга и прочих расходов.",
+        "Себестоимость": "Итоговая товарная себестоимость реализованных заказов за период.",
+        "Маржа": "Рентабельность по чистой прибыли: чистая прибыль / выручка × 100%.",
+        "Средний чек": "Выручка / количество заказов.",
+        "Всего заказов": "Общее количество заказов за период.",
+        "В пути": "Заказы в статусе доставки на момент формирования отчёта.",
+        "Доставлено": "Успешно доставленные заказы.",
+        "Отменено": "Отменённые заказы. Рост показателя требует проверки причин отмен.",
+        "Возвраты": "Возвращённые заказы.",
+        "Продвижение Ozon": "Расходы на внутреннее продвижение на Ozon за период.",
+        "Внешний маркетинг": "Затраты на внешний маркетинг вне Ozon, введённые при сборке отчёта.",
+        "Хранение FBO": "Затраты на хранение товаров на складах Ozon по схеме FBO.",
+        "Комиссии Ozon": "Комиссии маркетплейса: доля в выручке и сумма.",
+        "Логистика": "Логистические расходы Ozon: доля в выручке и сумма.",
+        "Валовая прибыль": "Выручка минус себестоимость товара, до прочих операционных расходов.",
+        "Операционные расходы": "Операционные расходы периода, влияющие на чистую прибыль.",
+        "Вне заказов": "Расходы Ozon за месяц, не привязанные к заказам: кросс-докинг, обработка поставки, ранний вывод средств и т.п. "
+                       "Вычитаются из чистой прибыли; подробности — на листе «Расходы вне заказов» в отчёте.",
+        "Выплачено": "Реальный перевод от Ozon за период — из отчёта о балансе (Финансы → Баланс), а не расчётная величина.",
+        "Начислено Ozon": "Начисления Ozon за период по календарным дням (отчёт о балансе). Сравните с нашим расчётом — методика группировки разная, небольшое расхождение нормально.",
+        "Ранний вывод": "Комиссия Ozon за досрочный вывод средств.",
+        "Рекламный расход": "Расход по кампаниям с ненулевым расходом за период.",
+        "Выручка с рекламы": "Выручка, атрибутированная рекламным кампаниям.",
+        "ROAS": "Выручка с рекламы / рекламный расход.",
+        "ДРР": "Рекламный расход / выручка с рекламы × 100%. Чем ниже, тем эффективнее.",
+        "CTR": "Клики / показы × 100%: насколько объявление привлекает клик.",
+        "CR": "Заказы / клики × 100%: как трафик превращается в покупку.",
+        "CPC": "Рекламный расход / клики.",
+        "CPA": "Стоимость заказа: рекламный расход / заказы.",
+        "CPM": "Стоимость 1000 показов.",
+    }
+
+    def dash_pal() -> dict:
+        dark = current_dark["value"]
+        return {
+            "dark": dark,
+            "ink": "#F3F4F6" if dark else TEXT,
+            "muted": "#9AA5A1" if dark else MUTED,
+            "surface": semantic_surface("neutral", dark=dark),
+            "border": "#343C42" if dark else "#E6E8EE",
+            "separator": "#2C3338" if dark else "#EEF0F4",
+            "good": "#5FD0B1" if dark else "#0E7A62",
+            "warn": "#E5B567" if dark else "#9A6420",
+            "bad": "#FF8F82" if dark else "#C2412F",
+            "accent": "#7FB2FF" if dark else "#2A6FD6",
+        }
+
+    def dtext(value: str, size: int = 13, color: str | None = None, weight=None, **kwargs) -> ft.Text:
+        return ft.Text(value, size=size, color=color or dash_pal()["ink"], weight=weight, data="preserve_excel_text", **kwargs)
+
+    def dpanel(content: ft.Control, padding: int = 20, **kwargs) -> ft.Container:
+        pal = dash_pal()
+        return ft.Container(content=content, padding=padding, border_radius=18, bgcolor=pal["surface"],
+                            border=ft.Border.all(1, pal["border"]), data="preserve_excel_fill", **kwargs)
+
+    def dash_section_title(title: str, caption: str = "") -> ft.Control:
+        pal = dash_pal()
+        items: list[ft.Control] = [dtext(title, 20, weight=ft.FontWeight.W_700)]
+        if caption:
+            items.append(dtext(caption, 13, pal["muted"]))
+        return ft.Container(padding=ft.Padding.only(top=10, left=4), content=ft.Column(items, spacing=2))
+
+    def dash_stat(label: str, value: str, caption: str = "", color: str | None = None, help_key: str | None = None) -> ft.Control:
+        pal = dash_pal()
+        controls: list[ft.Control] = [
+            dtext(label, 13, pal["muted"], ft.FontWeight.W_600),
+            dtext(value, 30, color, ft.FontWeight.W_700, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+        ]
+        if caption:
+            controls.append(dtext(caption, 12, pal["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS))
+        return ft.Container(col={"xs": 6, "md": 3}, padding=ft.Padding.symmetric(vertical=4, horizontal=4),
+                            tooltip=DASHBOARD_HELP.get(help_key or label), content=ft.Column(controls, spacing=2))
+
+    def dash_stats_panel(stats: list[ft.Control]) -> ft.Control:
+        return dpanel(ft.ResponsiveRow(stats, spacing=24, run_spacing=18), padding=24)
+
+    DASH_ROW_HEIGHT = 40
+
+    def dash_list(title: str, rows: list[tuple], rows_total: int, col=None) -> ft.Control:
+        """Сгруппированный список: подпись слева, значение справа, тонкие разделители. rows: (label, value, note, color, help_key)."""
+        pal = dash_pal()
+        lines: list[ft.Control] = []
+        for index, (label, value, note, color, help_key) in enumerate(rows):
+            right: list[ft.Control] = []
+            if note:
+                right.append(dtext(note, 12, pal["muted"]))
+            right.append(dtext(value, 14, color, ft.FontWeight.W_600))
+            lines.append(ft.Container(
+                height=DASH_ROW_HEIGHT, data="preserve_excel_fill",
+                border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])) if index else None,
+                tooltip=DASHBOARD_HELP.get(help_key or label),
+                content=ft.Row([dtext(label, 13, pal["muted"], expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                ft.Row(right, spacing=8, tight=True)],
+                               vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ))
+        body_height = rows_total * DASH_ROW_HEIGHT + 2
+        return dpanel(
+            ft.Column([dtext(title, 15, weight=ft.FontWeight.W_700),
+                       ft.Container(height=body_height, content=ft.Column(lines, spacing=0))], spacing=8),
+            padding=ft.Padding.only(left=20, right=20, top=16, bottom=10),
+            col=col or {"xs": 12, "md": 6, "xl": 3},
+        )
+
+    def dash_money(value) -> str:
+        return _format_currency(value)
+
+    def render_dashboard(push_update: bool = True) -> None:
+        pal = dash_pal()
+        metrics = dashboard_state["metrics"]
+        period = str(dashboard_state["period"] or "")
+        if not metrics:
+            dashboard_freshness.value = f"{period} · отчёта ещё нет" if period else "Отчёта ещё нет"
+            dashboard_metrics_area.controls = [dpanel(
+                ft.Column([
+                    ft.Icon(ft.Icons.INSERT_CHART_OUTLINED, size=44, color=pal["muted"]),
+                    dtext(f"Отчёта за {period.lower()} ещё нет" if period else "Отчёта ещё нет", 18, weight=ft.FontWeight.W_700),
+                    dtext("Сформируйте отчёт — сводка заполнится автоматически.", 13, pal["muted"]),
+                    ft.Container(height=6),
+                    ft.Button("Сформировать отчёт", icon=ft.Icons.REFRESH, bgcolor=PRIMARY, color="white", on_click=lambda _e: launch_dashboard_report()),
+                ], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
+                padding=48, alignment=ft.Alignment(0, 0),
+            )]
+        else:
+            built_at = str(dashboard_state["built_at"] or "")
+            fresh = ""
+            if len(built_at) >= 16:
+                fresh = f" · обновлено {built_at[8:10]}.{built_at[5:7]} в {built_at[11:16]}"
+            dashboard_freshness.value = period + fresh
+            revenue = as_float(metrics.get("Общая выручка")) or 0.0
+            profit = as_float(metrics.get("Чистая прибыль")) or 0.0
+            margin = as_float(metrics.get("Рентабельность по чистой прибыли (Net Profit Margin) %"))
+            orders = metrics.get("Общее количество заказов")
+            margin_color = pal["good"] if (margin or 0) >= 20 else pal["warn"] if (margin or 0) >= 5 else pal["bad"]
+
+            def share(amount) -> str:
+                value = as_float(amount)
+                return _format_percent(abs(value) / revenue * 100) if value and revenue else ""
+
+            cancelled = as_float(metrics.get("Количество отменённых заказов")) or 0
+            returns = as_float(metrics.get("Количество возвращённых заказов")) or 0
+            gap = as_float(metrics.get("Расхождение: баланс Ozon минус наш расчёт"))
+            groups = [
+                ("Заказы", [
+                    ("Всего", _format_number(orders), "", None, "Всего заказов"),
+                    ("В пути", _format_number(metrics.get("Количество заказов в доставке")), "", None, "В пути"),
+                    ("Доставлено", _format_number(metrics.get("Количество доставленных заказов")), "", None, "Доставлено"),
+                    ("Отменено", _format_number(cancelled), "", pal["bad"] if cancelled else None, "Отменено"),
+                    ("Возвраты", _format_number(returns), "", pal["bad"] if returns else None, "Возвраты"),
+                ]),
+                ("Экономика", [
+                    ("Себестоимость", dash_money(abs(as_float(metrics.get("Итоговая себестоимость")) or 0.0)), share(metrics.get("Итоговая себестоимость")), None, "Себестоимость"),
+                    ("Валовая прибыль", dash_money(metrics.get("Валовая прибыль", metrics.get("COGS (валовая прибыль)"))), "", None, "Валовая прибыль"),
+                    ("Операционные расходы", dash_money(metrics.get("Операционные расходы")), "", None, "Операционные расходы"),
+                    ("Чистая прибыль", dash_money(profit), "", pal["good"] if profit >= 0 else pal["bad"], "Чистая прибыль"),
+                ]),
+                ("Расходы Ozon", [
+                    ("Комиссии", dash_money(metrics.get("Комиссии Ozon сумма")), _format_percent(metrics.get("Комиссии Ozon %")), None, "Комиссии Ozon"),
+                    ("Логистика", dash_money(metrics.get("Логистика сумма")), _format_percent(metrics.get("Логистика %")), None, "Логистика"),
+                    ("Продвижение", dash_money(metrics.get("Продвижение Ozon")), share(metrics.get("Продвижение Ozon")), None, "Продвижение Ozon"),
+                    ("Хранение FBO", dash_money(metrics.get("Расход хранения FBO")), share(metrics.get("Расход хранения FBO")), None, "Хранение FBO"),
+                    ("Внешний маркетинг", dash_money(metrics.get("Внешний маркетинг")), share(metrics.get("Внешний маркетинг")), None, "Внешний маркетинг"),
+                    ("Вне заказов", dash_money(metrics.get("Расходы Ozon вне заказов")) if metrics.get("Расходы Ozon вне заказов") is not None else "—",
+                     share(metrics.get("Расходы Ozon вне заказов")), None, "Вне заказов"),
+                ]),
+                ("Выплаты Ozon", [
+                    ("Выплачено", dash_money(metrics.get("Выплачено Ozon за период (реальный перевод)")), "", None, "Выплачено"),
+                    ("Начислено Ozon", dash_money(metrics.get("Начислено Ozon за период (по балансу, календарные дни)")), "", None, "Начислено Ozon"),
+                    ("Наш расчёт", dash_money(metrics.get("Сумма начисления по нашему расчёту (по датам отгрузки)")), "", None, "Начислено Ozon"),
+                    ("Расхождение", dash_money(gap), "", pal["warn"] if gap and abs(gap) >= 1 else None, "Начислено Ozon"),
+                    ("Баланс: начало → конец", f"{dash_money(metrics.get('Входящий баланс на начало периода'))} → {dash_money(metrics.get('Исходящий баланс на конец периода'))}", "", None, "Выплачено"),
+                ]),
+            ]
+            rows_total = max(len(rows) for _title, rows in groups)
+            controls: list[ft.Control] = [
+                dash_stats_panel([
+                    dash_stat("Выручка", dash_money(revenue), f"{_format_number(orders)} заказов"),
+                    dash_stat("Чистая прибыль", dash_money(profit), "после всех расходов", pal["good"] if profit >= 0 else pal["bad"]),
+                    dash_stat("Маржа", _format_percent(margin), "чистая прибыль / выручка", margin_color),
+                    dash_stat("Средний чек", dash_money(metrics.get("Средний чек")), "выручка / заказы"),
+                ]),
+                ft.ResponsiveRow([dash_list(title, rows, rows_total) for title, rows in groups], spacing=16, run_spacing=16),
+            ]
+            controls += render_dashboard_promotion(pal)
+            dashboard_metrics_area.controls = controls
+        if push_update and page.controls:
+            page.update(dashboard_metrics_area, dashboard_freshness)
+
+    def render_dashboard_promotion(pal: dict) -> list[ft.Control]:
+        summary = dashboard_state["promo"] or {}
+        campaigns = list(dashboard_state["campaigns"] or [])
+        if not campaigns:
+            return [dash_section_title("Продвижение"),
+                    dpanel(dtext("В отчёте нет рекламных кампаний с расходом за этот месяц.", 13, pal["muted"]))]
+        roas = as_float(summary.get("roas")) or 0.0
+        drr = as_float(summary.get("drr"))
+        roas_color = pal["good"] if roas >= 5 else pal["warn"] if roas >= 3 else pal["bad"]
+        drr_color = None if drr is None else pal["good"] if drr <= 20 else pal["warn"] if drr <= 35 else pal["bad"]
+        roas_text = f"{roas:.2f}×".replace(".", ",")
+        total_revenue = as_float((dashboard_state["metrics"] or {}).get("Общая выручка")) or 0.0
+        ad_revenue = as_float(summary.get("revenue")) or 0.0
+        funnel = [
+            ("Показы", _format_number(summary.get("impressions")), "", None, None),
+            ("Клики", _format_number(summary.get("clicks")), f"CTR {_format_percent(summary.get('ctr'))}", None, "CTR"),
+            ("Заказы", _format_number(summary.get("orders")), f"CR {_format_percent(summary.get('cr'))}", None, "CR"),
+        ]
+        costs = [
+            ("Клик", dash_money(summary.get("cpc")), "CPC", None, "CPC"),
+            ("Заказ", dash_money(summary.get("cpa")), "CPA", None, "CPA"),
+            ("1000 показов", dash_money(summary.get("cpm")), "CPM", None, "CPM"),
+        ]
+        outcome = [
+            ("Средний чек", dash_money(summary.get("avg_order_value")), "", None, "Средний чек"),
+            ("Доля в общей выручке", _format_percent(ad_revenue / total_revenue * 100) if total_revenue else "—", "", None, None),
+            ("Кампаний с расходом", _format_number(summary.get("campaigns_count")), "", None, None),
+        ]
+        best_roas = max(campaigns, key=lambda item: item.get("__roas") or 0.0)
+        top_revenue = max(campaigns, key=lambda item: item.get("__revenue") or 0.0)
+        label_colors = {"Можно масштабировать": pal["good"], "Рабочая кампания": pal["accent"], "Нужна оптимизация": pal["warn"],
+                        "Трафик без заказов": pal["bad"]}
+        columns = [("Кампания", 4), ("Оценка", 3), ("Расход", 2), ("Выручка", 2), ("ROAS", 1), ("ДРР", 1), ("Заказы", 1), ("CPA", 2)]
+
+        def cell(content: ft.Control, weight: int, right: bool = False) -> ft.Control:
+            return ft.Container(expand=weight, alignment=ft.Alignment(1 if right else -1, 0), content=content)
+
+        table: list[ft.Control] = [ft.Row(
+            [cell(dtext(name, 12, pal["muted"], ft.FontWeight.W_600), weight, index >= 2) for index, (name, weight) in enumerate(columns)],
+            spacing=12,
+        )]
+        for campaign in sorted(campaigns, key=lambda item: -(item.get("__spend") or 0.0)):
+            name = str(campaign.get("Название кампании") or f"Кампания {campaign.get('ID кампании') or '—'}")
+            badges = []
+            if campaign is best_roas and len(campaigns) > 1:
+                badges.append("лучший ROAS")
+            if campaign is top_revenue and len(campaigns) > 1:
+                badges.append("лидер по выручке")
+            caption = f"ID {campaign.get('ID кампании') or '—'}" + (" · " + ", ".join(badges) if badges else "")
+            label = str(campaign.get("__efficiency_label") or "Без оценки")
+            table.append(ft.Container(
+                padding=ft.Padding.symmetric(vertical=10), data="preserve_excel_fill",
+                border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])),
+                content=ft.Row([
+                    cell(ft.Column([dtext(name, 13, weight=ft.FontWeight.W_600, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                    dtext(caption, 11, pal["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)], spacing=1), 4),
+                    cell(ft.Container(tooltip=str(campaign.get("__efficiency_reason") or ""),
+                                      content=ft.Row([ft.Container(width=8, height=8, border_radius=4, bgcolor=label_colors.get(label, pal["muted"]),
+                                                                   data="preserve_excel_fill"),
+                                                      dtext(label, 12, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)], spacing=6, tight=True)), 3),
+                    cell(dtext(dash_money(campaign.get("__spend")), 13), 2, True),
+                    cell(dtext(dash_money(campaign.get("__revenue")), 13), 2, True),
+                    cell(dtext(f"{(campaign.get('__roas') or 0.0):.2f}×".replace(".", ","), 13), 1, True),
+                    cell(dtext(_format_percent(campaign.get("__drr")), 13), 1, True),
+                    cell(dtext(_format_number(campaign.get("__orders")), 13), 1, True),
+                    cell(dtext(dash_money(campaign.get("__cpa")) if campaign.get("__cpa") is not None else "—", 13), 2, True),
+                ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ))
+        return [
+            dash_section_title("Продвижение", "Кампании с фактическим расходом за месяц"),
+            dash_stats_panel([
+                dash_stat("Рекламный расход", dash_money(summary.get("spend")), f"{_format_number(summary.get('campaigns_count'))} кампаний"),
+                dash_stat("Выручка с рекламы", dash_money(summary.get("revenue")), f"{_format_number(summary.get('orders'))} заказов"),
+                dash_stat("ROAS", roas_text, "выручка / расход", roas_color),
+                dash_stat("ДРР", _format_percent(drr), "доля рекламы в выручке", drr_color),
+            ]),
+            ft.ResponsiveRow([
+                dash_list("Воронка", funnel, 3, col={"xs": 12, "md": 4}),
+                dash_list("Стоимость", costs, 3, col={"xs": 12, "md": 4}),
+                dash_list("Итог рекламы", outcome, 3, col={"xs": 12, "md": 4}),
+            ], spacing=16, run_spacing=16),
+            dpanel(ft.Column([dtext("Кампании", 15, weight=ft.FontWeight.W_700), ft.Column(table, spacing=0)], spacing=10),
+                   padding=ft.Padding.only(left=20, right=20, top=16, bottom=8)),
+        ]
+
     def refresh_dashboard() -> None:
         selected_month = int(dashboard_m.value or today.month)
         selected_year = int(dashboard_y.value or today.year)
@@ -2493,496 +2936,15 @@ def main(page: ft.Page) -> None:
             toast(f"Не удалось прочитать {report_path.name}: {exc}", True)
             return
         period_title = f"{MONTHS[selected_month - 1]} {selected_year}"
-        # Always build dashboard cards from the light base palette.
-        # Dark mode is applied afterward via apply_control_theme(), which keeps
-        # theme switching instant and prevents stale dark surfaces in light mode.
-        dark_ui = False
-        business_metric_help = {
-            "Выручка": "Общая выручка за период по месячному отчёту. Основной показатель оборота.",
-            "Чистая прибыль": "Прибыль после вычета себестоимости, комиссий, логистики, маркетинга и прочих расходов.",
-            "Себестоимость": "Итоговая товарная себестоимость реализованных заказов за период.",
-            "Net Margin": "Рентабельность по чистой прибыли. Формула: чистая прибыль / выручка × 100%.",
-            "Средний чек": "Формула: выручка / количество заказов.",
-            "Всего заказов": "Общее количество заказов за период.",
-            "Доставляются": "Количество заказов в статусе доставки на момент формирования отчёта.",
-            "Доставлено": "Количество успешно доставленных заказов.",
-            "Отменено": "Количество отменённых заказов. Рост показателя требует проверки причин отмен.",
-            "Возвраты": "Количество возвращённых заказов.",
-            "Продвижение Ozon": "Расходы на внутреннее продвижение на Ozon за период.",
-            "Внешний маркетинг": "Затраты на внешний маркетинг вне Ozon, введённые при сборке отчёта.",
-            "Звёздные товары": "Расходы по программе продвижения 'Звёздные товары' за период.",
-            "Хранение FBO": "Затраты на хранение товаров на складах Ozon по схеме FBO.",
-            "Комиссии Ozon": "Комиссии маркетплейса. В карточке показаны доля в выручке и абсолютная сумма.",
-            "Логистика": "Логистические расходы Ozon. В карточке показаны доля в выручке и абсолютная сумма.",
-            "COGS": "Валовая прибыль после вычета себестоимости товара, до прочих операционных расходов.",
-            "Gross Margin": "Рентабельность по валовой прибыли. Формула: валовая прибыль / выручка × 100%.",
-            "Опер. расходы": "Операционные расходы периода, влияющие на чистую прибыль.",
-            "В доставке": "Количество заказов, которые ещё находятся в логистической цепочке.",
-            "Выплачено Ozon": "Реальный перевод от Ozon за период — из отчёта о балансе (Финансы → Баланс), а не расчётная величина.",
-            "Начислено Ozon": "Сумма начислений Ozon за период по календарным дням (отчёт о балансе). Сравните со строкой «Наш расчёт» — методика группировки разная, поэтому небольшое расхождение нормально.",
-            "Ранний вывод": "Комиссия Ozon за досрочный вывод средств (если вы им пользовались в этом периоде).",
-        }
-
-        if not metrics:
-            dashboard_freshness.value = "Актуальность данных: нет отчёта за выбранный период"
-            set_status("Нет отчёта", period_title, DANGER, busy=False)
-            dashboard_summary.controls = [
-                ft.ResponsiveRow(
-                    run_spacing=12,
-                    spacing=12,
-                    controls=[
-                        card(
-                            "Нет отчёта",
-                            "",
-                            [
-                                ft.Text("Отчёт за этот период не найден в папке reports.", size=12, color=MUTED),
-                                ft.Button("Сформировать отчёт", bgcolor=PRIMARY, color="white", on_click=lambda _e: launch_dashboard_report()),
-                            ],
-                            tone=semantic_surface("danger", dark=dark_ui),
-                            width=320,
-                            col=4,
-                        ),
-                    ],
-                )
-            ]
-            dashboard_metric_wrap.controls = [
-                metric("Выручка", "—", "", PRIMARY_SOFT, width=155, col=2),
-                metric("Чистая прибыль", "—", "", "#F6E7DA", width=155, col=2),
-                metric("Net Margin", "—", "", "#E8EEF8", width=155, col=2),
-                metric("Средний чек", "—", "", "#EFE6F5", width=155, col=2),
-                metric("Доставляются", "—", "", "#EEF3E9", width=155, col=2),
-            ]
-            dashboard_details.controls = [
-                card("Что дальше", "", [ft.Text("Выберите период и обновите данные.", size=12, color=MUTED)], tone=semantic_surface("neutral_soft", dark=dark_ui))
-            ]
-            dashboard_promotion.controls = []
-            if current_dark["value"]:
-                apply_control_theme(dashboard_summary, True)
-                apply_control_theme(dashboard_metric_wrap, True)
-                apply_control_theme(dashboard_details, True)
-                apply_control_theme(dashboard_promotion, True)
-            if page.controls:
-                page.update(dashboard_summary, dashboard_metric_wrap, dashboard_details, dashboard_promotion, dashboard_freshness, dashboard_chart_panel)
-            return
-
-        dashboard_freshness.value = f"Актуальность данных: {built_at or '—'}"
-        set_status("Данные загружены", period_title, PRIMARY, busy=False)
-        dashboard_summary.controls = []
-        net_margin_value = as_float(metrics.get("Рентабельность по чистой прибыли (Net Profit Margin) %")) or 0.0
-        profit_value = as_float(metrics.get("Чистая прибыль")) or 0.0
-        margin_tone = (
-            semantic_surface("positive", dark=dark_ui)
-            if net_margin_value >= 20
-            else semantic_surface("warning", dark=dark_ui)
-            if net_margin_value >= 5
-            else semantic_surface("danger", dark=dark_ui)
-        )
-        margin_accent = PRIMARY if net_margin_value >= 20 else ACCENT if net_margin_value >= 5 else DANGER
-        profit_tone = semantic_surface("positive", dark=dark_ui) if profit_value >= 0 else semantic_surface("danger", dark=dark_ui)
-        profit_accent = PRIMARY if profit_value >= 0 else DANGER
-        dashboard_metric_wrap.controls = [
-            hero_metric("Выручка", _format_currency(metrics.get("Общая выручка")), "", semantic_surface("neutral", dark=dark_ui), PRIMARY, width=330, col=4, tooltip=business_metric_help["Выручка"]),
-            hero_metric("Чистая прибыль", _format_currency(metrics.get("Чистая прибыль")), "", profit_tone, profit_accent, width=330, col=4, tooltip=business_metric_help["Чистая прибыль"]),
-            hero_metric("Себестоимость", _format_currency(abs(as_float(metrics.get("Итоговая себестоимость")) or 0.0)), "", semantic_surface("neutral_soft", dark=dark_ui), ACCENT, width=330, col=4, tooltip=business_metric_help["Себестоимость"]),
-            metric("Net Margin", _format_percent(metrics.get("Рентабельность по чистой прибыли (Net Profit Margin) %")), "", margin_tone, width=150, col=2, tooltip=business_metric_help["Net Margin"]),
-            metric("Средний чек", _format_currency(metrics.get("Средний чек")), "", semantic_surface("neutral_soft", dark=dark_ui), width=150, col=2, tooltip=business_metric_help["Средний чек"]),
-            metric("Заказы", _format_number(metrics.get("Общее количество заказов")), "", semantic_surface("neutral_alt", dark=dark_ui), width=150, col=2, tooltip=business_metric_help["Всего заказов"]),
-            metric("В пути", _format_number(metrics.get("Количество заказов в доставке")), "", semantic_surface("neutral_alt", dark=dark_ui), width=150, col=2, tooltip=business_metric_help["Доставляются"]),
-            metric("Доставлено", _format_number(metrics.get("Количество доставленных заказов")), "", semantic_surface("neutral_soft", dark=dark_ui), width=150, col=2, tooltip=business_metric_help["Доставлено"]),
-            metric("Отменено", _format_number(metrics.get("Количество отменённых заказов")), "", semantic_surface("danger", dark=dark_ui), width=150, col=2, tooltip=business_metric_help["Отменено"]),
-        ]
-        dashboard_details.controls = [
-            ft.ResponsiveRow(
-                run_spacing=12,
-                spacing=12,
-                controls=[
-                    card(
-                        "Продажи",
-                        "",
-                        [
-                            kv_row_compact("Заказы", _format_number(metrics.get("Общее количество заказов")), tooltip=business_metric_help["Всего заказов"]),
-                            kv_row_compact("Доставлено", _format_number(metrics.get("Количество доставленных заказов")), tooltip=business_metric_help["Доставлено"]),
-                            kv_row_compact("Отменено", _format_number(metrics.get("Количество отменённых заказов")), tooltip=business_metric_help["Отменено"]),
-                            kv_row_compact("Возвраты", _format_number(metrics.get("Количество возвращённых заказов")), tooltip=business_metric_help["Возвраты"]),
-                        ],
-                        tone=semantic_surface("neutral", dark=dark_ui),
-                        width=290,
-                        col=4,
-                    ),
-                    card(
-                        "Прибыль",
-                        "",
-                        [
-                            kv_row_compact("Чистая прибыль", _format_currency(metrics.get("Чистая прибыль")), tooltip=business_metric_help["Чистая прибыль"]),
-                            kv_row_compact("Net Margin", _format_percent(metrics.get("Рентабельность по чистой прибыли (Net Profit Margin) %")), tooltip=business_metric_help["Net Margin"]),
-                            kv_row_compact("Себестоимость", _format_currency(abs(as_float(metrics.get("Итоговая себестоимость")) or 0.0)), tooltip=business_metric_help["Себестоимость"]),
-                            kv_row_compact("COGS", _format_currency(metrics.get("COGS (валовая прибыль)")), tooltip=business_metric_help["COGS"]),
-                            kv_row_compact("Опер. расходы", _format_currency(metrics.get("Операционные расходы")), tooltip=business_metric_help["Опер. расходы"]),
-                        ],
-                        tone=semantic_surface("neutral", dark=dark_ui),
-                        width=290,
-                        col=4,
-                    ),
-                    card(
-                        "Расходы",
-                        "",
-                        [
-                            kv_row_compact("Продвижение Ozon", _format_currency(metrics.get("Продвижение Ozon")), tooltip=business_metric_help["Продвижение Ozon"]),
-                            kv_row_compact("Комиссии Ozon", f"{_format_percent(metrics.get('Комиссии Ozon %'))} • {_format_currency(metrics.get('Комиссии Ozon сумма'))}", tooltip=business_metric_help["Комиссии Ozon"]),
-                            kv_row_compact("Логистика", f"{_format_percent(metrics.get('Логистика %'))} • {_format_currency(metrics.get('Логистика сумма'))}", tooltip=business_metric_help["Логистика"]),
-                            kv_row_compact("Хранение FBO", _format_currency(metrics.get("Расход хранения FBO")), tooltip=business_metric_help["Хранение FBO"]),
-                            kv_row_compact("Внешний маркетинг", _format_currency(metrics.get("Внешний маркетинг")), tooltip=business_metric_help["Внешний маркетинг"]),
-                        ],
-                        tone=semantic_surface("neutral_alt", dark=dark_ui),
-                        width=290,
-                        col=4,
-                    ),
-                    card(
-                        "Выплаты Ozon",
-                        "Из отчёта о балансе — реальные переводы, а не наш расчёт.",
-                        [
-                            kv_row_compact("Выплачено", _format_currency(metrics.get("Выплачено Ozon за период (реальный перевод)")), tooltip=business_metric_help["Выплачено Ozon"]),
-                            kv_row_compact("Начислено (Ozon)", _format_currency(metrics.get("Начислено Ozon за период (по балансу, календарные дни)")), tooltip=business_metric_help["Начислено Ozon"]),
-                            kv_row_compact("Наш расчёт", _format_currency(metrics.get("Сумма начисления по нашему расчёту (по датам отгрузки)"))),
-                            kv_row_compact("Расхождение", _format_currency(metrics.get("Расхождение: баланс Ozon минус наш расчёт"))),
-                            kv_row_compact("Комиссия за ранний вывод", _format_currency(metrics.get("Комиссия за ранний вывод средств")), tooltip=business_metric_help["Ранний вывод"]),
-                            kv_row_compact("Баланс на начало → конец", f"{_format_currency(metrics.get('Входящий баланс на начало периода'))} → {_format_currency(metrics.get('Исходящий баланс на конец периода'))}"),
-                        ],
-                        tone=semantic_surface("neutral", dark=dark_ui),
-                        width=290,
-                        col=4,
-                    ),
-                ],
-            )
-        ]
-        if not promotion_campaigns:
-            dashboard_promotion.controls = [
-                ft.Text("Продвижение", size=24, weight=ft.FontWeight.W_800, color=TEXT),
-                card(
-                    "Продвижение",
-                    "В листе `Кампании` нет кампаний с расходом за период, поэтому блок анализа не заполнен.",
-                    [
-                        ft.Text(
-                            "Как только в месячном отчёте появятся кампании с ненулевым расходом, здесь автоматически появятся KPI и аналитика по эффективности.",
-                            size=12,
-                            color=MUTED,
-                        )
-                    ],
-                    tone=semantic_surface("neutral_soft", dark=dark_ui),
-                ),
-            ]
+        dashboard_state.update(metrics=metrics or None, promo=promotion_summary or {}, campaigns=promotion_campaigns or [],
+                               built_at=built_at, period=period_title)
+        if metrics:
+            set_status("Данные загружены", period_title, PRIMARY, busy=False)
         else:
-            best_roas_campaign = max(promotion_campaigns, key=lambda item: item.get("__roas") or 0.0)
-            top_revenue_campaign = max(promotion_campaigns, key=lambda item: item.get("__revenue") or 0.0)
-            campaign_section_tone = semantic_surface("neutral_soft", dark=dark_ui)
-            campaign_card_tone = semantic_surface("neutral", dark=dark_ui)
-            campaign_context_tone = semantic_surface("neutral_soft", dark=dark_ui)
-            campaign_secondary_tone = semantic_surface("neutral_alt", dark=dark_ui)
-            roas_tone = choose_metric_tone(as_float(promotion_summary.get("roas")), good_at_least=5, warn_at_least=3, dark=dark_ui)
-            drr_value = as_float(promotion_summary.get("drr"))
-            orders_value = as_float(promotion_summary.get("orders")) or 0.0
-            revenue_value = as_float(promotion_summary.get("revenue")) or 0.0
-            drr_tone = (
-                semantic_surface("danger", dark=dark_ui)
-                if orders_value <= 0 or revenue_value <= 0
-                else choose_metric_tone(drr_value, good_at_most=20, warn_at_most=35, dark=dark_ui)
-            )
-            ctr_tone = semantic_surface("neutral_alt", dark=dark_ui)
-            cr_tone = choose_metric_tone(as_float(promotion_summary.get("cr")), good_at_least=5, warn_at_least=2, dark=dark_ui)
-            cpa_limit = (as_float(promotion_summary.get("avg_order_value")) or 0.0) * 0.25
-            cpa_warn_limit = (as_float(promotion_summary.get("avg_order_value")) or 0.0) * 0.45
-            cpa_value = as_float(promotion_summary.get("cpa"))
-            cpa_tone = (
-                choose_metric_tone(cpa_value, good_at_most=cpa_limit, warn_at_most=cpa_warn_limit, dark=dark_ui)
-                if cpa_limit > 0 and cpa_warn_limit > 0
-                else semantic_surface("info", dark=dark_ui)
-            )
-            orders_tone = semantic_surface("neutral_soft", dark=dark_ui)
-            campaigns_count_tone = semantic_surface("neutral_alt", dark=dark_ui)
-            promotion_metric_help = {
-                "Рекламный расход": "Расход всего по кампаниям с ненулевым расходом за период. Берется как сумма поля 'Расход за период (руб.)'.",
-                "Выручка с рекламы": "Выручка, атрибутированная рекламным кампаниям. Сумма поля 'Заказы (руб.)' по кампаниям с расходом.",
-                "ROAS": "Return on Ad Spend. Формула: выручка с рекламы / рекламный расход.",
-                "ДРР": "Доля рекламных расходов. Формула: рекламный расход / выручка с рекламы × 100%. Чем ниже, тем эффективнее реклама.",
-                "CTR": "Click-Through Rate. Формула: клики / показы × 100%. Показывает, насколько объявление привлекает клик.",
-                "CR": "Conversion Rate в заказ. Формула: заказы / клики × 100%. Показывает, как трафик конвертируется в покупку.",
-                "CPC": "Cost Per Click. Формула: рекламный расход / клики.",
-                "CPA": "Cost Per Action или стоимость заказа. Формула: рекламный расход / заказы.",
-                "CPM": "Cost Per Mille. Формула: рекламный расход / показы × 1000.",
-                "Заказы": "Количество заказов, атрибутированных рекламным кампаниям. Сумма поля 'Заказы (шт.)'.",
-                "Средний чек": "Формула: выручка с рекламы / количество заказов.",
-                "Кампаний": "Количество кампаний, у которых за период был фактический расход.",
-                "Расход": "Фактический расход кампании за период. Поле 'Расход за период (руб.)'.",
-                "Выручка": "Выручка, атрибутированная конкретной кампании. Поле 'Заказы (руб.)'.",
-                "Клики": "Количество кликов по кампании за период.",
-                "Показы": "Количество показов рекламных объявлений кампании.",
-                "CPC кампании": "Средняя цена клика кампании. Поле 'Средняя цена клика (руб.)' или расход / клики.",
-                "CPA кампании": "Стоимость одного заказа по кампании. Формула: расход / заказы.",
-                "CPM кампании": "Стоимость 1000 показов по кампании. Формула: расход / показы × 1000.",
-                "CR кампании": "Конверсия клика в заказ по кампании. Формула: заказы / клики × 100%.",
-                "CTR кампании": "Кликабельность кампании. Формула: клики / показы × 100%.",
-                "ДРР кампании": "Доля рекламных расходов кампании в выручке. Чем ниже, тем лучше при сопоставимой марже.",
-                "Средний чек кампании": "Формула: выручка кампании / заказы кампании.",
-                "Бюджет": "Установленный бюджет кампании из отчёта. Используется как контекст, а не как KPI эффективности.",
-            }
-
-            campaign_cards: list[ft.Control] = []
-            campaign_card_col = 12 if len(promotion_campaigns) == 1 else 6 if len(promotion_campaigns) == 2 else 4
-            summary_fields = [
-                ("Расход", lambda item: _format_currency(item.get("Расход за период (руб.)"))),
-                ("Выручка", lambda item: _format_currency(item.get("Заказы (руб.)"))),
-                ("ROAS", lambda item: f"{(item.get('__roas') or 0.0):.2f}x".replace(".", ",")),
-                ("ДРР", lambda item: _format_percent(item.get("ДРР (%)"))),
-            ]
-            detail_fields = [
-                ("Заказы", lambda item: _format_number(item.get("Заказы (шт.)"))),
-                ("CPA", lambda item: _format_currency(item.get("__cpa"))),
-                ("CTR", lambda item: _format_percent(item.get("CTR (%)"))),
-                ("CR", lambda item: _format_percent(item.get("__cr"))),
-            ]
-            context_fields = [
-                ("Клики", lambda item: _format_number(item.get("Клики"))),
-                ("Показы", lambda item: _format_number(item.get("Показы"))),
-            ]
-            for campaign in promotion_campaigns:
-                campaign_name = str(campaign.get("Название кампании") or f"Кампания {campaign.get('ID кампании') or '—'}")
-                campaign_id = str(campaign.get("ID кампании") or "—")
-                details_wrap = ft.Container(visible=False)
-                details_button = ft.TextButton(
-                    "Детали",
-                    style=ft.ButtonStyle(
-                        color=MUTED,
-                        padding=ft.Padding.symmetric(horizontal=10, vertical=6),
-                        shape=ft.RoundedRectangleBorder(radius=999),
-                    ),
-                )
-                detail_grid = ft.ResponsiveRow(
-                    run_spacing=8,
-                    spacing=8,
-                    controls=[
-                        fact_chip(
-                            label,
-                            formatter(campaign),
-                            tone=campaign_context_tone,
-                            col=3,
-                            tooltip=promotion_metric_help.get(
-                                {
-                                    "CPA": "CPA кампании",
-                                    "CTR": "CTR кампании",
-                                    "CR": "CR кампании",
-                                    "Заказы": "Заказы",
-                                }.get(label, ""),
-                                None,
-                            ),
-                            variant="secondary",
-                        )
-                        for label, formatter in detail_fields
-                    ]
-                    + [
-                        fact_chip(
-                            label,
-                            formatter(campaign),
-                            tone=campaign_secondary_tone,
-                            col=6,
-                            tooltip=promotion_metric_help.get(
-                                {
-                                    "Показы": "Показы",
-                                    "Клики": "Клики",
-                                }.get(label, ""),
-                                None,
-                            ),
-                            variant="secondary",
-                        )
-                        for label, formatter in context_fields
-                    ],
-                )
-                details_wrap.content = ft.Container(
-                    padding=ft.Padding.only(top=2),
-                    content=detail_grid,
-                )
-
-                def toggle_campaign_details(_e=None, target=details_wrap, button=details_button):
-                    target.visible = not target.visible
-                    button.text = "Скрыть детали" if target.visible else "Детали"
-                    if page.controls:
-                        page.update(target, button)
-
-                details_button.on_click = toggle_campaign_details
-                body = ft.Column(
-                    [
-                        ft.Row(
-                            [
-                                ft.Text(campaign_name, expand=True, size=18, weight=ft.FontWeight.W_700, color=TEXT),
-                                ft.Text(f"ID {campaign_id}", size=10, color=MUTED, weight=ft.FontWeight.W_600),
-                            ],
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                        ft.Container(
-                            padding=ft.Padding.symmetric(horizontal=10, vertical=6),
-                            border_radius=12,
-                            bgcolor=str(campaign.get("__efficiency_tone") or campaign_context_tone),
-                            tooltip=str(campaign.get("__efficiency_reason") or ""),
-                            content=ft.Row(
-                                [
-                                    ft.Text(str(campaign.get("__efficiency_label") or "Без оценки"), size=11, weight=ft.FontWeight.W_700, color=TEXT),
-                                    ft.Text(
-                                        f"ROAS {(campaign.get('__roas') or 0.0):.2f}x".replace(".", ","),
-                                        size=11,
-                                        color=MUTED,
-                                        weight=ft.FontWeight.W_600,
-                                    ),
-                                ],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
-                        ),
-                        ft.ResponsiveRow(
-                            run_spacing=8,
-                            spacing=8,
-                            controls=[
-                                fact_chip(
-                                    label,
-                                    formatter(campaign),
-                                    tone=campaign_card_tone,
-                                    col=3,
-                                    tooltip=promotion_metric_help.get(
-                                        {
-                                            "Расход": "Расход",
-                                            "Выручка": "Выручка",
-                                            "ROAS": "ROAS",
-                                            "ДРР": "ДРР кампании",
-                                            "CPA": "CPA кампании",
-                                            "CTR": "CTR кампании",
-                                            "CR": "CR кампании",
-                                            "Заказы": "Заказы",
-                                        }.get(label, ""),
-                                        None,
-                                    ),
-                                )
-                                for label, formatter in summary_fields
-                            ],
-                        ),
-                        ft.Row(
-                            [
-                                details_button,
-                                ft.Text(
-                                    "Заказы, CPA, CTR, CR, клики и показы",
-                                    size=10,
-                                    color=MUTED,
-                                ),
-                            ],
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                        details_wrap,
-                    ],
-                    spacing=10,
-                )
-                campaign_card = ft.Container(
-                    col=campaign_card_col,
-                    padding=18,
-                    bgcolor=campaign_card_tone,
-                    border_radius=24,
-                    border=ft.Border.all(1, BORDER),
-                    shadow=ft.BoxShadow(blur_radius=16, spread_radius=0, color="#0D000000", offset=ft.Offset(0, 6)),
-                    content=body,
-                )
-
-                def hover_campaign_card(e: ft.ControlEvent, target=campaign_card):
-                    hovered = e.data == "true"
-                    if hovered:
-                        target.border = ft.Border.all(1, "#D8DEE8" if not current_dark["value"] else "#3E474D")
-                        target.shadow = ft.BoxShadow(
-                            blur_radius=22,
-                            spread_radius=0,
-                            color="#12000000" if not current_dark["value"] else "#18000000",
-                            offset=ft.Offset(0, 8),
-                        )
-                    else:
-                        target.border = ft.Border.all(1, "#D2D2D7" if not current_dark["value"] else "#3A3A3C")
-                        target.shadow = ft.BoxShadow(blur_radius=16, spread_radius=0, color="#0D000000", offset=ft.Offset(0, 6))
-                    if page.controls:
-                        page.update(target)
-
-                campaign_card.on_hover = hover_campaign_card
-                campaign_cards.append(campaign_card)
-
-            summary_controls = [
-                hero_metric("Рекламный расход", _format_currency(promotion_summary.get("spend")), "суммарно по кампаниям с расходом", semantic_surface("neutral", dark=dark_ui), ACCENT, width=330, col=4, tooltip=promotion_metric_help["Рекламный расход"]),
-                hero_metric("Выручка с рекламы", _format_currency(promotion_summary.get("revenue")), "атрибутированная выручка кампаний", semantic_surface("neutral", dark=dark_ui), PRIMARY, width=330, col=4, tooltip=promotion_metric_help["Выручка с рекламы"]),
-                hero_metric("ROAS", f"{(promotion_summary.get('roas') or 0.0):.2f}x".replace(".", ","), "возврат на рекламные инвестиции", roas_tone, "#4A6FA5", width=330, col=4, tooltip=promotion_metric_help["ROAS"]),
-                metric("ДРР", _format_percent(promotion_summary.get("drr")), "доля рекламы в выручке", drr_tone, width=150, col=2, tooltip=promotion_metric_help["ДРР"]),
-                metric("CTR", _format_percent(promotion_summary.get("ctr")), "кликабельность объявлений", semantic_surface("neutral_alt", dark=dark_ui), width=150, col=2, tooltip=promotion_metric_help["CTR"]),
-                metric("CR", _format_percent(promotion_summary.get("cr")), "конверсия клика в заказ", cr_tone, width=150, col=2, tooltip=promotion_metric_help["CR"]),
-                metric("CPC", _format_currency(promotion_summary.get("cpc")), "цена клика", semantic_surface("neutral", dark=dark_ui), width=150, col=2, tooltip=promotion_metric_help["CPC"]),
-                metric("CPA", _format_currency(promotion_summary.get("cpa")), "стоимость заказа", cpa_tone, width=150, col=2, tooltip=promotion_metric_help["CPA"]),
-                metric("CPM", _format_currency(promotion_summary.get("cpm")), "цена 1000 показов", semantic_surface("neutral_alt", dark=dark_ui), width=150, col=2, tooltip=promotion_metric_help["CPM"]),
-                metric("Заказы", _format_number(promotion_summary.get("orders")), "с рекламы", orders_tone, width=150, col=2, tooltip=promotion_metric_help["Заказы"]),
-                metric("Средний чек", _format_currency(promotion_summary.get("avg_order_value")), "по рекламным заказам", semantic_surface("neutral", dark=dark_ui), width=150, col=2, tooltip=promotion_metric_help["Средний чек"]),
-                metric("Кампаний", _format_number(promotion_summary.get("campaigns_count")), "с фактическим расходом", campaigns_count_tone, width=150, col=2, tooltip=promotion_metric_help["Кампаний"]),
-            ]
-            insight_controls = [
-                card(
-                    "Лучшая по ROAS",
-                    "",
-                    [
-                        ft.Text(str(best_roas_campaign.get("Название кампании") or best_roas_campaign.get("ID кампании") or "—"), size=18, weight=ft.FontWeight.W_700, color=TEXT),
-                        kv_row_compact("ROAS", f"{(best_roas_campaign.get('__roas') or 0.0):.2f}x".replace(".", ",")),
-                    ],
-                    tone=semantic_surface("neutral_alt", dark=dark_ui),
-                    col=4,
-                ),
-                card(
-                    "Лидер по выручке",
-                    "",
-                    [
-                        ft.Text(str(top_revenue_campaign.get("Название кампании") or top_revenue_campaign.get("ID кампании") or "—"), size=18, weight=ft.FontWeight.W_700, color=TEXT),
-                        kv_row_compact("Выручка", _format_currency(top_revenue_campaign.get("__revenue"))),
-                    ],
-                    tone=semantic_surface("neutral", dark=dark_ui),
-                    col=4,
-                ),
-                card(
-                    "Итог по каналу",
-                    "",
-                    [
-                        ft.ResponsiveRow(
-                            run_spacing=8,
-                            spacing=8,
-                            controls=[
-                                fact_chip("Расход всего", _format_currency(promotion_summary.get("spend")), tone=campaign_context_tone, col=6),
-                                fact_chip("Кликов", _format_number(promotion_summary.get("clicks")), tone=campaign_secondary_tone, col=6, variant="secondary"),
-                                fact_chip("Показов", _format_number(promotion_summary.get("impressions")), tone=campaign_secondary_tone, col=6, variant="secondary"),
-                                fact_chip("Кампаний", _format_number(promotion_summary.get("campaigns_count")), tone=campaign_secondary_tone, col=6, variant="secondary"),
-                            ],
-                        )
-                    ],
-                    tone=semantic_surface("neutral_soft", dark=dark_ui),
-                    col=4,
-                ),
-            ]
-            dashboard_promotion.controls = [
-                ft.Text("Продвижение", size=24, weight=ft.FontWeight.W_800, color=TEXT),
-                ft.ResponsiveRow(run_spacing=14, spacing=14, controls=summary_controls),
-                ft.ResponsiveRow(run_spacing=12, spacing=12, controls=insight_controls),
-                card(
-                    "Кампании с фактическим расходом",
-                    "",
-                    [
-                        ft.ResponsiveRow(run_spacing=12, spacing=12, controls=campaign_cards),
-                    ],
-                    tone=campaign_section_tone,
-                    col=12,
-                ),
-            ]
-        if current_dark["value"]:
-            apply_control_theme(dashboard_summary, True)
-            apply_control_theme(dashboard_metric_wrap, True)
-            apply_control_theme(dashboard_details, True)
-            apply_control_theme(dashboard_promotion, True)
+            set_status("Нет отчёта", period_title, DANGER, busy=False)
+        render_dashboard()
         if page.controls:
-            page.update(dashboard_summary, dashboard_metric_wrap, dashboard_details, dashboard_promotion, dashboard_freshness, dashboard_chart_panel)
+            page.update(dashboard_chart_panel)
 
     def valid_dashboard_chart_period() -> str | None:
         error = valid_month_year(dashboard_chart_from_m.value or "", dashboard_chart_from_y.value or "") or valid_month_year(
@@ -3122,7 +3084,7 @@ def main(page: ft.Page) -> None:
             build_missing_chart_reports(missing_periods, "abc")
             return
         job(
-            "ABC/XYZ",
+            ABC_JOB_TITLE,
             [
                 str(PYTHON),
                 str(SCRIPTS / "ABC_XYZ_analytics_report.py"),
@@ -3195,8 +3157,6 @@ def main(page: ft.Page) -> None:
 
     def refresh_files() -> None:
         files_col.controls = []
-        monthly_reports_list.controls = []
-        abc_reports_list.controls = []
         for spec in folder_specs:
             rows: list[ft.Control] = [ft.TextButton("Открыть папку", on_click=lambda _e, x=spec.path: reveal_path(x, x.name))]
             batch = files_by_relevance(spec.path)[:12]
@@ -3216,36 +3176,270 @@ def main(page: ft.Page) -> None:
                     )
             files_col.controls.append(card(spec.title, f"Папка: {spec.path.name}", rows))
 
-            target_list = None
-            if spec.path == ROOT / "reports":
-                target_list = monthly_reports_list
-            elif spec.path == ROOT / "ABC&XYZ reports":
-                target_list = abc_reports_list
-            if target_list is not None:
-                if not batch:
-                    target_list.controls.append(
-                        ft.Container(
-                            padding=14,
-                            border_radius=18,
-                            bgcolor="#F7F7FA",
-                            border=ft.Border.all(1, "#E5E5EA"),
-                            content=ft.Text("Файлы пока не найдены.", color=MUTED, size=12),
-                        )
-                    )
-                else:
-                    for p in batch:
-                        target_list.controls.append(
-                            report_list_item(
-                                p.name,
-                                datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-                                lambda _e, x=p: reveal_path(x, x.name),
-                            )
-                        )
 
         if current_dark["value"]:
             apply_control_theme(files_col, True)
-            apply_control_theme(monthly_reports_list, True)
-            apply_control_theme(abc_reports_list, True)
+        abc_files_changed()
+
+    # ---------------------------------------------------------------- ABC/XYZ-анализ
+    ABC_COLUMN_INFO = [
+        ("X", "стабильный"), ("Y1", "слабая сезонность"), ("Y2", "сезонный"), ("Y3", "сильная сезонность"),
+        ("Y", "умеренные колебания"), ("Z", "нерегулярный"), ("—", "мало продаж"),
+    ]
+    ABC_ROW_INFO = [("A", "≈80% прибыли"), ("B", "следующие ≈15%"), ("C", "последние ≈5%")]
+    ABC_FILTERS = [("all", "Все"), ("A", "A"), ("B", "B"), ("C", "C"), ("X", "X"), ("Y", "Y"), ("Z", "Z"), ("—", "Мало данных")]
+
+    def abc_cell_tone(abc: str, xyz: str) -> str:
+        pal = dash_pal()
+        dark = pal["dark"]
+        tones = {
+            "good": "#1E3A33" if dark else "#E6F4EE",
+            "mid": "#3A3426" if dark else "#FBF2E2",
+            "bad": "#42292C" if dark else "#FBE8E5",
+            "none": "#252B30" if dark else "#F4F5F8",
+        }
+        if xyz == "—":
+            return tones["none"]
+        score = {"A": 0, "B": 1, "C": 2}.get(abc, 1) + {"X": 0, "Y1": 1, "Y": 1.5, "Y2": 2, "Y3": 3, "Z": 4}.get(xyz, 2)
+        return tones["good"] if score <= 1 else tones["mid"] if score <= 3 else tones["bad"]
+
+    def abc_files_changed() -> None:
+        files = sorted(files_by_relevance(ROOT / "ABC&XYZ reports"), key=lambda p: p.stat().st_mtime, reverse=True)
+        abc_state["files"] = files
+        abc_report_pick.options = [ft.dropdown.Option(str(p), abc_period_title(p)) for p in files]
+        selected = abc_state.get("selected")
+        if not files:
+            abc_state.update(selected=None, data=None)
+        elif selected not in [str(p) for p in files]:
+            # Анализ за один месяц ничего не говорит о стабильности спроса — по умолчанию берём многомесячный.
+            multi = [p for p in files if len(set(re.findall(r"\d{4}", p.stem))) > 1 or p.stem.split("-")[0] != p.stem.split("-")[-1]]
+            abc_select(str((multi or files)[0]), push_update=False)
+            return
+        abc_report_pick.value = abc_state.get("selected")
+        render_abc_view(push_update=False)
+
+    def abc_select(path: str | None, push_update: bool = True) -> None:
+        if not path or abc_load_report is None:
+            return
+        abc_state.update(selected=path, filter="all", cell=None, error=None)
+        abc_report_pick.value = path
+        try:
+            abc_state["data"] = abc_load_report(Path(path))
+        except Exception as exc:
+            abc_state.update(data=None, error=f"Не удалось прочитать отчёт: {exc}")
+        render_abc_view(push_update=push_update)
+
+    def abc_toggle_create(show: bool | None = None) -> None:
+        abc_state["creating"] = (not abc_state["creating"]) if show is None else show
+        abc_create_panel.visible = abc_state["creating"]
+        if page.controls:
+            page.update(abc_create_panel)
+
+    def abc_set_filter(value: str, cell=None) -> None:
+        abc_state["filter"] = value
+        abc_state["cell"] = cell
+        render_abc_view()
+
+    def abc_item_matches(item: dict) -> bool:
+        cell = abc_state.get("cell")
+        if cell:
+            return (item["abc"], abc_xyz_group(item["xyz"])) == cell
+        value = abc_state.get("filter") or "all"
+        if value == "all":
+            return True
+        if value in ("A", "B", "C"):
+            return item["abc"] == value
+        group = abc_xyz_group(item["xyz"])
+        if value == "Y":
+            return group.startswith("Y")
+        return group == value
+
+    def abc_sparkline(values: list[float], months: list[str]) -> ft.Control:
+        pal = dash_pal()
+        peak = max(values) if values and max(values) > 0 else 1
+        bars = []
+        for value, month in zip(values, months):
+            bars.append(ft.Container(
+                expand=1, height=26, alignment=ft.Alignment(0, 1), tooltip=f"{month}: {_format_number(value)} шт.",
+                content=ft.Container(height=max(2, 24 * value / peak), border_radius=2, data="preserve_excel_fill",
+                                     bgcolor=pal["accent"] if value else pal["separator"]),
+            ))
+        return ft.Row(bars, spacing=2)
+
+    def abc_badge(code: str, abc: str, xyz: str) -> ft.Control:
+        return ft.Container(padding=ft.Padding.symmetric(horizontal=8, vertical=3), border_radius=8, bgcolor=abc_cell_tone(abc, abc_xyz_group(xyz)),
+                            data="preserve_excel_fill", content=dtext(code, 12, weight=ft.FontWeight.W_700))
+
+    def render_abc_view(push_update: bool = True) -> None:
+        pal = dash_pal()
+        data = abc_state.get("data")
+        files = abc_state.get("files") or []
+        if data:
+            built = data["built_at"]
+            abc_subtitle.value = f"{data['period']} · построен {built:%d.%m.%Y в %H:%M} · {len(data['items'])} товаров"
+        else:
+            abc_subtitle.value = "Какие товары приносят прибыль и насколько стабилен их спрос"
+        controls: list[ft.Control] = []
+        if abc_state.get("error"):
+            controls.append(dpanel(dtext(abc_state["error"], 13, pal["bad"])))
+        if not files:
+            controls.append(dpanel(
+                ft.Column([
+                    ft.Icon(ft.Icons.GRID_VIEW, size=44, color=pal["muted"]),
+                    dtext("Анализов пока нет", 18, weight=ft.FontWeight.W_700),
+                    dtext("Выберите период — программа соберёт ABC/XYZ-анализ по месячным отчётам.", 13, pal["muted"]),
+                    ft.Container(height=6),
+                    ft.Button("Новый анализ", icon=ft.Icons.ADD, bgcolor=PRIMARY, color="white", on_click=lambda _e: abc_toggle_create(True)),
+                ], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
+                padding=48, alignment=ft.Alignment(0, 0),
+            ))
+        if data:
+            items = data["items"]
+            total_profit = data["total_profit"] or 0.0
+            group_a = [i for i in items if i["abc"] == "A"]
+            share_a = sum(i["profit"] or 0 for i in group_a) / total_profit * 100 if total_profit else 0
+            stable = [i for i in items if abc_xyz_group(i["xyz"]) in ("X", "Y1")]
+            risky = [i for i in items if abc_xyz_group(i["xyz"]) in ("Z", "Y3")]
+            controls.append(dash_stats_panel([
+                dash_stat("Прибыль за период", _format_currency(round(total_profit)), f"{len(items)} товаров с продажами", help_key="Прибыль за период"),
+                dash_stat("Группа A", f"{len(group_a)} тов.", f"дают {share_a:.0f}% прибыли", pal["good"]),
+                dash_stat("Стабильный спрос", f"{len(stable)} тов.", "X и Y1 — легко планировать запасы"),
+                dash_stat("Требуют внимания", f"{len(risky)} тов.", "нерегулярный или сильно сезонный спрос", pal["warn"] if risky else None),
+            ]))
+
+            # Матрица ABC × XYZ
+            cells = abc_matrix_counts(items)
+            columns = [(key, caption) for key, caption in ABC_COLUMN_INFO
+                       if key not in ("Y", "—") or any(col == key for (_row, col) in cells)]
+            header = [ft.Container(width=120)] + [
+                ft.Container(expand=1, content=ft.Column([dtext(key if key != "—" else "?", 14, weight=ft.FontWeight.W_700),
+                                                          dtext(caption, 11, pal["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)],
+                                                         spacing=0, horizontal_alignment=ft.CrossAxisAlignment.CENTER))
+                for key, caption in columns
+            ]
+            grid: list[ft.Control] = [ft.Row(header, spacing=8)]
+            for row_key, row_caption in ABC_ROW_INFO:
+                row_cells: list[ft.Control] = [ft.Container(width=120, content=ft.Column([
+                    dtext(row_key, 18, weight=ft.FontWeight.W_800), dtext(row_caption, 11, pal["muted"])], spacing=0))]
+                for col_key, _caption in columns:
+                    articles = cells.get((row_key, col_key), [])
+                    selected = abc_state.get("cell") == (row_key, col_key)
+                    content = ft.Column([
+                        dtext(str(len(articles)) if articles else "—", 20, None if articles else pal["muted"], ft.FontWeight.W_700),
+                        dtext(", ".join(articles), 11, pal["muted"], max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                    ], spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+                    row_cells.append(ft.Container(
+                        expand=1, height=86, border_radius=12, padding=8, alignment=ft.Alignment(0, 0), data="preserve_excel_fill",
+                        bgcolor=abc_cell_tone(row_key, col_key) if articles else None,
+                        border=ft.Border.all(2, pal["accent"]) if selected else ft.Border.all(1, pal["separator"]),
+                        tooltip=", ".join(articles) if articles else None,
+                        on_click=(lambda _e, cell=(row_key, col_key): abc_set_filter("all", None if abc_state.get("cell") == cell else cell)) if articles else None,
+                        content=content,
+                    ))
+                grid.append(ft.Row(row_cells, spacing=8))
+            controls.append(dpanel(ft.Column([
+                ft.Row([dtext("Матрица ABC × XYZ", 15, weight=ft.FontWeight.W_700),
+                        dtext("ABC — вклад в прибыль, XYZ — стабильность спроса. Нажмите на ячейку, чтобы отфильтровать таблицу.", 12, pal["muted"], expand=True)],
+                       spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Column(grid, spacing=8),
+            ], spacing=14)))
+
+            # Таблица товаров
+            active = abc_state.get("filter") or "all"
+            chips: list[ft.Control] = []
+            for key, label in ABC_FILTERS:
+                is_active = active == key and not abc_state.get("cell")
+                chips.append(ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=12, vertical=6), border_radius=999, data="preserve_excel_fill",
+                    bgcolor=pal["accent"] if is_active else None, border=None if is_active else ft.Border.all(1, pal["border"]),
+                    on_click=lambda _e, value=key: abc_set_filter(value),
+                    content=dtext(label, 12, "#FFFFFF" if is_active else pal["ink"], ft.FontWeight.W_600),
+                ))
+            if abc_state.get("cell"):
+                code = "".join(abc_state["cell"])
+                chips.append(ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=12, vertical=6), border_radius=999, bgcolor=pal["accent"], data="preserve_excel_fill",
+                    on_click=lambda _e: abc_set_filter("all"),
+                    content=ft.Row([dtext(f"Ячейка {code}", 12, "#FFFFFF", ft.FontWeight.W_600), ft.Icon(ft.Icons.CLOSE, size=14, color="#FFFFFF")],
+                                   spacing=4, tight=True),
+                ))
+            shown = [i for i in items if abc_item_matches(i)]
+            months = data["months"]
+            table_columns = [("Артикул", 2, False), ("Класс", 2, False), ("Прибыль", 3, True), ("Доля", 2, True),
+                             (f"Продажи: {months[0][:3].lower()} — {months[-1][:3].lower()}" if months else "Продажи", 5, False),
+                             ("Шт.", 2, True), ("Колебания", 2, True), ("Что делать", 8, False)]
+
+            def tcell(content: ft.Control, weight: int, right: bool = False) -> ft.Control:
+                return ft.Container(expand=weight, alignment=ft.Alignment(1 if right else -1, 0), content=content)
+
+            rows: list[ft.Control] = [ft.Row([tcell(dtext(name, 12, pal["muted"], ft.FontWeight.W_600), w, r) for name, w, r in table_columns], spacing=14)]
+            for index, item in enumerate(shown):
+                recs = item.get("recommendations") or []
+                tip = item["title"] + ("\n• " + "\n• ".join(recs) if recs else "")
+                cv = item.get("cv")
+                rows.append(ft.Container(
+                    padding=ft.Padding.symmetric(vertical=9), data="preserve_excel_fill",
+                    border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])),
+                    tooltip=tip,
+                    content=ft.Row([
+                        tcell(dtext(item["article"], 14, weight=ft.FontWeight.W_700), 2),
+                        tcell(abc_badge(item["code"] or item["abc"], item["abc"], item["xyz"]), 2),
+                        tcell(dtext(_format_currency(round(item["profit"])) if item["profit"] is not None else "—", 13), 3, True),
+                        tcell(dtext(f"{item['share'] * 100:.1f}%".replace(".", ",") if item["share"] is not None else "—", 13, pal["muted"]), 2, True),
+                        tcell(abc_sparkline(item["sales"], months), 5),
+                        tcell(dtext(_format_number(item["total_qty"]) if item["total_qty"] is not None else "—", 13), 2, True),
+                        tcell(dtext(f"{cv:.2f}".replace(".", ",") if cv else "—", 13, pal["muted"]), 2, True),
+                        tcell(ft.Column([dtext(item["title"] or "—", 12, weight=ft.FontWeight.W_600, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)]
+                                        + ([dtext(recs[0], 11, pal["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)] if recs else []),
+                                        spacing=1, tight=True), 8),
+                    ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ))
+            if not shown:
+                rows.append(ft.Container(padding=20, alignment=ft.Alignment(0, 0), content=dtext("В этой группе товаров нет.", 13, pal["muted"])))
+            controls.append(dpanel(ft.Column([
+                ft.Row([dtext("Товары", 15, weight=ft.FontWeight.W_700), dtext(f"{len(shown)} из {len(items)}", 12, pal["muted"])],
+                       spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Row(chips, spacing=8, run_spacing=8, wrap=True),
+                ft.Column(rows, spacing=0),
+                dtext("Колебания — коэффициент вариации продаж по месяцам: до 0,2 стабильно, больше 0,5 — нерегулярно. "
+                      "Наведите на строку, чтобы увидеть все рекомендации.", 11, pal["muted"]),
+            ], spacing=12), padding=ft.Padding.only(left=20, right=20, top=16, bottom=14)))
+        abc_body.controls = controls
+        if push_update and page.controls:
+            page.update(abc_body, abc_subtitle, abc_report_pick)
+
+    def abc_open_selected(_e=None) -> None:
+        path = abc_state.get("selected")
+        if path:
+            reveal_path(Path(path), Path(path).name)
+        else:
+            toast("Сначала выберите или создайте анализ.", True)
+
+    def abc_after_job(code: int) -> None:
+        """После построения анализа — сразу показываем новый отчёт."""
+        set_abc_sync(False)
+        if code != 0:
+            return
+        try:
+            expected = ROOT / "ABC&XYZ reports" / f"{MONTHS[int(abc_fm.value) - 1]} {abc_fy.value}-{MONTHS[int(abc_tm.value) - 1]} {abc_ty.value}.xlsx"
+        except (TypeError, ValueError):
+            expected = None
+        abc_files_changed()
+        if expected is not None and expected.exists():
+            abc_select(str(expected), push_update=False)
+            abc_toggle_create(False)
+        render_abc_view()
+
+    def set_abc_sync(active: bool) -> None:
+        dark = current_dark["value"]
+        abc_sync_overlay.visible = active
+        abc_sync_overlay.bgcolor = ("#CC1E2328" if dark else "#CCF5F7FB") if active else None
+        abc_sync_overlay.content.bgcolor = "#2A3136" if dark else "#FFFFFF"
+        abc_sync_overlay.content.border = ft.Border.all(1, "#465056" if dark else BORDER)
+        abc_sync_label.color = "#F3F4F6" if dark else TEXT
+        abc_body.disabled = active
+        if page.controls:
+            page.update(abc_sync_overlay, abc_body)
 
     def set_pricing_costs_dirty(flag: bool, push_update: bool = False) -> None:
         pricing_costs_dirty["value"] = flag
@@ -3253,6 +3447,18 @@ def main(page: ft.Page) -> None:
         pricing_costs_save_button.text = "Сохранить изменения *" if flag else "Сохранить изменения"
         if push_update and page.controls:
             page.update(pricing_costs_save_button)
+
+    def set_pricing_sync(active: bool) -> None:
+        """Пока идёт синхронизация, таблица закрыта заглушкой с загрузкой и не принимает клики."""
+        dark = current_dark["value"]
+        pricing_sync_overlay.visible = active
+        pricing_sync_overlay.bgcolor = ("#CC1E2328" if dark else "#CCF5F7FB") if active else None
+        pricing_sync_label.color = "#F3F4F6" if dark else TEXT
+        pricing_costs_list.disabled = active
+        if active:
+            pricing_costs_save_button.disabled = True
+        if page.controls:
+            page.update(pricing_sync_overlay, pricing_costs_list, pricing_costs_save_button)
 
     def mark_pricing_costs_dirty(_e=None) -> None:
         pricing_costs_dirty["revision"] += 1
@@ -3397,10 +3603,10 @@ def main(page: ft.Page) -> None:
                                                 bgcolor=PRIMARY,
                                                 color="white",
                                                 height=34,
-                                                on_click=lambda _e: job("Текущие цены и акции", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "refresh-pricing"]),
+                                                on_click=lambda _e: job(PRICING_SYNC_TITLE, [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "refresh-pricing"]),
                                             ),
                                             ft.Text(
-                                                "Обновит цену Ozon, цену со скидкой и рентабельность",
+                                                "Обновит цены, рентабельность, прибыль и бустинг. Запускается сама при входе во вкладку",
                                                 size=10,
                                                 color="#3C5D85" if not dark else "#B9D4FF",
                                                 text_align=ft.TextAlign.CENTER,
@@ -3416,7 +3622,7 @@ def main(page: ft.Page) -> None:
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                         ft.Row(
-                            [ft.Text(column, expand=COSTS_MAIN_COLUMN_EXPANDS[column], size=11, weight=ft.FontWeight.W_800, color="#A1A1A6" if dark else MUTED) for column in COSTS_MAIN_COLUMNS],
+                            [ft.Text(column, expand=COSTS_MAIN_COLUMN_EXPANDS[column], size=11, weight=ft.FontWeight.W_800, color="#A1A1A6" if dark else MUTED) for column in COSTS_TABLE_COLUMNS],
                             spacing=12,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
@@ -3439,7 +3645,7 @@ def main(page: ft.Page) -> None:
                                 build_costs_edit_field(row_number, column, row.get(column), dark, COSTS_MAIN_COLUMN_EXPANDS[column])
                                 if column in EDITABLE_COSTS_COLUMNS and row_number >= 2
                                 else _build_costs_cell(column, row.get(column), dark, COSTS_MAIN_COLUMN_EXPANDS[column])
-                                for column in COSTS_MAIN_COLUMNS
+                                for column in COSTS_TABLE_COLUMNS
                             ],
                             spacing=12,
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -3535,7 +3741,7 @@ def main(page: ft.Page) -> None:
         refresh_files()
         set_status("Списки обновлены", "Отчёты перечитаны.", PRIMARY, busy=False)
         if page.controls:
-            page.update(files_col, monthly_reports_list, abc_reports_list)
+            page.update(files_col, abc_body, abc_report_pick)
 
     def finish(title: str, code: int, output: str) -> None:
         was_cancelled = cancel_state["requested"]
@@ -3546,9 +3752,17 @@ def main(page: ft.Page) -> None:
         append_log(f"\nЗадача «{title}» завершена, код {code}.")
         if code != 0:
             append_log(output)
+        if title == PRICING_SYNC_TITLE:
+            set_pricing_sync(False)
+        if title == DASHBOARD_REFRESH_TITLE:
+            set_dashboard_sync(False)
         try:
             refresh_dashboard()
             refresh_pricing_costs_preview()
+            if title == "План поставки FBO":
+                render_supply_results()
+            if title == WB_SUPPLY_TITLE:
+                render_wb_supply_results()
         except Exception as exc:
             append_log(f"\nНе удалось обновить интерфейс: {exc}")
         finally:
@@ -3571,8 +3785,10 @@ def main(page: ft.Page) -> None:
         elif code == 0 and dashboard_chart_state["built"] and not was_cancelled:
             build_dashboard_chart()
         refresh_files()
+        if title == ABC_JOB_TITLE:
+            abc_after_job(code)
         if page.controls:
-            page.update(state, spin, cancel_button, files_col, monthly_reports_list, abc_reports_list, pricing_costs_list, pricing_costs_status, pricing_costs_status_shell, pricing_costs_save_button, log)
+            page.update(state, spin, cancel_row, files_col, abc_body, abc_report_pick, pricing_costs_list, pricing_costs_status, pricing_costs_status_shell, pricing_costs_save_button, log)
 
     def job(title: str, cmd: list[str], prompt_for_costs: bool = False) -> None:
         if not job_lock.acquire(blocking=False):
@@ -3581,6 +3797,12 @@ def main(page: ft.Page) -> None:
         job_cancel_event.clear()
         cancel_state["requested"] = False
         cancel_state["title"] = title
+        if title == PRICING_SYNC_TITLE:
+            set_pricing_sync(True)
+        if title == DASHBOARD_REFRESH_TITLE:
+            set_dashboard_sync(True)
+        if title == ABC_JOB_TITLE:
+            set_abc_sync(True)
         set_status(f"Выполняется: {title}", "Фоновый процесс запущен.", ACCENT, busy=True)
         set_log(f"$ {' '.join(cmd)}")
         page.update()
@@ -3625,35 +3847,6 @@ def main(page: ft.Page) -> None:
             ],
         )
 
-    def launch_monthly_report() -> None:
-        month_error = valid_month_year(monthly_m.value or "", monthly_y.value or "")
-        if month_error:
-            toast(month_error, True)
-            return
-        job(
-            "Месячный отчёт",
-            [
-                str(PYTHON),
-                str(SCRIPTS / "Monthly_sales_report.py"),
-                "--month",
-                monthly_m.value or "",
-                "--year",
-                monthly_y.value or "",
-            ],
-            prompt_for_costs=True,
-        )
-
-    def open_selected_monthly_report() -> None:
-        month_error = valid_month_year(monthly_m.value or "", monthly_y.value or "")
-        if month_error:
-            toast(month_error, True)
-            return
-        report_path = report_path_for_period(int(monthly_m.value or today.month), int(monthly_y.value or today.year))
-        if not report_path.exists():
-            toast("Отчёт за выбранный период пока не найден.", True)
-            return
-        reveal_path(report_path, report_path.name)
-
     def open_selected_dashboard_report() -> None:
         month_error = valid_month_year(dashboard_m.value or "", dashboard_y.value or "")
         if month_error:
@@ -3673,7 +3866,7 @@ def main(page: ft.Page) -> None:
         monthly_m.value = dashboard_m.value
         monthly_y.value = dashboard_y.value
         job(
-            "Обновление бизнес-сводки",
+            DASHBOARD_REFRESH_TITLE,
             [
                 str(PYTHON),
                 str(SCRIPTS / "Monthly_sales_report.py"),
@@ -4185,7 +4378,7 @@ def main(page: ft.Page) -> None:
 
         page.run_thread(worker)
 
-    def open_discount_requests_dialog(_e=None) -> None:
+    def open_discount_requests_dialog(_e=None, quiet: bool = False, on_done=None) -> None:
         if discount_dialog_state["busy"]:
             return
         if build_discount_request_plan is None:
@@ -4200,6 +4393,14 @@ def main(page: ft.Page) -> None:
             page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
 
         def worker() -> None:
+            try:
+                load_discount_plan()
+            finally:
+                if on_done is not None:
+                    # Продолжение (синхронизация цен) — в потоке интерфейса, после загрузки заявок.
+                    ui_queue.put(("call", on_done))
+
+        def load_discount_plan() -> None:
             try:
                 plan = build_discount_request_plan(ROOT)
             except Exception as exc:
@@ -4222,7 +4423,7 @@ def main(page: ft.Page) -> None:
             apply_discount_dialog_theme()
             if page.controls:
                 page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
-            if not plan.get("items"):
+            if not plan.get("items") and not quiet:
                 toast(str(plan.get("message") or "Новых заявок нет."))
 
         page.run_thread(worker)
@@ -4376,6 +4577,13 @@ def main(page: ft.Page) -> None:
                 elif kind == "finish":
                     _, title, code, output = event
                     finish(title, code, output)
+                elif kind == "run_job":
+                    _, title, cmd = event
+                    job(title, cmd)
+                elif kind == "ads_rebuild":
+                    ads_build(keep_result=True)
+                elif kind == "call":
+                    event[1]()
                 elif kind == "ai_finish":
                     _, request_id, prompt, answer, meta = event
                     if request_id in ai_state["cancelled_request_ids"]:
@@ -4425,175 +4633,191 @@ def main(page: ft.Page) -> None:
                         ai_set_busy(False, str(meta))
                         set_status("AI недоступен", str(meta), DANGER, busy=False)
                     ai_sync_layout()
-                    page.update(ai_body, ai_messages, ai_messages_shell, ai_welcome_shell, ai_composer_shell, ai_busy_label, state, status_detail, spin, cancel_button)
+                    page.update(ai_body, ai_messages, ai_messages_shell, ai_welcome_shell, ai_composer_shell, ai_busy_label, state, status_detail, spin, cancel_row)
             await asyncio.sleep(0.01 if processed else 0.03)
 
     ai_refresh_status(push_update=False)
     ai_refresh_tools_menu()
     ai_apply_chat_theme()
 
-    dash = ft.Column(
+    dashboard_sync_label = ft.Text("Обновляю отчёт: загружаю продажи, расходы и выплаты из Ozon…",
+                                   size=13, weight=ft.FontWeight.W_600, text_align=ft.TextAlign.CENTER)
+    dashboard_sync_overlay = ft.Container(
+        left=0, top=0, right=0, bottom=0,
+        visible=False,
+        border_radius=26,
+        alignment=ft.Alignment(0, -1),
+        padding=ft.Padding.only(top=150),
+        data="preserve_excel_fill",
+        content=ft.Container(
+            padding=ft.Padding.symmetric(horizontal=28, vertical=20),
+            border_radius=18,
+            data="preserve_excel_fill",
+            content=ft.Column(
+                [ft.ProgressRing(width=36, height=36, stroke_width=3), dashboard_sync_label],
+                spacing=14, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        ),
+    )
+    dashboard_metrics_area = ft.Column(spacing=16)
+
+    def set_dashboard_sync(active: bool) -> None:
+        """Пока обновляется отчёт, показатели закрыты заглушкой с загрузкой и не принимают клики."""
+        dark = current_dark["value"]
+        dashboard_sync_overlay.visible = active
+        dashboard_sync_overlay.bgcolor = ("#CC1E2328" if dark else "#CCF5F7FB") if active else None
+        dashboard_sync_label.color = "#F3F4F6" if dark else TEXT
+        dashboard_sync_overlay.content.bgcolor = "#2A3136" if dark else "#FFFFFF"
+        dashboard_sync_overlay.content.border = ft.Border.all(1, "#465056" if dark else BORDER)
+        dashboard_metrics_area.disabled = active
+        if page.controls:
+            page.update(dashboard_sync_overlay, dashboard_metrics_area)
+
+    dashboard_m.label = "Месяц"
+    dashboard_m.width = 190
+    dashboard_y.label = "Год"
+    dashboard_y.width = 120
+    dashboard_more = ft.PopupMenuButton(
+        icon=ft.Icons.MORE_HORIZ,
+        tooltip="Ещё",
+        items=[
+            ft.PopupMenuItem(content=ft.Text("Открыть отчёт в Excel"), on_click=lambda _e: open_selected_dashboard_report()),
+            ft.PopupMenuItem(content=ft.Text("Открыть папку с отчётами"), on_click=lambda _e: reveal_path(ROOT / "reports", "reports")),
+        ],
+    )
+    dash_header = ft.ResponsiveRow(
         [
-            ft.Text("Бизнес-сводка", size=26, weight=ft.FontWeight.W_800, color=TEXT),
             ft.Container(
-                padding=18,
-                border_radius=26,
-                bgcolor=semantic_surface("neutral_soft", dark=False),
-                border=ft.Border.all(1, BORDER),
-                content=ft.Column(
+                col={"xs": 12, "lg": 5},
+                content=ft.Column([ft.Text("Бизнес-сводка", size=26, weight=ft.FontWeight.W_800, color=TEXT), dashboard_freshness], spacing=2),
+            ),
+            ft.Container(
+                col={"xs": 12, "lg": 7},
+                alignment=ft.Alignment(1, 0),
+                content=ft.Row(
                     [
-                        ft.Text("Период", size=16, weight=ft.FontWeight.W_700, color=TEXT),
-                        ft.Row([dashboard_m, dashboard_y], spacing=10),
-                        dashboard_freshness,
-                        ft.Row(
-                            [
-                                ft.Button("Обновить данные", bgcolor=PRIMARY, color="white", on_click=lambda _e: launch_dashboard_report()),
-                                ft.TextButton("Открыть отчёт", on_click=lambda _e: open_selected_dashboard_report()),
-                                ft.TextButton("Открыть папку с отчётами", on_click=lambda _e: reveal_path(ROOT / "reports", "reports")),
-                            ],
-                            spacing=8,
-                        ),
+                        dashboard_m,
+                        dashboard_y,
+                        ft.Button("Обновить", icon=ft.Icons.REFRESH, bgcolor=PRIMARY, color="white", on_click=lambda _e: launch_dashboard_report()),
+                        dashboard_more,
                     ],
                     spacing=10,
+                    alignment=ft.MainAxisAlignment.END,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
             ),
-            dashboard_summary,
-            dashboard_metric_wrap,
-            dashboard_details,
-            dashboard_promotion,
+        ],
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        run_spacing=12,
+    )
+
+    dash = ft.Column(
+        [
+            dash_header,
+            ft.Stack([dashboard_metrics_area, dashboard_sync_overlay]),
             ft.Container(
-                padding=18,
-                border_radius=26,
+                padding=ft.Padding.only(top=10, left=4),
+                content=ft.Column([
+                    ft.Text("Динамика", size=20, weight=ft.FontWeight.W_700, color=TEXT),
+                    ft.Text("Прибыль, оборот или рентабельность по месяцам", size=13, color=MUTED),
+                ], spacing=2),
+            ),
+            ft.Container(
+                padding=20,
+                border_radius=18,
                 bgcolor=semantic_surface("neutral", dark=False),
                 border=ft.Border.all(1, BORDER),
                 content=ft.Column(
                     [
-                        ft.Text("Динамика", size=16, weight=ft.FontWeight.W_700, color=TEXT),
-                        ft.Container(
-                            padding=14,
-                            border_radius=22,
-                            bgcolor=semantic_surface("neutral_soft", dark=False),
-                            border=ft.Border.all(1, BORDER),
-                            content=ft.ResponsiveRow(
-                                run_spacing=10,
-                                spacing=10,
-                                controls=[
-                                    ft.Container(content=dashboard_chart_type, col=3),
-                                    ft.Container(content=dashboard_chart_from_m, col=1.85),
-                                    ft.Container(content=dashboard_chart_from_y, col=1.15),
-                                    ft.Container(content=dashboard_chart_to_m, col=1.85),
-                                    ft.Container(content=dashboard_chart_to_y, col=1.15),
-                                    ft.Container(
-                                        col=3,
-                                        alignment=ft.Alignment(1, 0),
-                                        content=ft.Row(
-                                            [
-                                                ft.Button("Построить график", bgcolor=PRIMARY, color="white", on_click=build_dashboard_chart),
-                                                ft.TextButton("Интерактивный", on_click=open_interactive_dashboard_chart),
-                                            ],
-                                            spacing=6,
-                                            alignment=ft.MainAxisAlignment.END,
-                                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                            wrap=True,
-                                        ),
-                                    ),
-                                ],
-                            ),
+                        ft.Row(
+                            [
+                                dashboard_chart_type,
+                                dashboard_chart_from_m,
+                                dashboard_chart_from_y,
+                                ft.Text("—", size=16, color=MUTED),
+                                dashboard_chart_to_m,
+                                dashboard_chart_to_y,
+                                ft.Button("Построить", icon=ft.Icons.SHOW_CHART, bgcolor=PRIMARY, color="white", on_click=build_dashboard_chart),
+                                ft.TextButton("Интерактивный", on_click=open_interactive_dashboard_chart),
+                            ],
+                            spacing=10,
+                            run_spacing=10,
+                            wrap=True,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         ),
                         dashboard_chart_panel,
                     ],
-                    spacing=12,
+                    spacing=16,
                 ),
             ),
         ],
         spacing=14,
     )
 
+    for control, width in ((abc_fm, 180), (abc_fy, 120), (abc_tm, 180), (abc_ty, 120)):
+        control.width = width
+    abc_fm.label, abc_fy.label, abc_tm.label, abc_ty.label = "С месяца", "Год", "По месяц", "Год"
+
+    abc_report_pick.on_select = lambda e: abc_select(e.control.value)
+    abc_more = ft.PopupMenuButton(
+        icon=ft.Icons.MORE_HORIZ,
+        tooltip="Ещё",
+        items=[
+            ft.PopupMenuItem(content=ft.Text("Открыть отчёт в Excel"), on_click=abc_open_selected),
+            ft.PopupMenuItem(content=ft.Text("Папка с анализами"), on_click=lambda _e: reveal_path(ROOT / "ABC&XYZ reports", "ABC&XYZ reports")),
+        ],
+    )
+    abc_create_panel = ft.Container(
+        visible=False,
+        padding=20,
+        border_radius=18,
+        bgcolor=semantic_surface("neutral", dark=False),
+        border=ft.Border.all(1, BORDER),
+        content=ft.Column(
+            [
+                ft.Text("Новый анализ", size=15, weight=ft.FontWeight.W_700, color=TEXT),
+                ft.Text("Анализ строится по месячным отчётам. Недостающие месяцы программа сформирует сама.", size=12, color=MUTED),
+                ft.Row(
+                    [
+                        abc_fm, abc_fy, ft.Text("—", size=16, color=MUTED), abc_tm, abc_ty,
+                        ft.Button("Провести анализ", icon=ft.Icons.PLAY_ARROW_ROUNDED, bgcolor=PRIMARY, color="white", on_click=lambda _e: launch_abc_analysis()),
+                        ft.TextButton("Отмена", on_click=lambda _e: abc_toggle_create(False)),
+                    ],
+                    spacing=10, run_spacing=10, wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            ],
+            spacing=10,
+        ),
+    )
     reports = ft.Column(
         [
-            ft.Text("Отчёты", size=26, weight=ft.FontWeight.W_800, color=TEXT),
             ft.ResponsiveRow(
                 [
-                    card(
-                        "Месячный отчёт",
-                        "Сборка monthly Excel за выбранный период.",
-                        [
-                            ft.Container(
-                                height=152,
-                                content=ft.Column(
-                                    [
-                                        ft.Row([monthly_m, monthly_y], spacing=12),
-                                        ft.Row(
-                                            [
-                                                ft.Button("Сформировать отчёт", bgcolor=PRIMARY, color="white", on_click=lambda _e: launch_monthly_report()),
-                                                ft.TextButton("Папка reports", on_click=lambda _e: reveal_path(ROOT / "reports", "reports")),
-                                            ],
-                                            spacing=10,
-                                        ),
-                                    ],
-                                    spacing=12,
-                                    alignment=ft.MainAxisAlignment.START,
-                                ),
-                            ),
-                            ft.Container(height=1, bgcolor="#E5E5EA", border_radius=10),
-                            ft.Row(
-                                [
-                                    ft.Text("Готовые файлы", size=12, weight=ft.FontWeight.W_700, color=MUTED, expand=True),
-                                    ft.IconButton(ft.Icons.REFRESH, tooltip="Обновить список", on_click=refresh_report_lists, icon_color=MUTED),
-                                ],
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
-                            monthly_reports_list,
-                        ],
-                        tone=semantic_surface("neutral", dark=False),
-                        col=6,
+                    ft.Container(
+                        col={"xs": 12, "lg": 5},
+                        content=ft.Column([ft.Text("ABC/XYZ-анализ", size=26, weight=ft.FontWeight.W_800, color=TEXT), abc_subtitle], spacing=2),
                     ),
-                    card(
-                        "ABC/XYZ аналитика",
-                        "Анализ диапазона на основе monthly reports.",
-                        [
-                            ft.Container(
-                                height=152,
-                                content=ft.Column(
-                                    [
-                                        ft.Row([abc_fm, abc_fy], spacing=12),
-                                        ft.Row([abc_tm, abc_ty], spacing=12),
-                                        ft.Row(
-                                            [
-                                                ft.Button(
-                                                    "Провести ABC/XYZ анализ",
-                                                    bgcolor=PRIMARY,
-                                                    color="white",
-                                                    on_click=lambda _e: launch_abc_analysis(),
-                                                ),
-                                                ft.TextButton("Папка ABC&XYZ", on_click=lambda _e: reveal_path(ROOT / "ABC&XYZ reports", "ABC&XYZ reports")),
-                                            ],
-                                            spacing=10,
-                                        ),
-                                    ],
-                                    spacing=12,
-                                    alignment=ft.MainAxisAlignment.START,
-                                ),
-                            ),
-                            ft.Container(height=1, bgcolor="#E5E5EA", border_radius=10),
-                            ft.Row(
-                                [
-                                    ft.Text("Готовые файлы", size=12, weight=ft.FontWeight.W_700, color=MUTED, expand=True),
-                                    ft.IconButton(ft.Icons.REFRESH, tooltip="Обновить список", on_click=refresh_report_lists, icon_color=MUTED),
-                                ],
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
-                            abc_reports_list,
-                        ],
-                        tone=semantic_surface("neutral_soft", dark=False),
-                        col=6,
+                    ft.Container(
+                        col={"xs": 12, "lg": 7},
+                        alignment=ft.Alignment(1, 0),
+                        content=ft.Row(
+                            [
+                                abc_report_pick,
+                                ft.Button("Новый анализ", icon=ft.Icons.ADD, bgcolor=PRIMARY, color="white", on_click=lambda _e: abc_toggle_create()),
+                                abc_more,
+                            ],
+                            spacing=10, alignment=ft.MainAxisAlignment.END, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
                     ),
                 ],
-                run_spacing=16,
-                spacing=16,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                run_spacing=12,
             ),
+            abc_create_panel,
+            ft.Stack([abc_body, abc_sync_overlay]),
         ],
         spacing=16,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
     def pricing_round_action(icon: str, tooltip: str, on_click, *, tone: str = "neutral_alt") -> ft.Control:
@@ -4621,13 +4845,26 @@ def main(page: ft.Page) -> None:
         border=ft.Border.all(1, BORDER),
         content=discount_dialog_list,
     )
+    pricing_sync_label = ft.Text("Синхронизация с Ozon: обновляю цены, рентабельность, прибыль и бустинг…",
+                                 size=13, weight=ft.FontWeight.W_600, text_align=ft.TextAlign.CENTER)
+    pricing_sync_overlay = ft.Container(
+        left=0, top=0, right=0, bottom=0,
+        visible=False,
+        border_radius=18,
+        alignment=ft.Alignment(0, 0),
+        data="preserve_excel_fill",
+        content=ft.Column(
+            [ft.ProgressRing(width=36, height=36, stroke_width=3), pricing_sync_label],
+            spacing=14, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+    )
     pricing_costs_surface = ft.Container(
         height=760,
         padding=4,
         border_radius=22,
         bgcolor=semantic_surface("neutral_soft", dark=False),
         border=ft.Border.all(1, BORDER),
-        content=pricing_costs_list,
+        content=ft.Stack([pricing_costs_list, pricing_sync_overlay], expand=True),
     )
 
     pricing = ft.Column(
@@ -4841,6 +5078,283 @@ def main(page: ft.Page) -> None:
         spacing=18,
     )
 
+    promo_dialog_title = ft.Text("", size=18, weight=ft.FontWeight.W_800)
+    promo_dialog_summary = ft.Text("", size=13)
+    promo_dialog_list = ft.ListView(spacing=6, expand=True)
+    promo_cancel_button = ft.TextButton("Отмена")
+    promo_confirm_button = ft.Button("Отправить в Ozon", color="white")
+    promo_dialog = ft.AlertDialog(
+        modal=True,
+        title=promo_dialog_title,
+        content=ft.Container(
+            width=880,
+            height=520,
+            content=ft.Column([promo_dialog_summary, promo_dialog_list], spacing=12),
+        ),
+        actions=[promo_cancel_button, promo_confirm_button],
+        actions_alignment=ft.MainAxisAlignment.END,
+        open=False,
+    )
+    page.overlay.append(promo_dialog)
+    promo_state: dict[str, object] = {"mode": None, "plan": None}
+    promo_titles = {
+        "remove": "Удаление невыгодных товаров из акций",
+        "add": "Добавление в акции и подъём цен",
+        "tidy": "Порядок в предстоящих акциях",
+    }
+    promo_groups = (
+        ("add", "Добавить в акцию"),
+        ("raise", "Поднять цену в акции"),
+        ("remove", "Удалить из акции"),
+        ("watch", "Ozon может добавить сам по цене ниже минимальной"),
+    )
+
+    def promo_spinner() -> ft.Control:
+        return ft.Row([ft.ProgressRing(width=24, height=24, stroke_width=2.4)], alignment=ft.MainAxisAlignment.CENTER)
+
+    def promo_boost(value) -> str:
+        return "—" if value is None else f"{value:g}%"
+
+    def promo_row(primary: str, lines: list[tuple[str, str | None]], tone: str | None = None, checkbox: ft.Control | None = None) -> ft.Control:
+        dark = current_dark["value"]
+        texts = [ft.Text(primary, size=13, weight=ft.FontWeight.W_600, color=tone or ("#F3F4F6" if dark else TEXT))]
+        texts += [ft.Text(text, size=12, color=color or ("#B6C0BC" if dark else MUTED)) for text, color in lines]
+        body = ft.Column(texts, spacing=2, expand=True)
+        return ft.Container(
+            padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+            border_radius=10,
+            bgcolor="#2A3136" if dark else "#F3F4F7",
+            content=ft.Row([checkbox, body] if checkbox else [body], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
+        )
+
+    def promo_item_lines(item: dict) -> list[tuple[str, str | None]]:
+        dark = current_dark["value"]
+        warn = "#E0A15F" if dark else ACCENT
+        good = "#70D4BC" if dark else PRIMARY
+        kind = item["kind"]
+        if kind == "watch":
+            return [
+                (f"Максимум акции {_format_currency(item['max_action_price'])} · минимальная {_format_currency(item['min_price'])}", None),
+                (item.get("note") or "", warn),
+                ("Отметьте, чтобы отключить автодобавление этому товару (во всех акциях, а не только в этой).", None),
+            ]
+        if kind == "remove":
+            price_line = f"Цена в акции {_format_currency(item['action_price'])} ниже минимальной {_format_currency(item['min_price'])}"
+        elif kind == "raise":
+            price_line = (
+                f"Цена {_format_currency(item['current_price'])} → {_format_currency(item['action_price'])}"
+                f" · минимальная {_format_currency(item['min_price'])} · желаемая {_format_currency(item['desired_price'])}"
+            )
+        else:
+            price_line = (
+                f"Цена в акции {_format_currency(item['action_price'])} · минимальная {_format_currency(item['min_price'])}"
+                f" · максимум акции {_format_currency(item['max_action_price'])}"
+            )
+        lines: list[tuple[str, str | None]] = [(price_line, None)]
+        if item.get("note"):
+            lines.append((item["note"], warn if item.get("added_by_ozon") else None))
+
+        boost_now, boost_new = item.get("boost_now"), item.get("boost_new")
+        boost_min, boost_max = item.get("boost_min"), item.get("boost_max")
+        is_range = boost_min is not None and boost_max is not None and boost_min != boost_max
+        range_text = f" (в этой акции {promo_boost(boost_min)}–{promo_boost(boost_max)})" if is_range else ""
+        if kind == "remove":
+            if boost_now is not None:
+                lines.append((f"Бустинг {promo_boost(boost_now)} будет потерян", warn))
+        elif kind == "raise":
+            if boost_now is None or boost_new is None:
+                lines.append(("Бустинг: Ozon не сообщает, как изменится", None))
+            elif boost_new < boost_now:
+                lines.append((f"Бустинг {promo_boost(boost_now)} → {promo_boost(boost_new)}{range_text}: товар будут показывать реже", warn))
+            else:
+                lines.append((f"Бустинг не изменится: {promo_boost(boost_new)}", good))
+        else:
+            if boost_new is None:
+                lines.append(("Бустинг: Ozon не сообщает", None))
+            else:
+                lines.append((f"Бустинг {promo_boost(boost_new)}{range_text}", good))
+        max_boost_price = item.get("max_boost_price")
+        if kind != "remove" and is_range and max_boost_price and boost_new is not None and boost_new < boost_max:
+            reachable = "не ниже минимальной" if max_boost_price >= item["min_price"] else "ниже минимальной — в убыток"
+            lines.append((f"Максимальный бустинг {promo_boost(boost_max)} — при цене {_format_currency(max_boost_price)} ({reachable})", None))
+
+        visibility = []
+        if item.get("views") is not None:
+            visibility.append(f"увидели {_format_number(item['views'])} покупателей")
+        if item.get("position") is not None:
+            visibility.append(f"средняя позиция {item['position']:.1f}".replace(".", ","))
+        if visibility:
+            lines.append(("Поиск за 14 дней: " + " · ".join(visibility), None))
+        return lines
+
+    def promo_selected_count() -> int:
+        plan = promo_state.get("plan")
+        if not isinstance(plan, dict):
+            return 0
+        return sum(1 for item in plan.get("items") or [] if item.get("selected", True))
+
+    def refresh_promo_confirm() -> None:
+        count = promo_selected_count()
+        promo_confirm_button.content = f"Отправить в Ozon ({count})"
+        promo_confirm_button.disabled = count == 0
+        page.update(promo_confirm_button)
+
+    def promo_plan_rows(plan: dict) -> list[ft.Control]:
+        dark = current_dark["value"]
+        items = plan.get("items") or []
+        rows: list[ft.Control] = []
+        for kind, label in promo_groups:
+            group = [item for item in items if item["kind"] == kind]
+            if not group:
+                continue
+            rows.append(
+                ft.Container(
+                    padding=ft.Padding.only(top=6, bottom=2),
+                    content=ft.Text(f"{label} · {len(group)}", size=14, weight=ft.FontWeight.W_700, color="#F3F4F6" if dark else TEXT),
+                )
+            )
+            for item in group:
+                def on_toggle(e: ft.ControlEvent, target=item) -> None:
+                    target["selected"] = bool(e.control.value)
+                    refresh_promo_confirm()
+
+                checkbox = ft.Checkbox(value=item.get("selected", True), on_change=on_toggle)
+                rows.append(promo_row(f"{item['offer_id']} — {item['action_name']}", promo_item_lines(item), checkbox=checkbox))
+        return rows
+
+    def promo_plan_summary(plan: dict, mode: str) -> str:
+        items = plan.get("items") or []
+        parts = [str(plan.get("message") or "")]
+        if mode == "remove":
+            parts.append("Отмеченные товары будут удалены из акций в Ozon.")
+        elif mode == "tidy":
+            parts.append("Отмеченные товары будут добавлены по вашей цене, получат приемлемую цену или будут удалены.")
+            if any(item["kind"] == "watch" for item in items):
+                parts.append("Товары «под присмотром» Ozon может добавить сам по невыгодной цене, а отключить это через API нельзя: "
+                             "выключите автодобавление в кабинете Ozon или нажмите эту кнопку после указанной даты — программа их удалит.")
+        else:
+            parts.append("Отмеченные товары будут добавлены в акции или получат новую цену в Ozon.")
+            if any(item["kind"] == "raise" and not item.get("selected", True) for item in items):
+                parts.append("Подъёмы цены, которые снижают бустинг, по умолчанию не отмечены — решите сами, что важнее: маржа или показы.")
+        if not plan.get("visibility_available"):
+            parts.append("Показы и позицию в поиске Ozon по API для этих товаров не отдаёт — ориентируйтесь на процент бустинга.")
+        return " ".join(parts)
+
+    def show_promo_dialog(title: str, summary: str, rows: list[ft.Control], can_confirm: bool, busy: bool = False) -> None:
+        dark = current_dark["value"]
+        promo_dialog.bgcolor = "#232A2F" if dark else "#FFFDF8"
+        promo_dialog_title.value = title
+        promo_dialog_title.color = "#F3F4F6" if dark else TEXT
+        promo_dialog_summary.value = summary
+        promo_dialog_summary.color = "#B6C0BC" if dark else MUTED
+        promo_dialog_list.controls = rows
+        promo_confirm_button.visible = can_confirm
+        promo_confirm_button.content = f"Отправить в Ozon ({promo_selected_count()})"
+        promo_confirm_button.disabled = busy or promo_selected_count() == 0
+        promo_confirm_button.bgcolor = DANGER if promo_state["mode"] == "remove" else PRIMARY
+        promo_cancel_button.disabled = busy
+        promo_cancel_button.content = "Отмена" if can_confirm else "Закрыть"
+        promo_dialog.open = True
+        page.update(promo_dialog)
+
+    def close_promo_dialog(_e=None) -> None:
+        promo_dialog.open = False
+        promo_state["plan"] = None
+        page.update(promo_dialog)
+
+    def open_promo_plan(mode: str) -> None:
+        if build_action_removal_plan is None:
+            toast(f"Модуль акций недоступен: {PRICING_IMPORT_ERROR or 'ошибка импорта'}", True)
+            return
+        if not job_lock.acquire(blocking=False):
+            toast("Дождитесь завершения текущей операции.", True)
+            return
+        promo_state["mode"] = mode
+        promo_state["plan"] = None
+        title = promo_titles[mode]
+        set_status(title, "Собираю актуальные данные акций из Ozon...", ACCENT, busy=True, cancellable=False)
+        show_promo_dialog(title, "Собираю цены, бустинг и видимость товаров из Ozon. В Ozon пока ничего не отправляется.", [promo_spinner()], can_confirm=False, busy=True)
+
+        def worker() -> None:
+            try:
+                builder = {"remove": build_action_removal_plan, "add": build_action_add_plan, "tidy": build_upcoming_actions_plan}[mode]
+                plan = builder(ROOT)
+            except Exception as exc:
+                plan = {"ok": False, "message": f"Не удалось собрать список: {exc}", "items": []}
+            finally:
+                job_lock.release()
+            items = plan.get("items") or []
+            message = str(plan.get("message") or "")
+            set_status(title, message, PRIMARY if plan.get("ok") else DANGER, busy=False)
+            if not items:
+                show_promo_dialog(title, message, [], can_confirm=False)
+                return
+            promo_state["plan"] = plan
+            show_promo_dialog(title, promo_plan_summary(plan, mode), promo_plan_rows(plan), can_confirm=True)
+
+        page.run_thread(worker)
+
+    def confirm_promo_plan(_e=None) -> None:
+        plan = promo_state.get("plan")
+        mode = promo_state.get("mode")
+        if not isinstance(plan, dict) or mode not in promo_titles or promo_selected_count() == 0:
+            return
+        if not job_lock.acquire(blocking=False):
+            toast("Дождитесь завершения текущей операции.", True)
+            return
+        title = promo_titles[mode]
+        set_status(title, "Отправляю изменения в Ozon...", ACCENT, busy=True, cancellable=False)
+        show_promo_dialog(title, "Отправляю изменения в Ozon и проверяю, что они применились...", [promo_spinner()], can_confirm=True, busy=True)
+        promo_state["plan"] = None
+
+        def worker() -> None:
+            try:
+                result = execute_upcoming_actions_plan(plan) if mode == "tidy" else execute_action_plan(plan, mode)
+                watched = {} if mode != "tidy" else {
+                    item["product_id"]: {"product_id": item["product_id"], "offer_id": item["offer_id"]}
+                    for item in plan.get("items") or [] if item["kind"] == "watch" and item.get("selected")
+                }
+                if watched and auto_actions is not None:
+                    auto = auto_actions.apply_change(ROOT, "auto_add_off", list(watched.values()))
+                    result["message"] = f"{result.get('message', '')} {auto['message']}".strip()
+                    result["done"] = int(result.get("done") or 0) + auto["done"]
+                    result["ok"] = bool(result.get("ok", True)) and auto["ok"]
+                    result.setdefault("rejected", [])
+                    result["rejected"] += [{"offer_id": f["offer_id"], "action_name": "автодобавление", "reason": f["reason"]}
+                                           for f in auto["failed"]]
+            except Exception as exc:
+                result = {"ok": False, "done": 0, "message": f"Ошибка отправки в Ozon: {exc}", "rejected": [], "unconfirmed": [], "errors": []}
+            finally:
+                job_lock.release()
+            message = str(result.get("message") or "")
+            append_log(f"{title}: {message}")
+            failures = [
+                (f"{entry['offer_id']} — {entry['action_name']}", f"Ozon отклонил: {entry['reason']}")
+                for entry in result.get("rejected") or []
+            ]
+            failures += [
+                (f"{entry['offer_id']} — {entry['action_name']}", "Ozon принял запрос, но изменение не применилось")
+                for entry in result.get("unconfirmed") or []
+            ]
+            failures += [("Ошибка запроса", error) for error in result.get("errors") or []]
+            for primary, detail in failures:
+                append_log(f"  ✖ {primary}: {detail}")
+            rows = [promo_row(primary, [(detail, None)], DANGER) for primary, detail in failures]
+            set_status(title, message, PRIMARY if result.get("ok") else DANGER, busy=False)
+            show_promo_dialog(title, message, rows, can_confirm=False)
+            if result.get("done"):
+                # Обновляем лист «Акции» и цены в costs.xlsx после изменений.
+                ui_queue.put(("run_job", "Обновление цен и акций", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "refresh-pricing"]))
+                if calendar_state["started"]:
+                    ui_queue.put(("call", calendar_load))
+
+        page.run_thread(worker)
+
+    promo_cancel_button.on_click = close_promo_dialog
+    promo_confirm_button.on_click = confirm_promo_plan
+
+    actions_calendar = ft.Container(padding=18, border_radius=18, data="preserve_excel_fill")
+    auto_panel = ft.Container(padding=18, border_radius=18, data="preserve_excel_fill")
     actions = ft.Column(
         [
             ft.Text("Акции", size=26, weight=ft.FontWeight.W_800, color=TEXT),
@@ -4851,12 +5365,14 @@ def main(page: ft.Page) -> None:
                 controls=[
                     card(
                         "Акции Ozon",
-                        "Продвинутые промо-операции: удалить невыгодные или добавить выгодные товары.",
+                        "Удалить невыгодные, добавить выгодные товары или поднять цену участвующим. Перед отправкой покажем список с бустингом.\n"
+                        "«Порядок в предстоящих» проверяет акции, которые ещё не начались или куда Ozon скоро добавит товары сам.",
                         [
                             ft.Column(
                                 [
-                                    ft.Button("Удалить невыгодные", bgcolor=DANGER, color="white", on_click=lambda _e: job("Удаление невыгодных акций", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "remove-unprofitable-actions"])),
-                                    ft.Button("Добавить в акции", bgcolor=PRIMARY, color="white", on_click=lambda _e: job("Добавление в акции", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "add-to-actions"])),
+                                    ft.Button("Удалить невыгодные", bgcolor=DANGER, color="white", on_click=lambda _e: open_promo_plan("remove")),
+                                    ft.Button("Добавить и поднять цены", bgcolor=PRIMARY, color="white", on_click=lambda _e: open_promo_plan("add")),
+                                    ft.Button("Порядок в предстоящих", icon=ft.Icons.EVENT_AVAILABLE, bgcolor=ACCENT, color="white", on_click=lambda _e: open_promo_plan("tidy")),
                                 ],
                                 spacing=8,
                             )
@@ -4865,29 +5381,1932 @@ def main(page: ft.Page) -> None:
                     ),
                 ],
             ),
+            actions_calendar,
+            auto_panel,
         ],
         spacing=18,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
+
+    # Палитра графиков (справочная палитра dataviz: первые три слота проверены попарно для обеих тем).
+    supply_zone_palette = {False: ["#2a78d6", "#eb6834", "#1baf7a"], True: ["#3987e5", "#d95926", "#199e70"]}
+    supply_season_color = {False: "#4a3aa7", True: "#9085e9"}
+    supply_results = ft.Column(spacing=18, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+
+    def latest_supply_summary() -> dict | None:
+        folder = ROOT / "stocks reports"
+        files = sorted(folder.glob("Поставка FBO *.json"), key=lambda path: path.stat().st_mtime) if folder.exists() else []
+        if not files:
+            return None
+        try:
+            return json.loads(files[-1].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def supply_short_zone(name: str) -> str:
+        return {"Москва, МО и Дальние регионы": "Москва", "Санкт-Петербург и СЗО": "СПб"}.get(name, name)
+
+    def supply_date(value: str, with_year: bool = False) -> str:
+        day = datetime.strptime(value, "%Y-%m-%d").date()
+        return day.strftime("%d.%m.%Y" if with_year else "%d.%m")
+
+    def render_supply_results(push_update: bool = True) -> None:
+        dark = current_dark["value"]
+        ink = "#F3F4F6" if dark else TEXT
+        muted = "#B6C0BC" if dark else MUTED
+        border = "#384046" if dark else "#E1E5EE"
+        band = "#353F46" if dark else "#E6EBF3"
+        summary = latest_supply_summary()
+
+        def text(value: str, size: int = 12, color: str | None = None, weight=None, **kwargs) -> ft.Text:
+            return ft.Text(value, size=size, color=color or ink, weight=weight, data="preserve_excel_text", **kwargs)
+
+        def fill(color: str | None, **kwargs) -> ft.Container:
+            return ft.Container(bgcolor=color, data="preserve_excel_fill", **kwargs)
+
+        def panel(title: str, caption: str, content: ft.Control) -> ft.Control:
+            return fill(
+                semantic_surface("neutral", dark=dark),
+                padding=18,
+                border_radius=18,
+                border=ft.Border.all(1, border),
+                content=ft.Column(
+                    [text(title, 15, weight=ft.FontWeight.W_700), text(caption, 11, muted), content],
+                    spacing=10,
+                ),
+            )
+
+        if not summary:
+            supply_results.controls = [
+                panel("Результатов пока нет", "Нажмите «Рассчитать поставку» — здесь появятся прогноз, сезонность и что везти.", ft.Container())
+            ]
+            if push_update and page.controls:
+                page.update(supply_results)
+            return
+
+        zones = [zone["name"] for zone in summary["zones"]]
+        zone_order = [*zones, summary["fbs_zone"]]
+        palette = supply_zone_palette[dark]
+        zone_color = {zone: palette[index % len(palette)] for index, zone in enumerate(zone_order)}
+        settings = summary["settings"]
+        forecast = summary["forecast"]
+        window_start, window_end = summary["window"]
+        last_day = (datetime.strptime(window_end, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        def swatch(color: str) -> ft.Control:
+            return fill(color, width=10, height=10, border_radius=3)
+
+        def legend(items: list[tuple[str, str]]) -> ft.Control:
+            return ft.Row(
+                [ft.Row([swatch(color), text(label, 11, muted)], spacing=6, tight=True) for label, color in items],
+                spacing=16,
+                wrap=True,
+            )
+
+        # 1. Ключевые цифры
+        if forecast["method"] == "season":
+            forecast_note = f"год назад {forecast['last_year_units']:.0f} шт. × рост {forecast['growth']:.2f}".replace(".", ",")
+        else:
+            forecast_note = "по средней за последние 30 дней"
+        cost = summary.get("cost")  # нет в расчётах, сделанных до появления себестоимости
+        fbs = summary.get("fbs")    # нет в расчётах, сделанных до появления FBS
+        tile_col = 4 if fbs or not cost else 3
+        tiles = [
+            hero_metric("Прогноз магазина за цикл", f"{forecast['units']:.0f} шт.", forecast_note,
+                        semantic_surface("neutral_soft", dark=dark), supply_season_color[dark], width=330, col=tile_col)
+        ]
+        for zone in summary["zones"]:
+            safety = max(0, zone["ship"] - max(0.0, zone["demand"] - zone["on_arrival"]))
+            zone_cost = f" · {_format_currency(zone['cost'])}" if "cost" in zone else ""
+            tiles.append(hero_metric(
+                f"К поставке · {supply_short_zone(zone['name'])}", f"{zone['ship']} шт.",
+                f"спрос {zone['demand']:.0f} + страховка {safety:.0f} · {zone['articles']} арт.{zone_cost}",
+                semantic_surface("neutral_soft", dark=dark), zone_color[zone["name"]], width=330, col=tile_col,
+            ))
+        if cost:
+            missing = cost["missing_articles"]
+            cost_note = (
+                f"без себестоимости в costs.xlsx: {', '.join(missing[:5])}{'…' if len(missing) > 5 else ''} — не учтены"
+                if missing else "количество × себестоимость из costs.xlsx"
+            )
+            tiles.append(hero_metric(
+                "Себестоимость поставки", _format_currency(cost["total"]), cost_note,
+                semantic_surface("neutral_soft", dark=dark), ACCENT, width=330, col=tile_col,
+            ))
+        if fbs:
+            fbs_color = zone_color[summary["fbs_zone"]]
+            fbs_until = supply_date(last_day)
+            tiles.append(hero_metric(
+                "Нужно на своём складе (FBS)", f"{fbs['need']} шт.",
+                f"до {fbs_until} · спрос ~{fbs['demand']:.0f} шт. + страховка · есть {fbs['stock']} шт.",
+                semantic_surface("neutral_soft", dark=dark), fbs_color, width=330, col=tile_col,
+            ))
+            missing_cost = fbs.get("missing_cost_articles") or []
+            shortage_note = (
+                f"на {_format_currency(fbs['shortage_cost'])} по себестоимости" + (" (не у всех есть себестоимость)" if missing_cost else "")
+                if fbs["shortage"] else "остатка хватит на эти дни"
+            )
+            tiles.append(hero_metric(
+                "Не хватает на FBS", f"{fbs['shortage']} шт.", shortage_note,
+                semantic_surface("danger" if fbs["shortage"] else "positive", dark=dark), DANGER if fbs["shortage"] else PRIMARY,
+                width=330, col=tile_col,
+            ))
+        header = text(
+            f"Расчёт от {supply_date(summary['created'], True)} · товар придёт ~{supply_date(summary['arrival'])} · "
+            f"продаётся {supply_date(window_start)}–{supply_date(last_day)} · срок {settings['lead_days']} дн., "
+            f"цикл {settings['cover_days']} дн., уровень сервиса {settings['service_level']:.0%}",
+            12, muted,
+        )
+
+        # 2. Уровень сервиса
+        level_chips = []
+        for option in summary["sensitivity"]:
+            total = sum(option["by_zone"].values())
+            selected = abs(option["level"] - float(settings["service_level"])) < 1e-6
+            level_chips.append(fill(
+                semantic_surface("positive" if selected else "neutral_soft", dark=dark),
+                padding=ft.Padding.symmetric(horizontal=16, vertical=10),
+                border_radius=12,
+                border=ft.Border.all(2 if selected else 1, PRIMARY if selected else border),
+                tooltip=" · ".join(f"{supply_short_zone(zone)}: {qty} шт." for zone, qty in option["by_zone"].items()),
+                content=ft.Column(
+                    [text(f"{option['level']:.0%}", 15, weight=ft.FontWeight.W_800), text(f"{total} шт.", 12, muted)],
+                    spacing=2, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            ))
+        sensitivity_panel = panel(
+            "Сколько везти при другом уровне сервиса",
+            "Уровень сервиса — вероятность не уйти в ноль на FBO за цикл. Если FBO опустеет, заказ уйдёт FBS, только медленнее. "
+            "Чтобы получить список по артикулам, пересчитайте с нужным уровнем.",
+            ft.Row(level_chips, spacing=10, wrap=True),
+        )
+
+        # 3. Сезонность
+        season = summary["season"]
+        while season and season[0]["units"] == 0:
+            season = season[1:]
+        base_from, base_to = (datetime.strptime(value, "%Y-%m-%d") for value in summary["base_window"])
+        base_months = set()
+        cursor = base_from.replace(day=1)
+        while cursor < base_to:
+            base_months.add(cursor.strftime("%Y-%m"))
+            cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
+        current_month = summary["created"][:7]
+        by_month = {row["month"]: row["units"] for row in season}
+        peak = max((row["units"] for row in season), default=0) or 1
+        columns = []
+        for row in season:
+            month = row["month"]
+            year, mon = month.split("-")
+            last_year = by_month.get(f"{int(year) - 1}-{mon}")
+            partial = month == current_month
+            tooltip = f"{mon}.{year}: {row['units']} шт."
+            if last_year is not None:
+                tooltip += f" · год назад {last_year} шт."
+            if partial:
+                tooltip += " · месяц ещё идёт"
+            labeled = month in base_months or row["units"] == peak
+            columns.append(fill(
+                band if month in base_months else None,
+                expand=1,
+                border_radius=8,
+                padding=ft.Padding.only(left=2, right=2, top=4, bottom=2),
+                tooltip=tooltip,
+                content=ft.Column(
+                    [
+                        text(str(row["units"]) if labeled else "", 10, muted),
+                        fill(
+                            supply_season_color[dark],
+                            height=max(2, row["units"] / peak * 150) if row["units"] else 0,
+                            border_radius=ft.BorderRadius.only(top_left=4, top_right=4),
+                            opacity=0.45 if partial else 1,
+                        ),
+                        text(f"{mon}.{year[2:]}", 9, muted),
+                    ],
+                    spacing=4,
+                    alignment=ft.MainAxisAlignment.END,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                ),
+            ))
+        season_panel = panel(
+            "Продажи по месяцам",
+            f"Подсвечены месяцы год назад: продажи за {supply_date(summary['base_window'][0])}–"
+            f"{(base_to - timedelta(days=1)).strftime('%d.%m.%Y')} × рост дают прогноз на цикл. Наведите на столбец, чтобы сравнить с прошлым годом.",
+            ft.Container(height=200, content=ft.Row(columns, spacing=2, vertical_alignment=ft.CrossAxisAlignment.END)),
+        )
+
+        # 4. Спрос по кластерам
+        clusters = summary["clusters"]
+        shown = [row for row in clusters if row["share"] >= 1.0]
+        hidden = [row for row in clusters if row["share"] < 1.0]
+        if hidden:
+            shown.append({"cluster": f"Остальные ({len(hidden)})", "zone": None, "share": round(sum(r["share"] for r in hidden), 1)})
+        top_share = max((row["share"] for row in shown), default=1) or 1
+        cluster_rows = []
+        for row in shown:
+            color = zone_color.get(row["zone"], "#8E8E93")
+            width = int(row["share"] / top_share * 1000)
+            cluster_rows.append(ft.Row(
+                [
+                    ft.Container(width=190, content=text(row["cluster"], 11, ink, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)),
+                    ft.Row(
+                        [fill(color, expand=max(1, width), height=12, border_radius=ft.BorderRadius.only(top_right=4, bottom_right=4)),
+                         ft.Container(expand=max(1, 1000 - width))],
+                        expand=True, spacing=0,
+                    ),
+                    ft.Container(width=52, content=text(f"{row['share']:g}%".replace(".", ","), 11, muted, text_align=ft.TextAlign.RIGHT)),
+                ],
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ))
+        zone_totals = {zone: sum(row["share"] for row in clusters if row["zone"] == zone) for zone in zone_order}
+        cluster_panel = panel(
+            "Откуда покупатели — и какой склад их обслуживает",
+            "Доля спроса по кластеру покупателя за год. Цвет — склад, за которым закреплён кластер: склад FBO продаёт не только своему региону.",
+            ft.Column(
+                [legend([(f"{supply_short_zone(zone)} — {zone_totals[zone]:.0f}%", zone_color[zone]) for zone in zone_order]), *cluster_rows],
+                spacing=6,
+            ),
+        )
+
+        # 5. Что везти
+        supply_rows = summary["supply"]
+        biggest = max((row["total"] for row in supply_rows), default=1) or 1
+        header_row = ft.Row(
+            [
+                ft.Container(width=70, content=text("Артикул", 11, muted, weight=ft.FontWeight.W_700)),
+                *[ft.Container(width=64, content=text(supply_short_zone(zone), 11, muted, weight=ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT)) for zone in zones],
+                ft.Container(width=56, content=text("Итого", 11, muted, weight=ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT)),
+                *([ft.Container(width=110, content=text("Себестоимость", 11, muted, weight=ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT))] if cost else []),
+                ft.Container(width=86, content=text("Прогноз/день", 11, muted, weight=ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT)),
+                ft.Container(expand=True),
+            ],
+            spacing=12,
+        )
+        table_rows: list[ft.Control] = [header_row]
+        for row in supply_rows:
+            segments = []
+            for zone in zones:
+                qty = row["by_zone"].get(zone, 0)
+                if qty:
+                    segments.append(fill(zone_color[zone], expand=qty, height=12, border_radius=4,
+                                         tooltip=f"{supply_short_zone(zone)}: {qty} шт."))
+            segments.append(ft.Container(expand=max(1, biggest - row["total"])) if row["total"] < biggest else ft.Container(width=0))
+            table_rows.append(ft.Row(
+                [
+                    ft.Container(width=70, content=text(row["article"], 12, weight=ft.FontWeight.W_700)),
+                    *[ft.Container(width=64, content=text(str(row["by_zone"].get(zone, 0) or "—"), 12, text_align=ft.TextAlign.RIGHT)) for zone in zones],
+                    ft.Container(width=56, content=text(str(row["total"]), 12, weight=ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT)),
+                    *([ft.Container(
+                        width=110,
+                        tooltip=f"{row['total']} шт. × {_format_currency(row['unit_cost'])}" if row.get("unit_cost") else "Нет себестоимости в costs.xlsx",
+                        content=text(_format_currency(row.get("cost")), 12, text_align=ft.TextAlign.RIGHT),
+                    )] if cost else []),
+                    ft.Container(width=86, content=text(f"{row['per_day']:.2f}".replace(".", ","), 12, muted, text_align=ft.TextAlign.RIGHT)),
+                    ft.Row(segments, expand=True, spacing=2),
+                ],
+                spacing=12,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ))
+        total_by_zone = {zone: sum(row["by_zone"].get(zone, 0) for row in supply_rows) for zone in zones}
+        supply_panel = panel(
+            f"Что везти — {len(supply_rows)} артикулов, {sum(total_by_zone.values())} шт."
+            + (f" на {_format_currency(cost['total'])} по себестоимости" if cost else ""),
+            "По убыванию количества. Полный расчёт по каждой строке — в Excel на листе «Расчёт».",
+            ft.Column(
+                [legend([(f"{supply_short_zone(zone)} — {total_by_zone[zone]} шт.", zone_color[zone]) for zone in zones]), *table_rows],
+                spacing=8,
+            ),
+        )
+
+        # 6. Свой склад (FBS) на те же дни
+        fbs_panel = None
+        if fbs:
+            bad = "#FF9C8F" if dark else DANGER
+            fbs_rows_data = fbs["rows"]
+            fbs_peak = max((max(row["need"], row["stock"] or 0) for row in fbs_rows_data), default=1) or 1
+
+            def fbs_cell(value: str, width: int, color: str | None = None, weight=None, tooltip: str | None = None) -> ft.Control:
+                return ft.Container(width=width, tooltip=tooltip, content=text(value, 12, color, weight, text_align=ft.TextAlign.RIGHT))
+
+            fbs_header = ft.Row(
+                [
+                    ft.Container(width=70, content=text("Артикул", 11, muted, weight=ft.FontWeight.W_700)),
+                    *[ft.Container(width=w, content=text(label, 11, muted, weight=ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT))
+                      for label, w in (("Регионы FBS", 90), ("С FBO", 64), ("Спрос", 64), ("Нужно", 60), ("Есть", 56), ("Не хватает", 84))],
+                    *([ft.Container(width=110, content=text("Себестоимость", 11, muted, weight=ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT))] if cost else []),
+                    ft.Container(expand=True),
+                ],
+                spacing=12,
+            )
+            fbs_table: list[ft.Control] = [fbs_header]
+            for row in fbs_rows_data:
+                stock_now = row["stock"] or 0
+                covered = min(stock_now, row["need"])
+                segments = []
+                if covered:
+                    segments.append(fill(fbs_color, expand=covered, height=12, border_radius=4, tooltip=f"Есть: {stock_now} шт."))
+                if row["shortage"]:
+                    segments.append(fill(bad, expand=row["shortage"], height=12, border_radius=4, tooltip=f"Не хватает: {row['shortage']} шт."))
+                extra = max(0, stock_now - row["need"])
+                if extra:
+                    segments.append(fill(band, expand=extra, height=12, border_radius=4, tooltip=f"Сверх нужного: {extra} шт."))
+                used = covered + row["shortage"] + extra
+                segments.append(ft.Container(expand=max(1, fbs_peak - used)) if used < fbs_peak else ft.Container(width=0))
+                own = row["own_lead"] + row["own_window"]
+                fbs_table.append(ft.Row(
+                    [
+                        ft.Container(width=70, content=text(row["article"], 12, weight=ft.FontWeight.W_700)),
+                        fbs_cell(f"{own:.1f}".replace(".", ","), 90, muted,
+                                 tooltip=f"До прихода поставки {row['own_lead']:.1f} шт. + в окне {row['own_window']:.1f} шт.".replace(".", ",")),
+                        fbs_cell(f"{row['spill']:.1f}".replace(".", ",") if row["spill"] else "—", 64, muted,
+                                 tooltip="Что FBO не покроет до прихода поставки + мелкий спрос зон FBO, куда не везём"),
+                        fbs_cell(f"{row['demand']:.1f}".replace(".", ","), 64),
+                        fbs_cell(str(row["need"]), 60, weight=ft.FontWeight.W_700),
+                        fbs_cell("—" if row["stock"] is None else str(row["stock"]), 56),
+                        fbs_cell(str(row["shortage"]) if row["shortage"] else "—", 84, bad if row["shortage"] else muted, ft.FontWeight.W_700),
+                        *([fbs_cell(_format_currency(row["cost"]) if row.get("cost") else "—", 110)] if cost else []),
+                        ft.Row(segments, expand=True, spacing=2),
+                    ],
+                    spacing=12,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ))
+            fbs_panel = panel(
+                f"Свой склад (FBS) на те же дни — нужно {fbs['need']} шт., не хватает {fbs['shortage']} шт.",
+                f"С {supply_date(fbs['horizon'][0])} по {supply_date(last_day)}: заказы регионов без склада FBO, то, что FBO не покроет до прихода поставки, "
+                f"и мелкий спрос зон FBO, куда не везём. «Нужно» — запас, чтобы с вероятностью {settings['service_level']:.0%} не уйти в ноль.",
+                ft.Column(
+                    [legend([("есть на складе", fbs_color), ("не хватает", bad), ("сверх нужного", band)]), *fbs_table],
+                    spacing=8,
+                ),
+            )
+
+        supply_results.controls = [
+            header,
+            ft.ResponsiveRow(tiles, run_spacing=14, spacing=14),
+            sensitivity_panel,
+            supply_panel,
+            *([fbs_panel] if fbs_panel else []),
+            ft.ResponsiveRow(
+                [ft.Container(col={"md": 12, "xl": 6}, content=season_panel), ft.Container(col={"md": 12, "xl": 6}, content=cluster_panel)],
+                run_spacing=14, spacing=14,
+            ),
+        ]
+        if push_update and page.controls:
+            page.update(supply_results)
+
+    # ---------------------------------------------------------------- Реклама: оплата за клик
+    ads_defaults = ads_load_settings(ROOT) if ads_load_settings else {"profit_share": 0.4, "lookback_days": 21}
+    ads_share = ft.TextField(label="Доля прибыли на рекламу, %", value=f"{float(ads_defaults['profit_share']) * 100:g}", width=230,
+                             tooltip="Сколько прибыли с заказа можно отдать за клики, которые к нему привели")
+    ads_days = ft.TextField(label="Период анализа, дней", value=str(int(ads_defaults["lookback_days"])), width=190)
+    ads_results = ft.Column(spacing=18, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+    ads_apply_button = ft.Button("Применить отмеченные", bgcolor=PRIMARY, color="white")
+    ads_state: dict[str, object] = {"plan": None, "result": None, "busy": False}
+    ads_action_labels = {"bid_down": "Снизить ставку", "bid_up": "Повысить ставку", "remove": "Убрать из рекламы", "keep": "Без изменений", "info": "Только информация"}
+
+    def ads_selected_count() -> int:
+        plan = ads_state.get("plan")
+        if not isinstance(plan, dict):
+            return 0
+        return sum(1 for item in plan["items"] if item.get("selected") and item["action"] in ("bid_down", "bid_up", "remove"))
+
+    def ads_rub(value, digits: int = 0) -> str:
+        if value is None:
+            return "—"
+        return f"{value:,.{digits}f} ₽".replace(",", " ").replace(".", ",")
+
+    def render_ads_results(push_update: bool = True) -> None:
+        dark = current_dark["value"]
+        ink = "#F3F4F6" if dark else TEXT
+        muted = "#B6C0BC" if dark else MUTED
+        border = "#384046" if dark else "#E1E5EE"
+        good = "#70D4BC" if dark else PRIMARY
+        bad = "#FF9C8F" if dark else DANGER
+        warn = "#E0A15F" if dark else ACCENT
+
+        def text(value: str, size: int = 12, color: str | None = None, weight=None, **kwargs) -> ft.Text:
+            return ft.Text(value, size=size, color=color or ink, weight=weight, data="preserve_excel_text", **kwargs)
+
+        def box(content: ft.Control, **kwargs) -> ft.Container:
+            return ft.Container(
+                content=content, padding=18, border_radius=18, data="preserve_excel_fill",
+                bgcolor=semantic_surface("neutral", dark=dark), border=ft.Border.all(1, border), **kwargs,
+            )
+
+        status_icons = {
+            "ok": (ft.Icons.CHECK_CIRCLE_OUTLINE, good),
+            "warn": (ft.Icons.WARNING_AMBER_ROUNDED, warn),
+            "bad": (ft.Icons.ERROR_OUTLINE, bad),
+            "info": (ft.Icons.INFO_OUTLINE, muted),
+        }
+
+        def status_line(step: dict) -> ft.Control:
+            icon, color = status_icons.get(step["status"], status_icons["info"])
+            return ft.Row(
+                [
+                    ft.Icon(icon, size=16, color=color),
+                    ft.Column([text(step["name"], 12, weight=ft.FontWeight.W_700), text(step["text"], 12)], spacing=1, expand=True),
+                ],
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+
+        def advice_block(lines: list) -> ft.Control:
+            return ft.Column(
+                [text("Рекомендации", 12, warn, ft.FontWeight.W_700), *[text(f"→ {line}", 12) for line in lines]],
+                spacing=3,
+            )
+
+        plan, result = ads_state.get("plan"), ads_state.get("result")
+        controls: list[ft.Control] = []
+        if ads_state.get("loading"):
+            controls.append(box(ft.Row([ft.ProgressRing(width=22, height=22, stroke_width=2.4),
+                                        text("Подбираю ставки: статистика товаров, конкурентные ставки, остатки — около минуты…", 13, muted)], spacing=12)))
+        if isinstance(result, dict):
+            failures = result.get("failed") or []
+            lines = [text(result["message"], 13, good if result.get("ok") else bad, ft.FontWeight.W_700)]
+            lines += [text(f"✖ {f.get('offer_id') or f['sku']} — {f['campaign_title']}: {f['error']}", 12, bad) for f in failures]
+            controls.append(box(ft.Column(lines, spacing=6)))
+        if ads_state.get("loading"):
+            pass
+        elif not isinstance(plan, dict):
+            controls.append(box(text("Нажмите «Подобрать ставки» — программа посчитает, сколько выгодно платить за клик по каждому товару. "
+                                     "В Ozon ничего не отправляется, пока вы не нажмёте «Применить».", 12, muted)))
+        elif not plan.get("campaigns"):
+            controls.append(box(text(plan.get("message") or "Нет работающих кампаний.", 13, muted)))
+        else:
+            period = plan["period"]
+            controls.append(text(
+                f"Расчёт от {plan['created'][:16].replace('T', ' ')} · статистика {supply_date(period[0])}–{supply_date(period[1])} · "
+                f"на рекламу до {float(plan['settings']['profit_share']):.0%} прибыли с заказа",
+                12, muted,
+            ))
+            for campaign in plan["campaigns"]:
+                items = [i for i in plan["items"] if i["campaign_id"] == campaign["id"]]
+                after = campaign["profit_after_ads"]
+                share = campaign["profit_share_spent"]
+                budget = f"{ads_rub(campaign['weekly_budget'])} в неделю" if campaign["weekly_budget"] else (
+                    f"{ads_rub(campaign['daily_budget'])} в день" if campaign["daily_budget"] else "без лимита")
+                tiles = [
+                    hero_metric("Расход на рекламу", ads_rub(campaign["spend"]), f"{campaign['clicks']:.0f} кликов",
+                                semantic_surface("neutral_soft", dark=dark), ACCENT, width=260, col=3),
+                    hero_metric("Заказов с рекламы", f"{campaign['orders']:.0f}",
+                                f"конверсия {campaign['conversion']:.1%}".replace(".", ",") if campaign.get("conversion") else "",
+                                semantic_surface("neutral_soft", dark=dark), PRIMARY, width=260, col=3),
+                    hero_metric("Прибыль с них до рекламы", ads_rub(campaign["profit_before_ads"]), "по прибыли с продажи из costs.xlsx",
+                                semantic_surface("neutral_soft", dark=dark), PRIMARY, width=260, col=3),
+                    hero_metric("Осталось после рекламы", ads_rub(after),
+                                f"реклама съела {share:.0%} прибыли" if share is not None else "",
+                                semantic_surface("danger" if after < 0 else "positive", dark=dark), DANGER if after < 0 else PRIMARY, width=260, col=3),
+                ]
+                header = ft.Row(
+                    [
+                        ft.Container(width=40),
+                        ft.Container(width=210, content=text("Товар", 11, muted, ft.FontWeight.W_700)),
+                        *[ft.Container(width=w, content=text(t, 11, muted, ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT))
+                          for t, w in (("Клики", 56), ("Заказы", 60), ("Расход", 80), ("₽ на заказ", 84), ("Безубыт.", 74), ("Ставка", 120), ("Ozon советует", 100))],
+                        ft.Container(expand=True, content=text("Решение", 11, muted, ft.FontWeight.W_700)),
+                    ],
+                    spacing=10,
+                )
+                rows: list[ft.Control] = [header]
+                for item in items:
+                    actionable = item["action"] in ("bid_down", "bid_up", "remove")
+
+                    def on_toggle(e: ft.ControlEvent, target=item) -> None:
+                        target["selected"] = bool(e.control.value)
+                        refresh_ads_apply()
+
+                    cpo = item["spend"] / item["orders_total"] if item["orders_total"] else None
+                    if item["action"] in ("bid_down", "bid_up"):
+                        bid_text = f"{item['current_bid']:.2f} → {item['recommended_bid']:.2f}".replace(".", ",")
+                    else:
+                        bid_text = f"{item['current_bid']:.2f}".replace(".", ",")
+                    action_color = {"bid_down": warn, "bid_up": good, "remove": bad}.get(item["action"], muted)
+                    orders_text = f"{item['orders_total']:.0f}" + (f" ({item['model_orders']:.0f} вар.)" if item.get("model_orders") else "")
+                    details = ft.Container(
+                        visible=bool(item.get("_open")),
+                        padding=ft.Padding.only(left=50, top=6, bottom=4, right=8),
+                        content=ft.Column(
+                            [*[status_line(step) for step in item.get("steps") or []],
+                             *([advice_block(item["advice"])] if item.get("advice") else [])],
+                            spacing=8,
+                        ),
+                    )
+                    details_button = ft.TextButton("Скрыть шаги" if item.get("_open") else "Подробнее: 6 шагов")
+
+                    def toggle_details(_e, target=item, panel=details, button=details_button) -> None:
+                        target["_open"] = not target.get("_open")
+                        panel.visible = target["_open"]
+                        button.content = "Скрыть шаги" if target["_open"] else "Подробнее: 6 шагов"
+                        page.update(panel, button)
+
+                    details_button.on_click = toggle_details
+                    stage_label = {"test": "Тест · ", "mature": ""}.get(item.get("stage") or "", "")
+                    rows.append(ft.Container(
+                        padding=ft.Padding.symmetric(vertical=6),
+                        border=ft.Border.only(top=ft.BorderSide(1, border)),
+                        data="preserve_excel_fill",
+                        content=ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Container(width=40, content=ft.Checkbox(value=bool(item.get("selected")), on_change=on_toggle) if actionable else None),
+                                        ft.Container(width=210, content=ft.Column([
+                                            text(str(item.get("offer_id") or item["sku"]), 12, weight=ft.FontWeight.W_700),
+                                            text(item.get("title") or "", 10, muted, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                        ], spacing=0, tight=True)),
+                                        *[ft.Container(width=w, content=text(v, 12, text_align=ft.TextAlign.RIGHT)) for v, w in (
+                                            (f"{item['clicks']:.0f}", 56),
+                                            (orders_text, 60),
+                                            (ads_rub(item["spend"]), 80),
+                                            (ads_rub(cpo), 84),
+                                            (f"{item['breakeven_bid']:.2f}".replace(".", ",") if item.get("breakeven_bid") is not None else "—", 74),
+                                            (bid_text, 120),
+                                            (f"{item['competitive_bid']:.2f}".replace(".", ",") if item.get("competitive_bid") else "—", 100),
+                                        )],
+                                        ft.Container(expand=True, content=text(ads_action_labels[item["action"]], 12, action_color, ft.FontWeight.W_700)),
+                                    ],
+                                    spacing=10,
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                ),
+                                ft.Row(
+                                    [
+                                        ft.Container(padding=ft.Padding.only(left=50), expand=True, content=text(stage_label + item["reason"], 11, muted)),
+                                        details_button,
+                                    ],
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                ),
+                                details,
+                            ],
+                            spacing=2,
+                        ),
+                    ))
+                controls.append(box(ft.Column(
+                    [
+                        text(campaign["title"], 16, weight=ft.FontWeight.W_800),
+                        text(f"Стратегия «{campaign['strategy']}» · бюджет {budget}", 12, muted),
+                        ft.ResponsiveRow(tiles, run_spacing=12, spacing=12),
+                        *([ft.Container(
+                            padding=12,
+                            border_radius=12,
+                            data="preserve_excel_fill",
+                            bgcolor=semantic_surface("neutral_soft", dark=dark),
+                            content=ft.Column([text("Что видно по кампании", 13, weight=ft.FontWeight.W_800),
+                                               *[status_line(note) for note in campaign["advice"]]], spacing=8),
+                        )] if campaign.get("advice") else []),
+                        *rows,
+                    ],
+                    spacing=10,
+                )))
+            controls.append(text(
+                "«Безубыт.» — ставка, при которой реклама съедает всю прибыль с заказа. «Ozon советует» — конкурентная ставка Ozon. "
+                "Заказы учитывают покупки соседних вариантов товара после клика (вар.).", 11, muted,
+            ))
+        ads_results.controls = controls
+        # Плитки сводки (hero_metric) окрашиваются темой; наши тексты и заливки помечены и не меняются.
+        apply_control_theme(ads_results, dark)
+        refresh_ads_apply(push_update=False)
+        if push_update and page.controls:
+            try:
+                page.update(ads_results, ads_apply_button)
+            except Exception:
+                pass  # вкладку уже закрыли — покажем при следующем открытии
+
+    def refresh_ads_apply(push_update: bool = True) -> None:
+        count = ads_selected_count()
+        ads_apply_button.content = f"Применить отмеченные ({count})"
+        ads_apply_button.disabled = count == 0 or bool(ads_state["busy"])
+        ads_apply_button.opacity = 0.45 if ads_apply_button.disabled else 1
+        if push_update and page.controls:
+            try:
+                page.update(ads_apply_button)
+            except Exception:
+                pass
+
+    def ads_read_settings() -> dict | None:
+        try:
+            share = float((ads_share.value or "").replace(",", ".")) / 100
+            days = int(ads_days.value or "")
+        except ValueError:
+            toast("Доля прибыли — число, период — целое число дней.", True)
+            return None
+        if not 0.05 <= share <= 0.9 or not 7 <= days <= 60:
+            toast("Доля прибыли — от 5 до 90%, период — от 7 до 60 дней.", True)
+            return None
+        settings = {**ads_load_settings(ROOT), "profit_share": share, "lookback_days": days}
+        settings.pop("min_profit_to_cost", None)  # условие убрано, старое значение из файла не нужно
+        ads_save_settings(ROOT, settings)
+        return settings
+
+    def ads_build(_e=None, keep_result: bool = False) -> None:
+        if build_ads_plan is None:
+            toast(f"Модуль рекламы недоступен: {ADS_IMPORT_ERROR or 'ошибка импорта'}", True)
+            return
+        settings = ads_read_settings()
+        if settings is None:
+            return
+        if not job_lock.acquire(blocking=False):
+            toast("Дождитесь завершения текущей операции.", True)
+            return
+        campaign_id = ads_nav["campaign_id"]
+        ads_state["busy"] = True
+        if not keep_result:
+            ads_state["result"] = None
+        set_status("Реклама", "Собираю статистику кампании из Ozon...", ACCENT, busy=True, cancellable=False)
+        ads_state["plan"] = None
+        ads_state["loading"] = True
+        render_ads_results()
+
+        def worker() -> None:
+            try:
+                ads_state["plan"] = build_ads_plan(ROOT, settings, campaign_ids=[campaign_id] if campaign_id else None)
+                ads_state["plan_campaign"] = campaign_id
+                set_status("Реклама", str(ads_state["plan"]["message"]), PRIMARY, busy=False)
+            except Exception as exc:
+                ads_state["plan"] = None
+                set_status("Реклама", f"Не удалось собрать данные: {exc}", DANGER, busy=False)
+                ads_state["result"] = {"ok": False, "message": f"Не удалось собрать данные: {exc}", "failed": []}
+            finally:
+                ads_state["busy"] = False
+                ads_state["loading"] = False
+                job_lock.release()
+            render_ads_results()
+
+        page.run_thread(worker)
+
+    def ads_apply(_e=None) -> None:
+        plan = ads_state.get("plan")
+        if not isinstance(plan, dict) or ads_selected_count() == 0 or execute_ads_plan is None:
+            return
+        if not job_lock.acquire(blocking=False):
+            toast("Дождитесь завершения текущей операции.", True)
+            return
+        ads_state["busy"] = True
+        set_status("Реклама", "Отправляю ставки в Ozon и проверяю применение...", ACCENT, busy=True, cancellable=False)
+        refresh_ads_apply()
+
+        def worker() -> None:
+            try:
+                ads_state["result"] = execute_ads_plan(ROOT, plan["items"])
+            except Exception as exc:
+                ads_state["result"] = {"ok": False, "message": f"Ошибка отправки в Ozon: {exc}", "failed": []}
+            finally:
+                ads_state["busy"] = False
+                job_lock.release()
+            result = ads_state["result"]
+            append_log(f"Реклама: {result['message']}")
+            for failure in result.get("failed") or []:
+                append_log(f"  ✖ {failure.get('offer_id') or failure['sku']}: {failure['error']}")
+            set_status("Реклама", result["message"], PRIMARY if result.get("ok") else DANGER, busy=False)
+            # Пересобираем рекомендации, чтобы показать фактические ставки после изменений.
+            ui_queue.put(("ads_rebuild",))
+
+        page.run_thread(worker)
+
+    ads_apply_button.on_click = ads_apply
+
+    def open_ads_reports() -> None:
+        folder = ROOT / "ads reports"
+        folder.mkdir(parents=True, exist_ok=True)
+        reveal_path(folder, "ads reports")
+
+    # ---------------------------------------------------------------- Реклама: навигация (тип → кампании → кампания)
+    ADS_TYPES = [
+        ("cpc", "Оплата за клик", "Поднимайте товары в поиске и рекомендациях Ozon и платите за клики. С помощью инструмента можно привлечь потенциальных покупателей и увеличить продажи"),
+        ("cpo", "Оплата за заказ", "Поднимайте товары выше в поиске Ozon и платите только за заказы. С помощью инструмента можно усилить продвижение товаров в «Оплате за клик»"),
+        ("media", "Медийная реклама", "Повышайте узнаваемость бренда, рассказывайте о новинках и акциях с помощью баннеров на главной странице, в каталоге и поиске Ozon"),
+        ("collections", "Подборки товаров", "Создавайте страницу с вашими товарами и делитесь ей с покупателями в рассылках, соцсетях или за пределами Ozon"),
+        ("external", "Внешнее продвижение", "Продвигайте товары в соцсетях с помощью блогеров, чтобы повысить охваты и привлечь внимание покупателей"),
+        ("promo", "Акции", "Участвуйте в акциях от Ozon, чтобы повысить продажи. Акционным бустингом можно управлять: чем выше скидка, тем больше бустинга"),
+        ("b2b", "Продажи юридическим лицам", "Юрлица чаще заказывают оптом и повышают средний чек"),
+    ]
+    ADS_PERIOD_PRESETS = (7, 14, 31, 90)
+    ads_nav: dict[str, object] = {
+        "screen": "types", "campaign_id": None, "preset": 31,
+        "from": date.today() - timedelta(days=30), "to": date.today(),
+        "list": None, "list_busy": False, "list_error": None, "opened": set(),
+    }
+    ads_view = ft.Column(spacing=18, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+    ads_custom_from = ft.TextField(label="С", width=150, dense=True)
+    ads_custom_to = ft.TextField(label="По", width=150, dense=True)
+
+    def ads_palette() -> dict:
+        dark = current_dark["value"]
+        return {
+            "dark": dark,
+            "ink": "#F3F4F6" if dark else TEXT,
+            "muted": "#B6C0BC" if dark else MUTED,
+            "border": "#384046" if dark else "#E1E5EE",
+            "surface": semantic_surface("neutral", dark=dark),
+            "soft": semantic_surface("neutral_soft", dark=dark),
+            "good": "#70D4BC" if dark else PRIMARY,
+            "bad": "#FF9C8F" if dark else DANGER,
+        }
+
+    def ads_text(value: str, size: int = 12, color: str | None = None, weight=None, **kwargs) -> ft.Text:
+        return ft.Text(value, size=size, color=color or ads_palette()["ink"], weight=weight, data="preserve_excel_text", **kwargs)
+
+    def ads_box(content: ft.Control, **kwargs) -> ft.Container:
+        pal = ads_palette()
+        options = {"padding": 18, "border_radius": 18, "bgcolor": pal["surface"], "border": ft.Border.all(1, pal["border"])}
+        options.update(kwargs)
+        return ft.Container(content=content, data="preserve_excel_fill", **options)
+
+    def ads_header(title: str, subtitle: str, back: tuple[str, object] | None = None) -> list[ft.Control]:
+        controls: list[ft.Control] = []
+        if back:
+            controls.append(ft.Row([ft.TextButton(back[0], icon=ft.Icons.ARROW_BACK, on_click=lambda _e: back[1]())]))
+        controls += [ft.Text(title, size=26, weight=ft.FontWeight.W_800, color=TEXT), ft.Text(subtitle, size=13, color=MUTED)]
+        return controls
+
+    def ads_go(screen: str, campaign_id: str | None = None) -> None:
+        ads_nav["screen"] = screen
+        if campaign_id is not None:
+            ads_nav["campaign_id"] = campaign_id
+        render_ads_view()
+        if screen == "list" and ads_nav["list"] is None and not ads_nav["list_busy"]:
+            ads_load_list()
+        if screen == "campaign":
+            campaign = ads_current_campaign()
+            if ads_state.get("plan_campaign") != campaign_id:
+                ads_state["plan"], ads_state["result"] = None, None
+                render_ads_results()
+            # При первом открытии кампании подбор ставок запускается сам — на настройках по умолчанию.
+            if campaign and campaign["running"] and campaign_id not in ads_nav["opened"]:
+                ads_nav["opened"].add(campaign_id)
+                ads_build()
+
+    def ads_current_campaign() -> dict | None:
+        data = ads_nav.get("list")
+        if not isinstance(data, dict):
+            return None
+        return next((c for c in data["campaigns"] if c["id"] == ads_nav["campaign_id"]), None)
+
+    def ads_set_period(preset: int | None = None) -> None:
+        if preset is not None:
+            ads_nav["preset"] = preset
+            ads_nav["to"] = date.today()
+            ads_nav["from"] = date.today() - timedelta(days=preset - 1)
+            ads_custom_from.value, ads_custom_to.value = f"{ads_nav['from']:%d.%m.%Y}", f"{ads_nav['to']:%d.%m.%Y}"
+        else:
+            try:
+                start = datetime.strptime((ads_custom_from.value or "").strip(), "%d.%m.%Y").date()
+                end = datetime.strptime((ads_custom_to.value or "").strip(), "%d.%m.%Y").date()
+            except ValueError:
+                toast("Даты в формате ДД.ММ.ГГГГ, например 01.09.2026.", True)
+                return
+            if start > end or end > date.today():
+                toast("Начало периода должно быть раньше конца, а конец — не позже сегодняшнего дня.", True)
+                return
+            ads_nav["preset"], ads_nav["from"], ads_nav["to"] = None, start, end
+        ads_load_list()
+
+    def ads_load_list() -> None:
+        if list_cpc_campaigns is None:
+            toast(f"Модуль рекламы недоступен: {ADS_IMPORT_ERROR or 'ошибка импорта'}", True)
+            return
+        if ads_nav["list_busy"]:
+            return
+        ads_nav["list_busy"], ads_nav["list_error"] = True, None
+        render_ads_view()
+        start, end = ads_nav["from"], ads_nav["to"]
+        set_status("Реклама", f"Загружаю кампании за {start:%d.%m}–{end:%d.%m}...", ACCENT, busy=True, cancellable=False)
+
+        def worker() -> None:
+            try:
+                ads_nav["list"] = list_cpc_campaigns(start, end)
+                set_status("Реклама", f"Кампаний за период: {len(ads_nav['list']['campaigns'])}.", PRIMARY, busy=False)
+            except Exception as exc:
+                ads_nav["list_error"] = str(exc)
+                set_status("Реклама", f"Не удалось загрузить кампании: {exc}", DANGER, busy=False)
+            finally:
+                ads_nav["list_busy"] = False
+            render_ads_view()
+
+        page.run_thread(worker)
+
+    def ads_metric(label: str, value: str) -> ft.Control:
+        pal = ads_palette()
+        return ft.Container(
+            width=118,
+            content=ft.Column([ads_text(label, 10, pal["muted"]), ads_text(value, 14, weight=ft.FontWeight.W_700)], spacing=1, tight=True),
+        )
+
+    def ads_campaign_metrics(c: dict) -> list[ft.Control]:
+        pct = lambda v: "—" if v is None else f"{v * 100:.1f}%".replace(".", ",")
+        rub2 = lambda v: "—" if v is None else f"{v:.2f} ₽".replace(".", ",")
+        return [
+            ads_metric("Расход", ads_rub(c["spend"])), ads_metric("Показы", _format_number(c["views"])),
+            ads_metric("Клики", _format_number(c["clicks"])), ads_metric("CTR", pct(c["ctr"])),
+            ads_metric("Цена клика", rub2(c["cpc"])), ads_metric("Заказы", _format_number(c["orders"])),
+            ads_metric("Выручка", ads_rub(c["revenue"])), ads_metric("ДРР", pct(c["drr"])),
+            ads_metric("₽ на заказ", ads_rub(c["cpo"])),
+        ]
+
+    def ads_status_badge(c: dict) -> ft.Control:
+        pal = ads_palette()
+        color = pal["good"] if c["running"] else pal["muted"]
+        return ft.Container(
+            padding=ft.Padding.symmetric(horizontal=10, vertical=4), border_radius=999, border=ft.Border.all(1, color),
+            data="preserve_excel_fill", content=ads_text(c["state_name"], 11, color, ft.FontWeight.W_700),
+        )
+
+    def ads_budget_text(c: dict) -> str:
+        if c["weekly_budget"]:
+            return f"{ads_rub(c['weekly_budget'])} в неделю"
+        return f"{ads_rub(c['daily_budget'])} в день" if c["daily_budget"] else "без лимита"
+
+    def render_ads_types() -> list[ft.Control]:
+        pal = ads_palette()
+        cards = []
+        for key, title, description in ADS_TYPES:
+            if key == "cpc":
+                footer = ft.Button("Открыть кампании", bgcolor=PRIMARY, color="white", on_click=lambda _e: ads_go("list"))
+            elif key == "promo":
+                footer = ft.TextButton("Открыть раздел «Акции»", on_click=lambda _e: open_section(actions))
+            else:
+                footer = ads_text("Скоро", 12, pal["muted"], ft.FontWeight.W_700)
+            enabled = key in ("cpc", "promo")
+            cards.append(ft.Container(
+                col={"md": 6, "xl": 4},
+                content=ads_box(
+                    ft.Column([ads_text(title, 16, weight=ft.FontWeight.W_800), ads_text(description, 12, pal["muted"]), footer], spacing=10),
+                    height=190, opacity=1 if enabled else 0.55,
+                    on_click=(lambda _e: ads_go("list")) if key == "cpc" else None,
+                    ink=key == "cpc",
+                ),
+            ))
+        return [*ads_header("Реклама", "Продвижение товаров. Пока программа работает с «Оплатой за клик»."),
+                ft.ResponsiveRow(cards, run_spacing=14, spacing=14)]
+
+    def render_ads_period_bar() -> ft.Control:
+        pal = ads_palette()
+        chips = []
+        for days in ADS_PERIOD_PRESETS:
+            selected = ads_nav["preset"] == days
+            chips.append(ft.Container(
+                padding=ft.Padding.symmetric(horizontal=14, vertical=8), border_radius=999,
+                bgcolor=semantic_surface("positive", dark=pal["dark"]) if selected else None,
+                border=ft.Border.all(2 if selected else 1, PRIMARY if selected else pal["border"]),
+                data="preserve_excel_fill", ink=True,
+                on_click=lambda _e, d=days: ads_set_period(d),
+                content=ads_text(f"{days} дней" if days != 31 else "31 день", 12, weight=ft.FontWeight.W_700),
+            ))
+        start, end = ads_nav["from"], ads_nav["to"]
+        if not ads_custom_from.value:
+            ads_custom_from.value, ads_custom_to.value = f"{start:%d.%m.%Y}", f"{end:%d.%m.%Y}"
+        return ads_box(ft.Row(
+            [
+                ads_text("Период:", 12, pal["muted"], ft.FontWeight.W_700), *chips,
+                ft.Container(width=12), ads_custom_from, ads_custom_to,
+                ft.TextButton("Показать свои даты", on_click=lambda _e: ads_set_period(None)),
+                ft.Container(width=12),
+                ads_text(f"Показано: {start:%d.%m.%Y} — {end:%d.%m.%Y}", 12, pal["muted"]),
+            ],
+            wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ), padding=12)
+
+    def render_ads_list() -> list[ft.Control]:
+        pal = ads_palette()
+        controls = [*ads_header("Оплата за клик", "Кампании, которые работают сейчас или работали в выбранном периоде. Нажмите на кампанию, чтобы подобрать ставки.",
+                                back=("Типы рекламы", lambda: ads_go("types"))),
+                    render_ads_period_bar()]
+        if ads_nav["list_busy"]:
+            controls.append(ads_box(ft.Row([ft.ProgressRing(width=22, height=22, stroke_width=2.4),
+                                            ads_text("Загружаю кампании и показатели за период…", 13, pal["muted"])], spacing=12)))
+        elif ads_nav["list_error"]:
+            controls.append(ads_box(ads_text(f"Не удалось загрузить кампании: {ads_nav['list_error']}", 13, pal["bad"])))
+        elif isinstance(ads_nav["list"], dict):
+            campaigns = ads_nav["list"]["campaigns"]
+            if not campaigns:
+                controls.append(ads_box(ads_text("За этот период кампаний с показами не было.", 13, pal["muted"])))
+            for c in campaigns:
+                controls.append(ads_box(
+                    ft.Column([
+                        ft.Row([ads_text(c["title"], 16, weight=ft.FontWeight.W_800), ads_status_badge(c), ft.Container(expand=True),
+                                ft.Icon(ft.Icons.CHEVRON_RIGHT, color=pal["muted"])],
+                               spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                        ads_text(f"Стратегия «{c['strategy']}» · бюджет {ads_budget_text(c)}" + (f" · с {c['from_date']}" if c["from_date"] else ""), 12, pal["muted"]),
+                        ft.Row(ads_campaign_metrics(c), wrap=True, spacing=8, run_spacing=8),
+                    ], spacing=8),
+                    ink=True, on_click=lambda _e, cid=c["id"]: ads_go("campaign", cid),
+                ))
+        return controls
+
+    def render_ads_campaign() -> list[ft.Control]:
+        pal = ads_palette()
+        campaign = ads_current_campaign()
+        back = ("Все кампании", lambda: ads_go("list"))
+        if campaign is None:
+            return [*ads_header("Кампания", "Кампания не найдена в выбранном периоде.", back=back)]
+        controls = [*ads_header(campaign["title"], f"Стратегия «{campaign['strategy']}» · бюджет {ads_budget_text(campaign)}", back=back),
+                    ads_box(ft.Column([
+                        ft.Row([ads_status_badge(campaign),
+                                ads_text(f"Показатели за {ads_nav['from']:%d.%m.%Y} — {ads_nav['to']:%d.%m.%Y}", 12, pal["muted"])], spacing=10),
+                        ft.Row(ads_campaign_metrics(campaign), wrap=True, spacing=8, run_spacing=8),
+                    ], spacing=10))]
+        if not campaign["running"]:
+            controls.append(ads_box(ads_text("Кампания сейчас не работает — подбор ставок доступен только для активных кампаний.", 13, pal["muted"])))
+            return controls
+        controls += [
+            card(
+                "Подбор ставок",
+                "Безубыточная ставка = конверсия клика в заказ × прибыль с продажи. Рекомендуем долю от неё и меняем ставку не больше чем на 25% за раз. "
+                "Убыточные товары предлагаем убрать из рекламы. В Ozon уходит только то, что вы отметите.",
+                [
+                    ft.Row([ads_share, ads_days], wrap=True),
+                    ft.Row([
+                        ft.Button("Подобрать ставки", bgcolor=PRIMARY, color="white", on_click=ads_build),
+                        ads_apply_button,
+                        ft.TextButton("Журнал изменений", on_click=lambda _e: open_ads_reports()),
+                    ], wrap=True),
+                ],
+                tone="#EAF0F5",
+            ),
+            ads_results,
+        ]
+        return controls
+
+    def render_ads_view(push_update: bool = True) -> None:
+        screen = ads_nav["screen"]
+        if screen == "types":
+            ads_view.controls = render_ads_types()
+        elif screen == "list":
+            ads_view.controls = render_ads_list()
+        else:
+            ads_view.controls = render_ads_campaign()
+        apply_control_theme(ads_view, current_dark["value"])
+        if push_update and page.controls and host.controls and host.controls[0] is ads_view:
+            page.update(ads_view)
+
+    # ---------------------------------------------------------------- Анализ органических продаж
+    analysis_state: dict[str, object] = {
+        "days": 28, "result": organic_load_last(ROOT) if organic_load_last else None,
+        "busy": False, "progress": "", "error": None, "started": False, "open": set(),
+    }
+    analysis_view = ft.Column(spacing=18, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+    ANALYSIS_STATUS = {"bad": "Проблема", "warn": "Внимание", "info": "Инфо", "ok": "В порядке"}
+
+    def analysis_colors() -> dict:
+        dark = current_dark["value"]
+        return {
+            "organic": "#3987e5" if dark else "#2a78d6",
+            "ads": "#d95926" if dark else "#eb6834",
+            "status": {"bad": "#FF9C8F" if dark else DANGER, "warn": "#E0A15F" if dark else ACCENT,
+                       "ok": "#70D4BC" if dark else PRIMARY, "info": "#B6C0BC" if dark else MUTED},
+        }
+
+    def analysis_run(_e=None) -> None:
+        if organic_run_analysis is None:
+            toast(f"Модуль анализа недоступен: {ORGANIC_IMPORT_ERROR or 'ошибка импорта'}", True)
+            return
+        if analysis_state["busy"]:
+            return
+        analysis_state.update(busy=True, error=None, progress="Готовлю анализ…", started=True)
+        set_status("Анализ", "Собираю данные по продажам, рекламе, ценам и карточкам…", ACCENT, busy=True, cancellable=False)
+        render_analysis_view()
+        days = int(analysis_state["days"])
+
+        def progress(message: str) -> None:
+            analysis_state["progress"] = message
+            ui_queue.put(("call", render_analysis_view))
+
+        def worker() -> None:
+            try:
+                analysis_state["result"] = organic_run_analysis(ROOT, days=days, progress=progress)
+                products = analysis_state["result"]["products"]
+                problems = sum(1 for p in products if p["main_status"] in ("bad", "warn"))
+                set_status("Анализ", f"Готово: товаров {len(products)}, с проблемами {problems}.", PRIMARY, busy=False)
+            except Exception as exc:
+                analysis_state["error"] = str(exc)
+                set_status("Анализ", f"Не удалось выполнить анализ: {exc}", DANGER, busy=False)
+            finally:
+                analysis_state["busy"] = False
+            ui_queue.put(("call", render_analysis_view))
+
+        page.run_thread(worker)
+
+    def analysis_set_days(days: int) -> None:
+        if analysis_state["busy"] or analysis_state["days"] == days:
+            return
+        analysis_state["days"] = days
+        analysis_run()
+
+    def analysis_delta(current: float, previous: float) -> str:
+        if not previous:
+            return "новые продажи" if current else "без изменений"
+        return f"{(current - previous) / previous * 100:+.0f}% к прошлому периоду".replace(".", ",")
+
+    def analysis_funnel(title: str, stages: list[tuple[str, float]], color: str, note: str) -> ft.Control:
+        """Воронка: ширина полосы — логарифм значения (иначе заказы не видны рядом с тысячами показов)."""
+        import math
+        pal = ads_palette()
+        top = max((math.log10(v + 1) for _, v in stages), default=1) or 1
+        rows: list[ft.Control] = [ads_text(title, 14, weight=ft.FontWeight.W_800), ads_text(note, 11, pal["muted"])]
+        previous = None
+        for label, value in stages:
+            share = max(0.06, math.log10(value + 1) / top)
+            conversion = f"{value / previous * 100:.1f}% от предыдущего шага".replace(".", ",") if previous else ""
+            rows.append(ft.Row(
+                [
+                    ft.Container(width=150, content=ads_text(label, 12, pal["muted"])),
+                    ft.Row([ft.Container(expand=int((1 - share) * 500)), ft.Container(expand=int(share * 1000), height=26, border_radius=6, bgcolor=color, data="preserve_excel_fill"),
+                            ft.Container(expand=int((1 - share) * 500))], expand=True, spacing=0),
+                    ft.Container(width=110, content=ads_text(_format_number(value), 13, weight=ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT)),
+                    ft.Container(width=190, content=ads_text(conversion, 11, pal["muted"])),
+                ],
+                spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ))
+            previous = value
+        return ads_box(ft.Column(rows, spacing=8))
+
+    def analysis_weekly_chart(weeks: list[dict]) -> ft.Control:
+        pal, colors = ads_palette(), analysis_colors()
+        top = max((w["total"] for w in weeks), default=1) or 1
+        bars = []
+        for w in weeks:
+            ads_part = min(w["ads"], w["total"])
+            organic_part = max(0.0, w["total"] - ads_part)
+            week = datetime.strptime(w["week"], "%Y-%m-%d").date()
+            bars.append(ft.Container(
+                expand=1, tooltip=f"Неделя с {week:%d.%m}: всего {w['total']:.0f}, органика {organic_part:.0f}, реклама {ads_part:.0f}",
+                content=ft.Column(
+                    [
+                        ads_text(f"{w['total']:.0f}", 10, pal["muted"]),
+                        ft.Container(height=ads_part / top * 150, bgcolor=colors["ads"], border_radius=ft.BorderRadius.only(top_left=4, top_right=4), data="preserve_excel_fill"),
+                        ft.Container(height=organic_part / top * 150, bgcolor=colors["organic"], data="preserve_excel_fill"),
+                        ads_text(f"{week:%d.%m}", 9, pal["muted"]),
+                    ],
+                    spacing=2, alignment=ft.MainAxisAlignment.END, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                ),
+            ))
+        legend = ft.Row([
+            ft.Row([ft.Container(width=10, height=10, border_radius=3, bgcolor=colors["organic"], data="preserve_excel_fill"), ads_text("органика", 11, pal["muted"])], spacing=6, tight=True),
+            ft.Row([ft.Container(width=10, height=10, border_radius=3, bgcolor=colors["ads"], data="preserve_excel_fill"), ads_text("реклама", 11, pal["muted"])], spacing=6, tight=True),
+        ], spacing=16)
+        return ads_box(ft.Column([
+            ads_text("Заказы по неделям", 14, weight=ft.FontWeight.W_800),
+            ads_text("Органика = все заказы − заказы, которые Ozon приписал рекламе. Наведите на столбец, чтобы увидеть цифры.", 11, pal["muted"]),
+            legend,
+            ft.Container(height=200, content=ft.Row(bars, spacing=4, vertical_alignment=ft.CrossAxisAlignment.END)),
+        ], spacing=8))
+
+    def analysis_product_row(p: dict) -> ft.Control:
+        pal, colors = ads_palette(), analysis_colors()
+        status_color = colors["status"][p["main_status"]]
+        is_open = p["offer_id"] in analysis_state["open"]
+        details = ft.Container(visible=is_open, padding=ft.Padding.only(left=12, top=8, right=8, bottom=4))
+        step_icons = {"ok": ft.Icons.CHECK_CIRCLE_OUTLINE, "warn": ft.Icons.WARNING_AMBER_ROUNDED, "bad": ft.Icons.ERROR_OUTLINE, "info": ft.Icons.INFO_OUTLINE}
+
+        def build_details() -> list[ft.Control]:
+            lines: list[ft.Control] = []
+            for step in p["steps"]:
+                lines.append(ft.Row([
+                    ft.Icon(step_icons[step["status"]], size=16, color=colors["status"][step["status"]]),
+                    ft.Column([ads_text(step["name"], 12, weight=ft.FontWeight.W_700), ads_text(step["text"], 12)], spacing=1, expand=True),
+                ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START))
+            ad = p.get("ads") or {}
+            if ad.get("views"):
+                lines.append(analysis_funnel("Воронка товара по рекламному трафику",
+                                             [("Показы", ad["views"]), ("Клики", ad["clicks"]), ("В корзину", ad["to_cart"]), ("Заказы", ad["orders"])],
+                                             colors["ads"], "Те же покупатели приходят и из поиска: слабый шаг здесь — слабый и в органике."))
+            if p.get("events"):
+                lines.append(ft.Column([ads_text("Что менялось (по снимкам программы)", 12, weight=ft.FontWeight.W_700),
+                                        *[ads_text(f"• {e}", 12) for e in p["events"]]], spacing=2))
+            if p.get("advice"):
+                lines.append(ft.Column([ads_text("Рекомендации", 12, colors["status"]["warn"], ft.FontWeight.W_700),
+                                        *[ads_text(f"→ {a}", 12) for a in p["advice"]]], spacing=3))
+            return lines
+
+        if is_open:
+            details.content = ft.Column(build_details(), spacing=8)
+        button = ft.TextButton("Скрыть" if is_open else "Подробнее")
+
+        def toggle(_e) -> None:
+            if p["offer_id"] in analysis_state["open"]:
+                analysis_state["open"].discard(p["offer_id"])
+                details.visible = False
+            else:
+                analysis_state["open"].add(p["offer_id"])
+                details.content = ft.Column(build_details(), spacing=8)
+                apply_control_theme(details, current_dark["value"])
+                details.visible = True
+            button.content = "Скрыть" if details.visible else "Подробнее"
+            page.update(details, button)
+
+        button.on_click = toggle
+        organic_text = f"{p['organic']:.0f} ({p['organic_prev']:.0f})"
+        return ft.Container(
+            padding=ft.Padding.symmetric(vertical=8), border=ft.Border.only(top=ft.BorderSide(1, pal["border"])), data="preserve_excel_fill",
+            content=ft.Column([
+                ft.Row([
+                    ft.Container(width=90, content=ads_text(str(p["offer_id"]), 13, weight=ft.FontWeight.W_700)),
+                    ft.Container(width=110, content=ads_text(f"{p['orders']:.0f} ({p['orders_prev']:.0f})", 12, text_align=ft.TextAlign.RIGHT)),
+                    ft.Container(width=120, content=ads_text(organic_text, 12, text_align=ft.TextAlign.RIGHT)),
+                    ft.Container(width=80, content=ads_text(f"{p['ad_orders']:.0f}", 12, text_align=ft.TextAlign.RIGHT)),
+                    ft.Container(width=16),
+                    ft.Container(
+                        padding=ft.Padding.symmetric(horizontal=10, vertical=3), border_radius=999, border=ft.Border.all(1, status_color), data="preserve_excel_fill",
+                        content=ads_text(f"{ANALYSIS_STATUS[p['main_status']]}: {p['main_problem']}" if p["main_problem"] else "В порядке", 11, status_color, ft.FontWeight.W_700),
+                    ),
+                    ft.Container(expand=True, content=ads_text((p["advice"] or [""])[0], 11, pal["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)),
+                    button,
+                ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                details,
+            ], spacing=2),
+        )
+
+    def render_analysis_view(push_update: bool = True) -> None:
+        pal, colors = ads_palette(), analysis_colors()
+        controls: list[ft.Control] = [
+            ft.Text("Анализ органических продаж", size=26, weight=ft.FontWeight.W_800, color=TEXT),
+            ft.Text("Почему товары продаются или не продаются без рекламы: наличие и доставка, цена, карточка, воронка, поиск.", size=13, color=MUTED),
+        ]
+        chips = []
+        for days in (7, 14, 28, 56):
+            selected = analysis_state["days"] == days
+            chips.append(ft.Container(
+                padding=ft.Padding.symmetric(horizontal=14, vertical=8), border_radius=999, ink=True, data="preserve_excel_fill",
+                bgcolor=semantic_surface("positive", dark=pal["dark"]) if selected else None,
+                border=ft.Border.all(2 if selected else 1, PRIMARY if selected else pal["border"]),
+                on_click=lambda _e, d=days: analysis_set_days(d),
+                content=ads_text(f"{days} дней", 12, weight=ft.FontWeight.W_700),
+            ))
+        controls.append(ads_box(ft.Row([
+            ads_text("Период:", 12, pal["muted"], ft.FontWeight.W_700), *chips,
+            ft.Button("Обновить анализ", bgcolor=PRIMARY, color="white", on_click=analysis_run, disabled=bool(analysis_state["busy"])),
+            ads_text("Сравниваем с таким же предыдущим периодом. 28 дней = 4 полные недели — так сравнивают аналитики маркетплейсов.", 11, pal["muted"]),
+        ], wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER), padding=12))
+
+        if analysis_state["busy"]:
+            controls.append(ads_box(ft.Row([ft.ProgressRing(width=22, height=22, stroke_width=2.4),
+                                            ads_text(str(analysis_state["progress"]), 13, pal["muted"])], spacing=12)))
+        if analysis_state["error"]:
+            controls.append(ads_box(ads_text(f"Не удалось выполнить анализ: {analysis_state['error']}", 13, colors["status"]["bad"])))
+
+        result = analysis_state["result"]
+        if not isinstance(result, dict):
+            if not analysis_state["busy"]:
+                controls.append(ads_box(ads_text("Нажмите «Обновить анализ» — займёт 1–3 минуты.", 13, pal["muted"])))
+            analysis_view.controls = controls
+            apply_control_theme(analysis_view, current_dark["value"])
+            if push_update and page.controls and host.controls and host.controls[0] is analysis_view:
+                page.update(analysis_view)
+            return
+
+        periods = result["periods"]
+        fmt = lambda value: datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m")
+        end = (datetime.strptime(periods["current"][1], "%Y-%m-%d") - timedelta(days=1)).strftime("%d.%m")
+        prev_end = (datetime.strptime(periods["previous"][1], "%Y-%m-%d") - timedelta(days=1)).strftime("%d.%m")
+        controls.append(ads_text(
+            f"Анализ от {result['created'][:16].replace('T', ' ')} · {fmt(periods['current'][0])}–{end} против {fmt(periods['previous'][0])}–{prev_end}", 12, pal["muted"]))
+        source_chips = []
+        for source in result["sources"]:
+            color = colors["status"].get(source["status"], pal["muted"])
+            source_chips.append(ft.Container(
+                padding=ft.Padding.symmetric(horizontal=10, vertical=4), border_radius=999, border=ft.Border.all(1, color), data="preserve_excel_fill",
+                tooltip=source["text"], content=ads_text(source["name"], 11, color, ft.FontWeight.W_700)))
+        controls.append(ft.Row([ads_text("Источники:", 11, pal["muted"]), *source_chips], wrap=True, spacing=6))
+
+        store = result["store"]
+        season = store.get("season_change")
+        season_text = f"по сезону год назад {season * 100:+.0f}%".replace(".", ",") if season is not None else "сезон не определён"
+        share = store["organic"] / store["orders"] if store["orders"] else None
+        controls.append(ft.ResponsiveRow([
+            hero_metric("Заказов всего", f"{store['orders']:.0f}", analysis_delta(store["orders"], store["orders_prev"]),
+                        semantic_surface("neutral_soft", dark=pal["dark"]), PRIMARY, width=260, col=3),
+            hero_metric("Органические", f"{store['organic']:.0f}", f"{analysis_delta(store['organic'], store['organic_prev'])}; {season_text}",
+                        semantic_surface("neutral_soft", dark=pal["dark"]), colors["organic"], width=260, col=3),
+            hero_metric("С рекламы", f"{store['ad_orders']:.0f}", analysis_delta(store["ad_orders"], store["ad_orders_prev"]),
+                        semantic_surface("neutral_soft", dark=pal["dark"]), colors["ads"], width=260, col=3),
+            hero_metric("Доля органики", f"{share * 100:.0f}%" if share is not None else "—", "чем выше, тем меньше зависимость от рекламы",
+                        semantic_surface("neutral_soft", dark=pal["dark"]), colors["organic"], width=260, col=3),
+        ], run_spacing=14, spacing=14))
+
+        funnels = []
+        if store.get("search_funnel"):
+            sf = store["search_funnel"]
+            funnels.append(analysis_funnel("Поиск: от запроса до заказа",
+                                           [("Искали", sf["searched"]), ("Увидели товар", sf["viewed"]), ("Заказали", sf["ordered"])],
+                                           colors["organic"], "Данные Premium: сколько покупателей искали по запросам с вашими товарами, увидели их и заказали."))
+        af = store["ad_funnel"]
+        if af.get("views"):
+            funnels.append(analysis_funnel("Воронка карточек по рекламному трафику",
+                                           [("Показы", af["views"]), ("Клики", af["clicks"]), ("В корзину", af["to_cart"]), ("Заказы", af["orders"])],
+                                           colors["ads"], "Поисковую воронку Ozon без Premium не отдаёт, поэтому карточки оцениваем по рекламным покупателям — карточка у них та же."))
+        if not store.get("search_funnel"):
+            funnels.append(ads_box(ads_text("Поисковая воронка (запросы → просмотры → заказы) и позиции появятся здесь автоматически, "
+                                            "когда будет подключена подписка Premium.", 12, pal["muted"])))
+        controls.extend(funnels)
+        if result.get("weeks"):
+            controls.append(analysis_weekly_chart(result["weeks"]))
+
+        products = result["products"]
+        top = [p for p in products if p["advice"] and p["main_status"] in ("bad", "warn")][:6]
+        if top:
+            controls.append(ads_box(ft.Column(
+                [ads_text("Что сделать в первую очередь", 14, weight=ft.FontWeight.W_800),
+                 *[ft.Row([ft.Container(width=70, content=ads_text(str(p["offer_id"]), 12, weight=ft.FontWeight.W_700)),
+                           ads_text(p["advice"][0], 12, expand=True)], vertical_alignment=ft.CrossAxisAlignment.START) for p in top]],
+                spacing=8)))
+        header = ft.Row([
+            ft.Container(width=90, content=ads_text("Артикул", 11, pal["muted"], ft.FontWeight.W_700)),
+            ft.Container(width=110, content=ads_text("Заказы (было)", 11, pal["muted"], ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT)),
+            ft.Container(width=120, content=ads_text("Органика (было)", 11, pal["muted"], ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT)),
+            ft.Container(width=80, content=ads_text("Реклама", 11, pal["muted"], ft.FontWeight.W_700, text_align=ft.TextAlign.RIGHT)),
+            ft.Container(width=16),
+            ads_text("Главная проблема и первая рекомендация", 11, pal["muted"], ft.FontWeight.W_700),
+        ], spacing=8)
+        controls.append(ads_box(ft.Column(
+            [ads_text(f"Товары — {len(products)}, по важности", 14, weight=ft.FontWeight.W_800), header, *[analysis_product_row(p) for p in products]],
+            spacing=4)))
+        analysis_view.controls = controls
+        apply_control_theme(analysis_view, current_dark["value"])
+        if push_update and page.controls and host.controls and host.controls[0] is analysis_view:
+            page.update(analysis_view)
+
+    # ---------------------------------------------------------------- Акции: календарь
+    calendar_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False, "open": set(), "offset": 0}
+    CALENDAR_PAST_DAYS, CALENDAR_DAYS = 3, 35
+    MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+    WEEKDAYS_RU = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+    def calendar_load(_e=None) -> None:
+        if load_actions_calendar is None:
+            toast(f"Модуль акций недоступен: {PRICING_IMPORT_ERROR or 'ошибка импорта'}", True)
+            return
+        if calendar_state["busy"]:
+            return
+        calendar_state.update(busy=True, error=None, started=True)
+        render_actions_calendar()
+
+        def worker() -> None:
+            try:
+                calendar_state["data"] = load_actions_calendar(ROOT)
+            except Exception as exc:
+                calendar_state["error"] = str(exc)
+            finally:
+                calendar_state["busy"] = False
+            ui_queue.put(("call", render_actions_calendar))
+
+        page.run_thread(worker)
+
+    def calendar_boost_text(action: dict) -> str:
+        boosts = [p["boost"] for p in action["participants"] if p.get("boost") is not None]
+        if action.get("fixed_boost") is not None:
+            return f"буст {action['fixed_boost']:g}%"
+        if boosts:
+            low, high = min(boosts), max(boosts)
+            return f"буст {low:g}%" if low == high else f"буст {low:g}–{high:g}%"
+        return "буст по скидке"
+
+    def calendar_shift(days: int | None) -> None:
+        """Листание календаря: ±неделя или возврат к сегодняшнему дню (None)."""
+        calendar_state["offset"] = 0 if days is None else int(calendar_state.get("offset") or 0) + days
+        render_actions_calendar()
+
+    def render_actions_calendar(push_update: bool = True) -> None:
+        pal = ads_palette()
+        dark = pal["dark"]
+        bar_color = "#3987e5" if dark else "#2a78d6"
+        today_color = "#FF9C8F" if dark else DANGER
+        warn = "#E0A15F" if dark else ACCENT
+        grid_line = "#2F363B" if dark else "#ECEEF3"
+        week_line = "#46505A" if dark else "#D3D8E2"
+        weekend_bg = "#252B30" if dark else "#F4F5F8"
+        today_bg = "#3A2D30" if dark else "#FDEDEA"
+        label_width = 260
+        offset = int(calendar_state.get("offset") or 0)
+        today = date.today()
+        start = today - timedelta(days=CALENDAR_PAST_DAYS) + timedelta(days=offset)
+        days = [start + timedelta(days=i) for i in range(CALENDAR_DAYS)]
+        end = days[-1]
+
+        nav = ft.Row([
+            ft.IconButton(ft.Icons.CHEVRON_LEFT, tooltip="Неделя назад", on_click=lambda _e: calendar_shift(-7)),
+            ft.TextButton("Сегодня", on_click=lambda _e: calendar_shift(None), disabled=offset == 0),
+            ft.IconButton(ft.Icons.CHEVRON_RIGHT, tooltip="Неделя вперёд", on_click=lambda _e: calendar_shift(7)),
+            ads_text(f"{start:%d.%m} — {end:%d.%m.%Y}", 12, pal["muted"]),
+        ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        controls: list[ft.Control] = [ft.Row([
+            ads_text("Календарь акций", 16, weight=ft.FontWeight.W_800),
+            ft.TextButton("Обновить", icon=ft.Icons.REFRESH, on_click=calendar_load, disabled=bool(calendar_state["busy"])),
+            ft.Container(expand=True),
+            nav,
+        ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)]
+        data = calendar_state["data"]
+        if calendar_state["busy"] and not data:
+            controls.append(ft.Row([ft.ProgressRing(width=20, height=20, stroke_width=2.4), ads_text("Загружаю акции и участников…", 13, pal["muted"])], spacing=10))
+        if calendar_state["error"]:
+            controls.append(ads_text(f"Не удалось загрузить акции: {calendar_state['error']}", 13, pal["bad"]))
+
+        def day_border(day: date) -> ft.Border:
+            return ft.Border.only(left=ft.BorderSide(1, week_line if day.weekday() == 0 else grid_line))
+
+        def day_bg(day: date) -> str | None:
+            if day == today:
+                return today_bg
+            return weekend_bg if day.weekday() >= 5 else None
+
+        if isinstance(data, dict):
+            # Шапка: месяцы и дни
+            months, cursor = [], 0
+            while cursor < len(days):
+                month_start = days[cursor]
+                span = sum(1 for d in days[cursor:] if (d.year, d.month) == (month_start.year, month_start.month))
+                months.append(ft.Container(expand=span, padding=ft.Padding.only(left=4), border=day_border(month_start),
+                                           data="preserve_excel_fill",
+                                           content=ads_text(f"{MONTHS_RU[month_start.month - 1]} {month_start.year}", 11, pal["muted"], ft.FontWeight.W_700,
+                                                            max_lines=1, overflow=ft.TextOverflow.CLIP)))
+                cursor += span
+            day_cells = []
+            for day in days:
+                is_today = day == today
+                number = ft.Container(
+                    width=22, height=22, border_radius=11, alignment=ft.Alignment(0, 0), data="preserve_excel_fill",
+                    bgcolor=today_color if is_today else None,
+                    content=ads_text(str(day.day), 11, "#FFFFFF" if is_today else (pal["muted"] if day.weekday() >= 5 else pal["ink"]),
+                                     ft.FontWeight.W_800 if is_today else ft.FontWeight.W_600),
+                )
+                day_cells.append(ft.Container(
+                    expand=1, bgcolor=day_bg(day), border=day_border(day), padding=ft.Padding.symmetric(vertical=3), data="preserve_excel_fill",
+                    content=ft.Column([ads_text(WEEKDAYS_RU[day.weekday()], 9, pal["muted"]), number],
+                                      spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
+                ))
+            controls.append(ft.Row([ft.Container(width=label_width), ft.Column([ft.Row(months, spacing=0), ft.Row(day_cells, spacing=0)], spacing=2, expand=True),
+                                    ft.Container(width=110)], spacing=12))
+
+            shown = 0
+            for action in data["actions"]:
+                if not action.get("start") or not action.get("end"):
+                    continue
+                first, last = date.fromisoformat(action["start"]), date.fromisoformat(action["end"])
+                if last < start or first > end:
+                    continue
+                shown += 1
+                participating = action["participating"]
+                cut_left, cut_right = first < start, last > end
+                bar_from, bar_to = max(first, start), min(last, end)
+                before = (bar_from - start).days
+                length = (bar_to - bar_from).days + 1
+                after = CALENDAR_DAYS - before - length
+                label = ("‹ " if cut_left else "") + f"{participating} тов. · {calendar_boost_text(action)}" + (" ›" if cut_right else "")
+                radius = ft.BorderRadius.only(top_left=0 if cut_left else 7, bottom_left=0 if cut_left else 7,
+                                             top_right=0 if cut_right else 7, bottom_right=0 if cut_right else 7)
+                bar = ft.Container(
+                    height=22, border_radius=radius, padding=ft.Padding.symmetric(horizontal=8), alignment=ft.Alignment(-1, 0),
+                    bgcolor=bar_color if participating else (pal["soft"]), border=None if participating else ft.Border.all(1, week_line),
+                    data="preserve_excel_fill",
+                    tooltip=f"{action['name']}\n{first:%d.%m.%Y} — {last:%d.%m.%Y}\nУчаствует {participating}, можно добавить ещё {action['can_add']}",
+                )
+                # Короткая полоса: подпись справа от неё, чтобы не обрезалась.
+                label_outside = length <= 6 and after >= 6
+                label_text = ads_text(label, 11, pal["ink"] if label_outside else ("#FFFFFF" if participating else pal["muted"]), ft.FontWeight.W_700,
+                                      max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+                if not label_outside:
+                    bar.content = label_text
+                bar_parts = ([ft.Container(expand=before)] if before else []) + [ft.Container(expand=length, content=bar)] + \
+                            ([ft.Container(expand=after, padding=ft.Padding.only(left=8), alignment=ft.Alignment(-1, 0),
+                                           content=label_text if label_outside else None)] if after else [])
+                auto_dates = {date.fromisoformat(d) for d in action.get("auto_add_dates") or []}
+                markers = [ft.Container(
+                    expand=1, alignment=ft.Alignment(0, 1),
+                    content=ft.Container(width=8, height=8, border_radius=4, bgcolor=warn, data="preserve_excel_fill",
+                                         tooltip=f"{day:%d.%m}: Ozon добавит товары сам") if day in auto_dates else None,
+                ) for day in days]
+                grid = ft.Row([ft.Container(expand=1, bgcolor=day_bg(day), border=day_border(day), data="preserve_excel_fill") for day in days], spacing=0)
+                timeline = ft.Stack([
+                    ft.Container(content=grid, left=0, right=0, top=0, bottom=0),
+                    ft.Container(content=ft.Row(bar_parts, spacing=0), left=0, right=0, top=5, height=22),
+                    ft.Container(content=ft.Row(markers, spacing=0), left=0, right=0, top=0, bottom=1),
+                ], height=38, expand=True)
+
+                is_open = action["id"] in calendar_state["open"]
+                upcoming = sorted(d for d in auto_dates if d >= today)
+                notes = [ads_text(f"{first:%d.%m} — {last:%d.%m.%Y} · можно ещё {action['can_add']}", 10, pal["muted"])]
+                if upcoming:
+                    notes.append(ads_text("● Ozon добавит сам: " + ", ".join(f"{d:%d.%m}" for d in upcoming), 10, warn))
+                details = ft.Container(visible=is_open, padding=ft.Padding.only(left=label_width + 12, top=6, bottom=6))
+
+                def build_details(a=action) -> ft.Control:
+                    if a.get("error"):
+                        return ads_text(a["error"], 12, pal["bad"])
+                    if not a["participants"]:
+                        return ads_text("Ваших товаров в акции нет.", 12, pal["muted"])
+                    chips = []
+                    for item in a["participants"]:
+                        boost = f" · буст {item['boost']:g}%" if item.get("boost") is not None else ""
+                        chips.append(ft.Container(
+                            padding=ft.Padding.symmetric(horizontal=10, vertical=5), border_radius=8, border=ft.Border.all(1, pal["border"]),
+                            data="preserve_excel_fill",
+                            content=ads_text(f"{item['offer_id']} · {item['action_price']:,.0f} ₽{boost}".replace(",", " "), 11),
+                        ))
+                    return ft.Row(chips, wrap=True, spacing=6, run_spacing=6)
+
+                if is_open:
+                    details.content = build_details()
+                toggle_button = ft.TextButton("Скрыть" if is_open else "Товары", disabled=not action["participants"] and not action.get("error"))
+
+                def toggle(_e, a=action, panel=details, button=toggle_button, builder=build_details) -> None:
+                    if a["id"] in calendar_state["open"]:
+                        calendar_state["open"].discard(a["id"])
+                        panel.visible = False
+                    else:
+                        calendar_state["open"].add(a["id"])
+                        panel.content = builder()
+                        apply_control_theme(panel, current_dark["value"])
+                        panel.visible = True
+                    button.content = "Скрыть" if panel.visible else "Товары"
+                    page.update(panel, button)
+
+                toggle_button.on_click = toggle
+                controls.append(ft.Column([
+                    ft.Row([
+                        ft.Container(width=label_width, content=ft.Column([
+                            ads_text(action["name"], 12, pal["bad"] if action.get("error") else None, ft.FontWeight.W_700,
+                                     max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                            *notes,
+                        ], spacing=1, tight=True)),
+                        timeline,
+                        ft.Container(width=110, content=toggle_button),
+                    ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    details,
+                ], spacing=0))
+            if not shown:
+                controls.append(ads_text("В эти дни акций нет — пролистайте назад или вперёд.", 12, pal["muted"]))
+            controls.append(ft.Row([
+                ft.Container(width=14, height=10, border_radius=3, bgcolor=bar_color, data="preserve_excel_fill"), ads_text("ваши товары участвуют", 11, pal["muted"]),
+                ft.Container(width=14, height=10, border_radius=3, bgcolor=pal["soft"], border=ft.Border.all(1, week_line), data="preserve_excel_fill"),
+                ads_text("не участвуют", 11, pal["muted"]),
+                ft.Container(width=8, height=8, border_radius=4, bgcolor=warn, data="preserve_excel_fill"), ads_text("автодобавление Ozon", 11, pal["muted"]),
+                ft.Container(width=14, height=10, border_radius=3, bgcolor=weekend_bg, border=ft.Border.all(1, grid_line), data="preserve_excel_fill"),
+                ads_text("выходные", 11, pal["muted"]),
+                ads_text(f"· обновлено {data['loaded'][11:16]}", 11, pal["muted"]),
+            ], spacing=8, wrap=True))
+        actions_calendar.content = ft.Column(controls, spacing=8)
+        actions_calendar.bgcolor = pal["surface"]
+        actions_calendar.border = ft.Border.all(1, pal["border"])
+        apply_control_theme(actions_calendar, current_dark["value"])
+        if push_update and page.controls and host.controls and host.controls[0] is actions:
+            page.update(actions_calendar)
+
+    # ---------------------------------------------------------------- Акции: автодобавление и учёт минимальной цены
+    auto_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False, "selected": set(), "filter": "all"}
+    AUTO_SOON_HOURS = 72
+    AUTO_ACTIONS = {
+        "auto_add_off": ("Отключить автодобавление",
+                         "Ozon перестанет сам добавлять эти товары в акции. Уже добавленные останутся — их убирайте в акциях. "
+                         "Срока у отключения нет; программа будет сверять его с Ozon и предупредит, если Ozon включит обратно."),
+        "auto_add_on": ("Включить автодобавление", "Ozon снова сможет сам добавлять эти товары в акции."),
+        "min_price_on": ("Учитывать минимальную цену",
+                         "Ozon не будет добавлять товары в акции ниже минимальной цены. Учёт работает до сброса таймера — "
+                         "дату окончания программа покажет после применения. Нужна заданная минимальная цена."),
+        "timer_update": ("Продлить таймер",
+                         "Подтверждаем Ozon, что минимальная цена актуальна: учёт минимальной цены продлится ещё на период. "
+                         "Цены не меняются, переносится только дата сброса."),
+    }
+
+    def auto_load(_e=None) -> None:
+        if auto_actions is None:
+            return
+        if auto_state["busy"]:
+            return
+        auto_state.update(busy=True, error=None, started=True)
+        render_auto_panel()
+
+        def worker() -> None:
+            try:
+                auto_state["data"] = auto_actions.load_state(ROOT)
+            except Exception as exc:
+                auto_state["error"] = str(exc)
+            finally:
+                auto_state["busy"] = False
+            ui_queue.put(("call", render_auto_panel))
+
+        page.run_thread(worker)
+
+    def auto_left_text(hours: float | None) -> str:
+        if hours is None:
+            return ""
+        if hours <= 0:
+            return "истёк"
+        days, rest = divmod(int(hours), 24)
+        return f"{days} д {rest} ч" if days else f"{rest} ч"
+
+    def auto_rows_filtered() -> list[dict]:
+        data = auto_state.get("data") or {}
+        rows = list(data.get("rows") or [])
+        mode = auto_state.get("filter")
+        if mode == "auto_add_on":
+            rows = [r for r in rows if r["auto_add"]]
+        elif mode == "soon":
+            rows = [r for r in rows if r["hours_left"] is not None and r["hours_left"] <= AUTO_SOON_HOURS]
+        elif mode == "min_off":
+            rows = [r for r in rows if not r["min_price_on"]]
+        return rows
+
+    def auto_set_filter(mode: str) -> None:
+        auto_state["filter"] = mode
+        render_auto_panel()
+
+    def auto_select(ids: set | None) -> None:
+        auto_state["selected"] = set(ids or ())
+        render_auto_panel()
+
+    def auto_confirm(action: str) -> None:
+        data = auto_state.get("data") or {}
+        chosen = [r for r in data.get("rows") or [] if r["product_id"] in auto_state["selected"]]
+        if not chosen:
+            toast("Отметьте товары в таблице.", True)
+            return
+        title, explanation = AUTO_ACTIONS[action]
+        dark = current_dark["value"]
+        articles = ", ".join(r["offer_id"] for r in chosen)
+        body = ft.Column([
+            ft.Text(explanation, size=13, color="#B6C0BC" if dark else MUTED),
+            ft.Text(f"Товары ({len(chosen)}): {articles}", size=13, color="#F3F4F6" if dark else TEXT),
+        ], spacing=10, tight=True)
+
+        def run(_e=None) -> None:
+            dialog.open = False
+            page.update(dialog)
+            if not job_lock.acquire(blocking=False):
+                toast("Дождитесь завершения текущей операции.", True)
+                return
+            set_status(title, "Отправляю изменение в Ozon и проверяю результат…", ACCENT, busy=True, cancellable=False)
+
+            def worker() -> None:
+                try:
+                    result = auto_actions.apply_change(ROOT, action, chosen)
+                except Exception as exc:
+                    result = {"ok": False, "message": f"Не удалось: {exc}", "failed": [], "state": None}
+                finally:
+                    job_lock.release()
+                message = str(result.get("message") or "")
+                append_log(f"{title}: {message}")
+                for entry in result.get("failed") or []:
+                    append_log(f"  ✖ {entry['offer_id']}: {entry['reason']}")
+                if result.get("state"):
+                    auto_state["data"] = {"loaded": datetime.now().isoformat(timespec="seconds"),
+                                          "rows": sorted(result["state"], key=lambda r: (len(r["offer_id"]), r["offer_id"]))}
+                auto_state["selected"] = set()
+                set_status(title, message, PRIMARY if result.get("ok") else DANGER, busy=False)
+                failed = result.get("failed") or []
+                toast(message + (" Причины — в журнале задач." if failed else ""), bool(failed) or not result.get("ok"))
+                ui_queue.put(("call", render_auto_panel))
+
+            page.run_thread(worker)
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"{title}?", size=18, weight=ft.FontWeight.W_800, color="#F3F4F6" if dark else TEXT),
+            bgcolor="#232A2F" if dark else "#FFFDF8",
+            content=ft.Container(width=620, content=body),
+            actions=[ft.TextButton("Отмена", on_click=lambda _e: (setattr(dialog, "open", False), page.update(dialog))),
+                     ft.Button(f"Отправить в Ozon ({len(chosen)})", bgcolor=PRIMARY, color="white", on_click=run)],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.overlay.append(dialog)
+        dialog.open = True
+        page.update(dialog)
+
+    def render_auto_panel(push_update: bool = True) -> None:
+        pal = dash_pal()
+        data = auto_state.get("data") or {}
+        rows_all = list(data.get("rows") or [])
+        selected = auto_state["selected"]
+        header = ft.Row([
+            dtext("Автодобавление в акции и минимальная цена", 16, weight=ft.FontWeight.W_800),
+            ft.TextButton("Обновить", icon=ft.Icons.REFRESH, on_click=auto_load, disabled=bool(auto_state["busy"])),
+        ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        controls: list[ft.Control] = [
+            header,
+            dtext("Автодобавление — Ozon сам ставит товар в акции. Учёт минимальной цены — Ozon не ставит товар в акцию ниже неё, "
+                  "но только до сброса таймера; «Продлить таймер» переносит сброс.", 12, pal["muted"]),
+        ]
+        if auto_actions is None:
+            controls.append(dtext("Модуль автоакций не загрузился.", 13, pal["bad"]))
+        if auto_state["busy"] and not rows_all:
+            controls.append(ft.Row([ft.ProgressRing(width=20, height=20, stroke_width=2.4), dtext("Загружаю состояние товаров…", 13, pal["muted"])], spacing=10))
+        if auto_state.get("error"):
+            controls.append(dtext(f"Не удалось загрузить: {auto_state['error']}", 13, pal["bad"]))
+        if rows_all:
+            soon = [r for r in rows_all if r["hours_left"] is not None and r["hours_left"] <= AUTO_SOON_HOURS]
+            reverted = [r for r in rows_all if r["reverted_by_ozon"]]
+            summary = [
+                f"автодобавление включено у {sum(1 for r in rows_all if r['auto_add'])} из {len(rows_all)}",
+                f"учёт минимальной цены — у {sum(1 for r in rows_all if r['min_price_on'])}",
+            ]
+            controls.append(dtext(" · ".join(summary), 13))
+            if soon:
+                first = min(soon, key=lambda r: r["hours_left"])
+                controls.append(dtext(f"⚠ У {len(soon)} товаров учёт минимальной цены сбросится в ближайшие 3 дня "
+                                      f"(первый — через {auto_left_text(first['hours_left'])}).", 13, pal["warn"], ft.FontWeight.W_600))
+            if reverted:
+                controls.append(dtext("⚠ Ozon сам включил обратно автодобавление: " + ", ".join(r["offer_id"] for r in reverted), 13, pal["bad"], ft.FontWeight.W_600))
+
+            def chip(label: str, active: bool, on_click) -> ft.Control:
+                return ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=12, vertical=6), border_radius=999, data="preserve_excel_fill",
+                    bgcolor=pal["accent"] if active else None, border=None if active else ft.Border.all(1, pal["border"]),
+                    on_click=on_click, content=dtext(label, 12, "#FFFFFF" if active else pal["ink"], ft.FontWeight.W_600))
+
+            mode = auto_state.get("filter")
+            visible = auto_rows_filtered()
+            controls.append(ft.Row([
+                chip("Все", mode == "all", lambda _e: auto_set_filter("all")),
+                chip("Автодобавление вкл.", mode == "auto_add_on", lambda _e: auto_set_filter("auto_add_on")),
+                chip("Сброс ≤ 3 дн.", mode == "soon", lambda _e: auto_set_filter("soon")),
+                chip("Учёт мин. цены выкл.", mode == "min_off", lambda _e: auto_set_filter("min_off")),
+                ft.Container(width=12),
+                ft.TextButton("Отметить все видимые", on_click=lambda _e: auto_select({r["product_id"] for r in visible})),
+                ft.TextButton("Снять отметки", on_click=lambda _e: auto_select(set()), disabled=not selected),
+            ], spacing=8, run_spacing=8, wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+            controls.append(ft.Row([
+                ft.Button(f"{AUTO_ACTIONS[key][0]}" + (f" ({len(selected)})" if selected else ""), bgcolor=color, color="white",
+                          disabled=not selected or bool(auto_state["busy"]), on_click=lambda _e, k=key: auto_confirm(k))
+                for key, color in (("auto_add_off", DANGER), ("auto_add_on", PRIMARY), ("min_price_on", PRIMARY), ("timer_update", ACCENT))
+            ], spacing=8, run_spacing=8, wrap=True))
+
+            def badge(on: bool | None, yes: str = "вкл", no: str = "выкл") -> ft.Control:
+                color = pal["good"] if on else pal["muted"]
+                return ft.Row([ft.Container(width=8, height=8, border_radius=4, bgcolor=color, data="preserve_excel_fill"),
+                               dtext(yes if on else (no if on is not None else "—"), 12, None if on else pal["muted"])], spacing=6, tight=True)
+
+            columns = [("", 1), ("Артикул", 2), ("Цена", 2), ("Мин. цена в Ozon", 2), ("Автодобавление", 3), ("Автоприменение", 3),
+                       ("Учёт мин. цены", 5), ("Заметка", 5)]
+
+            def cell(content: ft.Control, weight: int) -> ft.Control:
+                return ft.Container(expand=weight, alignment=ft.Alignment(-1, 0), content=content)
+
+            table: list[ft.Control] = [ft.Row([cell(dtext(name, 12, pal["muted"], ft.FontWeight.W_600), w) for name, w in columns], spacing=10)]
+            for row in visible:
+                def toggle(e: ft.ControlEvent, pid=row["product_id"]) -> None:
+                    if e.control.value:
+                        auto_state["selected"].add(pid)
+                    else:
+                        auto_state["selected"].discard(pid)
+                    render_auto_panel()
+
+                if row["min_price_on"] and row["expires_at"]:
+                    expires = datetime.fromisoformat(row["expires_at"]).astimezone()
+                    soon_flag = row["hours_left"] is not None and row["hours_left"] <= AUTO_SOON_HOURS
+                    timer = dtext(f"до {expires:%d.%m %H:%M} · осталось {auto_left_text(row['hours_left'])}", 12,
+                                  pal["warn"] if soon_flag else None, ft.FontWeight.W_600 if soon_flag else None)
+                else:
+                    timer = dtext("выкл", 12, pal["muted"])
+                notes = []
+                if row["reverted_by_ozon"]:
+                    notes.append(("Ozon включил автодобавление обратно", pal["bad"]))
+                elif row["auto_add_changed_at"] and row["auto_add"] is False:
+                    notes.append((f"отключено {row['auto_add_changed_at'][8:10]}.{row['auto_add_changed_at'][5:7]}", pal["muted"]))
+                if row["min_price_on"] and not row["min_price"]:
+                    notes.append(("мин. цена в Ozon не задана — учитывать нечего", pal["warn"]))
+                table.append(ft.Container(
+                    padding=ft.Padding.symmetric(vertical=4), data="preserve_excel_fill",
+                    border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])),
+                    content=ft.Row([
+                        cell(ft.Checkbox(value=row["product_id"] in selected, on_change=toggle), 1),
+                        cell(dtext(row["offer_id"], 13, weight=ft.FontWeight.W_700), 2),
+                        cell(dtext(_format_currency(row["price"]) if row["price"] else "—", 13), 2),
+                        cell(dtext(_format_currency(row["min_price"]) if row["min_price"] else "—", 13, None if row["min_price"] else pal["muted"]), 2),
+                        cell(badge(row["auto_add"]), 3),
+                        cell(badge(row["auto_action"]), 3),
+                        cell(timer, 5),
+                        cell(ft.Column([dtext(text, 12, color) for text, color in notes], spacing=0, tight=True) if notes else dtext("", 12), 5),
+                    ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ))
+            controls.append(ft.Column(table, spacing=0))
+            controls.append(dtext(f"Обновлено {str(data.get('loaded') or '')[11:16]}. Журнал изменений — actions history/auto_actions_log.jsonl.", 11, pal["muted"]))
+        auto_panel.content = ft.Column(controls, spacing=10)
+        auto_panel.bgcolor = pal["surface"]
+        auto_panel.border = ft.Border.all(1, pal["border"])
+        if push_update and page.controls and host.controls and host.controls[0] is actions:
+            page.update(auto_panel)
+
+    def launch_supply_plan() -> None:
+        lead, cover, level = (supply_lead.value or "").strip(), (supply_cover.value or "").strip(), (supply_level.value or "").strip().replace(",", ".")
+        error = valid_supply(lead, cover, level)
+        if error:
+            toast(error, True)
+            return
+        job(
+            "План поставки FBO",
+            [str(PYTHON), str(SCRIPTS / "fbo_supply_plan.py"), "--lead-days", lead, "--cover-days", cover, "--service-level", level],
+        )
 
     supply = ft.Column(
         [
             ft.Text("Поставки", size=26, weight=ft.FontWeight.W_800, color=TEXT),
-            ft.Text("FBO supply planning на базе ABC/XYZ и продаж за 90 дней.", size=13, color=MUTED),
+            ft.Text("Сколько штук каждого артикула везти на склады FBO и сколько держать на своём складе (FBS) — по спросу, сезонности и текущим остаткам.", size=13, color=MUTED),
             card(
-                "Расчёт поставки FBO",
-                "Автоматически использует последние 3 полных месяца и формирует Excel в stocks reports.",
+                "План поставки FBO",
+                "Прогноз по продажам того же периода год назад с поправкой на рост, разложенный по зонам складов. "
+                "Excel с расчётом и объяснением каждого шага сохраняется в stocks reports.",
                 [
+                    ft.Row([supply_lead, supply_cover, supply_level], wrap=True),
                     ft.Row(
                         [
-                            ft.Button("Рассчитать поставку", bgcolor=PRIMARY, color="white", on_click=lambda _e: job("Расчёт поставки FBO", [str(PYTHON), str(SCRIPTS / "fbo_supply_report.py")])),
+                            ft.Button("Рассчитать поставку", bgcolor=PRIMARY, color="white", on_click=lambda _e: launch_supply_plan()),
                             ft.TextButton("Открыть stocks reports", on_click=lambda _e: reveal_path(ROOT / "stocks reports", "stocks reports")),
                         ]
-                    )
+                    ),
                 ],
                 tone="#EAF0F5",
             ),
+            supply_results,
         ],
         spacing=18,
+    )
+
+    # ---------------------------------------------------------------- Поставки WB
+    wb_supply_results = ft.Column(spacing=16, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+
+    def latest_wb_supply_summary() -> dict | None:
+        folder = ROOT / "stocks reports"
+        files = sorted(folder.glob("Поставка WB *.json"), key=lambda path: path.stat().st_mtime) if folder.exists() else []
+        if not files:
+            return None
+        try:
+            return json.loads(files[-1].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def wb_supply_defaults() -> dict:
+        defaults = {"lead_days": 14, "cover_days": 30, "service_level": 0.9, "wb_fbw_min_monthly": 3}
+        try:
+            defaults.update(json.loads((ROOT / "wb_supply_settings.json").read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+        return defaults
+
+    wb_defaults = wb_supply_defaults()
+    wb_supply_lead = ft.TextField(label="Срок поставки, дней", value=str(wb_defaults["lead_days"]), width=190,
+                                  tooltip="От решения о поставке до продажи на складе WB: сборка, слот, дорога, приёмка")
+    wb_supply_cover = ft.TextField(label="Цикл, дней", value=str(wb_defaults["cover_days"]), width=150,
+                                   tooltip="На сколько дней продаж должен хватать запас")
+    wb_supply_level = ft.TextField(label="Уровень сервиса", value=f"{float(wb_defaults['service_level']):g}", width=170,
+                                   tooltip="Вероятность не уйти в ноль за цикл: 0.8 — меньше товара, 0.95 — больше")
+    wb_supply_min = ft.TextField(label="На склады WB от, шт./мес.", value=f"{float(wb_defaults['wb_fbw_min_monthly']):g}", width=210,
+                                 tooltip="Везти на склады WB только артикулы с прогнозом от стольких штук в месяц")
+
+    def launch_wb_supply_plan() -> None:
+        lead, cover = (wb_supply_lead.value or "").strip(), (wb_supply_cover.value or "").strip()
+        level = (wb_supply_level.value or "").strip().replace(",", ".")
+        minimum = (wb_supply_min.value or "").strip().replace(",", ".")
+        error = valid_supply(lead, cover, level)
+        try:
+            if float(minimum) <= 0:
+                raise ValueError
+        except ValueError:
+            error = error or "Порог для складов WB — положительное число штук в месяц, например 3."
+        if error:
+            toast(error, True)
+            return
+        job(WB_SUPPLY_TITLE, [str(PYTHON), str(SCRIPTS / "wb_supply_plan.py"), "--lead-days", lead, "--cover-days", cover,
+                              "--service-level", level, "--fbw-min-monthly", minimum])
+
+    def render_wb_supply_results(push_update: bool = True) -> None:
+        pal = dash_pal()
+        summary = latest_wb_supply_summary()
+        if not summary:
+            wb_supply_results.controls = [dpanel(ft.Column([
+                ft.Icon(ft.Icons.INVENTORY_2_OUTLINED, size=44, color=pal["muted"]),
+                dtext("Расчёта пока нет", 18, weight=ft.FontWeight.W_700),
+                dtext("Нажмите «Рассчитать для WB» — появятся запас своего склада, поставка на склады WB и сводка вместе с Ozon.", 13, pal["muted"]),
+            ], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True), padding=48, alignment=ft.Alignment(0, 0))]
+            if push_update and page.controls:
+                page.update(wb_supply_results)
+            return
+        settings = summary["settings"]
+        window_start, window_end = summary["window"]
+        last_day = (datetime.strptime(window_end, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        season = summary["season"]
+        fbw, fbs = summary["fbw"], summary["fbs"]
+        season_note = (f"сезон ×{season['factor']:.2f} по истории WB".replace(".", ",") if season["method"] == "season"
+                       else "истории мало — без сезонности")
+        bad, good = pal["bad"], pal["good"]
+        colors = {"wb_fbw": "#C08CFF" if pal["dark"] else "#8A3FD1"}
+
+        def table(columns: list[tuple[str, int, bool]], rows: list[list[ft.Control]]) -> ft.Control:
+            def cell(content: ft.Control, weight: int, right: bool) -> ft.Control:
+                return ft.Container(expand=weight, alignment=ft.Alignment(1 if right else -1, 0), content=content)
+            lines = [ft.Row([cell(dtext(name, 12, pal["muted"], ft.FontWeight.W_600), w, r) for name, w, r in columns], spacing=12)]
+            for values in rows:
+                lines.append(ft.Container(
+                    padding=ft.Padding.symmetric(vertical=8), data="preserve_excel_fill",
+                    border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])),
+                    content=ft.Row([cell(v, w, r) for v, (_n, w, r) in zip(values, columns)], spacing=12,
+                                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ))
+            return ft.Column(lines, spacing=0)
+
+        def num(value, color=None, weight=None) -> ft.Control:
+            return dtext("—" if not value else str(value), 13, color if value else pal["muted"], weight)
+
+        def money(value) -> ft.Control:
+            return dtext(_format_currency(value) if value else "—", 13, None if value else pal["muted"])
+
+        controls: list[ft.Control] = [
+            dtext(f"Расчёт от {supply_date(summary['created'], True)} · с {supply_date(summary['created'])} по {supply_date(last_day)} · "
+                  f"поставка на WB придёт ~{supply_date(summary['arrival'])} · срок {settings['lead_days']} дн., цикл {settings['cover_days']} дн., "
+                  f"уровень сервиса {settings['service_level']:.0%}", 12, pal["muted"]),
+            dash_stats_panel([
+                dash_stat("Прогноз WB за цикл", f"{summary['window_units']:.0f} шт.",
+                          f"{summary['recent_units']:.0f} заказов за 90 дн. · {season_note}"),
+                dash_stat("На склады WB", f"{fbw['ship']} шт.",
+                          f"{fbw['articles']} арт. · {_format_currency(fbw['cost'])}" if fbw["ship"] else "пока везти не нужно"),
+                dash_stat("Свой склад для WB", f"{fbs['need']} шт.", f"выставлено на WB {fbs['stock']} шт."),
+                dash_stat("Не хватает для WB", f"{fbs['shortage']} шт.",
+                          f"{_format_currency(fbs['cost'])} по себестоимости WB" if fbs["shortage"] else "остатка хватит", bad if fbs["shortage"] else good),
+            ]),
+        ]
+
+        # Свой склад для WB
+        idle = [row for row in fbs["rows"] if not row["need"]]
+        fbs_rows = [[
+            dtext(row["article"], 13, weight=ft.FontWeight.W_700), num(row["orders"]),
+            dtext(f"{row['demand']:.1f}".replace(".", ","), 13, pal["muted"]),
+            dtext(str(row["need"]), 13, weight=ft.FontWeight.W_700), num(row["stock"]),
+            num(row["shortage"], bad, ft.FontWeight.W_700), money(row["cost"]),
+        ] for row in fbs["rows"] if row["need"]]
+        controls.append(dpanel(ft.Column([
+            dtext(f"Свой склад для WB (FBS) — нужно {fbs['need']} шт., есть {fbs['stock']}, не хватает {fbs['shortage']}", 15, weight=ft.FontWeight.W_700),
+            dtext(f"Сейчас {summary['own_share']:.0%} заказов WB уходят со своего склада. Сюда входит спрос артикулов, которые на WB не возим, "
+                  "и спрос до прихода поставки сверх остатка на складах WB. «Есть» — остаток, выставленный на WB; остатки и поставки Ozon сюда не входят.",
+                  12, pal["muted"]),
+            table([("Артикул", 2, False), ("Заказов за 90 дн.", 2, True), ("Спрос на дни", 2, True), ("Нужно", 2, True),
+                   ("Есть", 2, True), ("Не хватает", 2, True), ("Себестоимость", 3, True)], fbs_rows),
+            *([dtext(f"Ещё {len(idle)} арт. без спроса на WB на эти дни, на складе по ним {sum(r['stock'] or 0 for r in idle)} шт.: "
+                     + ", ".join(r["article"] for r in idle), 12, pal["muted"])] if idle else []),
+        ], spacing=10), padding=ft.Padding.only(left=20, right=20, top=16, bottom=12)))
+
+        # Склады WB
+        min_monthly = settings.get("wb_fbw_min_monthly", 3)
+        if fbw["rows"]:
+            fbw_body: ft.Control = table(
+                [("Артикул", 2, False), ("В месяц", 2, True), ("На складах WB", 2, True), ("Возвраты в пути", 2, True),
+                 ("Цель", 2, True), ("К поставке", 2, True), ("Себестоимость", 3, True)],
+                [[dtext(row["article"], 13, weight=ft.FontWeight.W_700), dtext(f"{row['monthly']:.1f}".replace(".", ","), 13),
+                  num(row["stock"]), num(row["returns"]), num(row["target"]), num(row["ship"], None, ft.FontWeight.W_700), money(row["cost"])]
+                 for row in fbw["rows"]],
+            )
+        else:
+            fbw_body = dtext(f"Ни один артикул не продаётся на WB от {min_monthly:g} шт. в месяц — на склады WB пока везти не нужно, "
+                             f"заказы закрывает свой склад. Сейчас на складах WB {fbw['stock']} шт.", 13, pal["muted"])
+        controls.append(dpanel(ft.Column([
+            dtext(f"Склады WB (FBW) — к поставке {fbw['ship']} шт.", 15, weight=ft.FontWeight.W_700),
+            dtext("WB отдаёт остатки только общей суммой «Склад WB», поэтому считается общий объём без разбивки по складам. "
+                  f"Возим артикулы с прогнозом от {min_monthly:g} шт. в месяц.", 12, pal["muted"]),
+            fbw_body,
+        ], spacing=10), padding=ft.Padding.only(left=20, right=20, top=16, bottom=14)))
+
+        # Выкупы по месяцам
+        months = summary.get("monthly_sales") or []
+        while months and months[0]["units"] == 0:
+            months = months[1:]
+        top = max((m["units"] for m in months), default=1) or 1
+        bars = [ft.Container(
+            expand=1, tooltip=f"{m['month'][5:]}.{m['month'][:4]}: {m['units']} шт.",
+            content=ft.Column([
+                dtext(str(m["units"]), 10, pal["muted"]),
+                ft.Container(height=max(2, m["units"] / top * 120), border_radius=ft.BorderRadius.only(top_left=4, top_right=4),
+                             bgcolor=colors["wb_fbw"], data="preserve_excel_fill"),
+                dtext(f"{m['month'][5:]}.{m['month'][2:4]}", 9, pal["muted"]),
+            ], spacing=4, alignment=ft.MainAxisAlignment.END, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+        ) for m in months]
+        season_text = (f"Год назад в окне продаж выкупили {season['window_last_year']:.0f} шт., в базовые {season['base_days']} дн. — "
+                       f"{season['base_last_year']:.0f} шт.: коэффициент " + f"{season['factor']:.2f}".replace(".", ",") + "."
+                       if season["method"] == "season" else "Истории за прошлый год мало — прогноз без сезонности.")
+        controls.append(dpanel(ft.Column([
+            dtext("Выкупы WB по месяцам", 15, weight=ft.FontWeight.W_700),
+            dtext(season_text, 12, pal["muted"]),
+            ft.Container(height=160, content=ft.Row(bars, spacing=4, vertical_alignment=ft.CrossAxisAlignment.END)),
+        ], spacing=10)))
+        wb_supply_results.controls = controls
+        if push_update and page.controls:
+            page.update(wb_supply_results)
+
+    wb_supply = ft.Column(
+        [
+            ft.Text("Wildberries", size=13, weight=ft.FontWeight.W_600, color=MUTED),
+            ft.Text("Поставки", size=26, weight=ft.FontWeight.W_800, color=TEXT),
+            ft.Text("Сколько держать на своём складе под WB и везти ли товар на склады WB. Считается только по данным WB — отдельно от Ozon.", size=13, color=MUTED),
+            card(
+                "План запасов WB",
+                "Свои настройки WB, заказы и остатки WB, себестоимость из wb_costs.xlsx. Excel с расчётом сохраняется в stocks reports.",
+                [ft.Row([wb_supply_lead, wb_supply_cover, wb_supply_level, wb_supply_min], wrap=True), ft.Row([
+                    ft.Button("Рассчитать для WB", bgcolor=PRIMARY, color="white", on_click=lambda _e: launch_wb_supply_plan()),
+                    ft.TextButton("Открыть stocks reports", on_click=lambda _e: reveal_path(ROOT / "stocks reports", "stocks reports")),
+                ])],
+                tone="#EAF0F5",
+            ),
+            wb_supply_results,
+        ],
+        spacing=18,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
     finance = ft.Column(
@@ -5280,10 +7699,10 @@ def main(page: ft.Page) -> None:
         spacing=18,
     )
 
-    views = [dash, ai_view, reports, pricing, actions, supply, finance, settings, file_view]
+    views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, supply, finance, settings, file_view]
     active_store = {"value": "ozon"}
     store_sections = {"ozon": 0, "wb": 0}
-    section_names = ["Бизнес-сводка", "AI-ассистент", "Отчёты", "Цены и скидки", "Акции", "Поставки", "Финансы", "Настройки", "Файлы"]
+    section_names = ["Бизнес-сводка", "AI-ассистент", "ABC/XYZ-анализ", "Цены и скидки", "Акции", "Реклама", "Анализ", "Поставки", "Финансы", "Настройки", "Файлы"]
 
     wb_dashboard = build_wb_dashboard(
         months=MONTHS, metric=metric, hero_metric=hero_metric, card=card,
@@ -5297,8 +7716,11 @@ def main(page: ft.Page) -> None:
     def wb_section(index):
         if index == 0:
             return wb_dashboard
-        if index == 7:
+        if views[index] is settings:
             return settings
+        if views[index] is supply:
+            render_wb_supply_results(push_update=False)
+            return wb_supply
         return ft.Column(
             [
                 ft.Text("Wildberries", size=13, weight=ft.FontWeight.W_600, color=MUTED),
@@ -5313,12 +7735,38 @@ def main(page: ft.Page) -> None:
 
     host = ft.Column([views[0]], expand=True, spacing=0, scroll=ft.ScrollMode.AUTO)
 
+    # Синхронизация цен при входе во вкладку «Цены и скидки» — не чаще раза в 5 минут.
+    PRICING_AUTO_SYNC_INTERVAL = 300
+    pricing_auto_sync = {"last": 0.0}
+
+    def auto_sync_pricing() -> None:
+        if time.monotonic() - pricing_auto_sync["last"] < PRICING_AUTO_SYNC_INTERVAL:
+            return
+        if job_lock.locked() or pricing_costs_dirty["value"]:
+            return  # идёт другая задача или в таблице несохранённые правки
+        pricing_auto_sync["last"] = time.monotonic()
+        job(PRICING_SYNC_TITLE, [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "refresh-pricing"])
+
+    def enter_pricing_tab() -> None:
+        """При входе во вкладку: сначала свежие заявки на скидку, затем синхронизация цен."""
+        if discount_dialog_state["busy"]:
+            auto_sync_pricing()
+            return
+        open_discount_requests_dialog(quiet=True, on_done=auto_sync_pricing)
+
     def show_store_section(selected_index: int) -> None:
         store_sections[active_store["value"]] = selected_index
         is_ozon = active_store["value"] == "ozon"
         host.controls = [views[selected_index] if is_ozon else wb_section(selected_index)]
+        if is_ozon and views[selected_index] is ads_view:
+            ads_nav["screen"] = "types"
+            render_ads_view(push_update=False)
+        if is_ozon and views[selected_index] is analysis_view:
+            render_analysis_view(push_update=False)
+        if is_ozon and views[selected_index] is actions:
+            render_actions_calendar(push_update=False)
+            render_auto_panel(push_update=False)
         is_ai_view = is_ozon and selected_index == 1
-        header.visible = is_ozon and not is_ai_view
         host.scroll = ft.ScrollMode.HIDDEN if is_ai_view else ft.ScrollMode.AUTO
         host_shell.padding = 0 if is_ai_view else ft.Padding.only(left=8, right=10, top=20, bottom=20)
         host_shell.bgcolor = ai_surface_tokens()["canvas"] if is_ai_view else ("#FBFCFF" if not current_dark["value"] else "#1E2328")
@@ -5336,6 +7784,20 @@ def main(page: ft.Page) -> None:
         page.title = f"{store_name} — OzonReportX"
         set_status("Раздел открыт", f"{store_name} · {section_names[selected_index]}", PRIMARY, busy=False)
         page.update()
+        if is_ozon and views[selected_index] is pricing:
+            enter_pricing_tab()
+        if is_ozon and views[selected_index] is actions and not calendar_state["started"]:
+            calendar_load()
+        if is_ozon and views[selected_index] is actions and not auto_state["started"]:
+            auto_load()
+        if is_ozon and views[selected_index] is analysis_view and not analysis_state["started"]:
+            # Первый заход в сессии: показываем прошлый результат и сразу считаем свежий.
+            analysis_run()
+
+    def open_section(view) -> None:
+        index = views.index(view)
+        rail.selected_index = index
+        show_store_section(index)
 
     def nav_change(e: ft.ControlEvent) -> None:
         show_store_section(e.control.selected_index)
@@ -5383,7 +7845,7 @@ def main(page: ft.Page) -> None:
             tooltip=f"Открыть магазин {title}",
         )
     rail_brand_card = ft.Container(
-        width=240,
+        width=216,
         padding=7,
         border_radius=22,
         bgcolor="#F7F7FA",
@@ -5395,7 +7857,7 @@ def main(page: ft.Page) -> None:
         selected_index=0,
         extended=True,
         min_width=92,
-        min_extended_width=228,
+        min_extended_width=240,
         group_alignment=-0.88,
         label_type=ft.NavigationRailLabelType.ALL,
         bgcolor=SURFACE,
@@ -5403,26 +7865,29 @@ def main(page: ft.Page) -> None:
         on_change=nav_change,
         leading=ft.Container(
             content=rail_brand_card,
-            padding=ft.Padding.only(bottom=18),
+            padding=ft.Padding.only(bottom=12),
         ),
         destinations=[
             ft.NavigationRailDestination(icon=ft.Icons.SPACE_DASHBOARD_OUTLINED, selected_icon=ft.Icons.SPACE_DASHBOARD, label="Бизнес-сводка"),
             ft.NavigationRailDestination(icon=ft.Icons.AUTO_AWESOME_OUTLINED, selected_icon=ft.Icons.AUTO_AWESOME, label="AI-ассистент"),
-            ft.NavigationRailDestination(icon=ft.Icons.INSERT_CHART_OUTLINED, selected_icon=ft.Icons.INSERT_CHART, label="Отчёты"),
+            ft.NavigationRailDestination(icon=ft.Icons.GRID_VIEW, selected_icon=ft.Icons.GRID_VIEW_ROUNDED, label="ABC/XYZ-анализ"),
             ft.NavigationRailDestination(icon=ft.Icons.LOCAL_OFFER_OUTLINED, selected_icon=ft.Icons.LOCAL_OFFER, label="Цены и скидки"),
             ft.NavigationRailDestination(icon=ft.Icons.LOCAL_ACTIVITY_OUTLINED, selected_icon=ft.Icons.LOCAL_ACTIVITY, label="Акции"),
-            ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2_OUTLINED, selected_icon=ft.Icons.INVENTORY_2, label="Supply"),
+            ft.NavigationRailDestination(icon=ft.Icons.CAMPAIGN_OUTLINED, selected_icon=ft.Icons.CAMPAIGN, label="Реклама"),
+            ft.NavigationRailDestination(icon=ft.Icons.INSIGHTS_OUTLINED, selected_icon=ft.Icons.INSIGHTS, label="Анализ"),
+            ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2_OUTLINED, selected_icon=ft.Icons.INVENTORY_2, label="Поставки"),
             ft.NavigationRailDestination(icon=ft.Icons.ACCOUNT_BALANCE_WALLET_OUTLINED, selected_icon=ft.Icons.ACCOUNT_BALANCE_WALLET, label="Finance"),
             ft.NavigationRailDestination(icon=ft.Icons.SETTINGS_OUTLINED, selected_icon=ft.Icons.SETTINGS, label="Settings"),
             ft.NavigationRailDestination(icon=ft.Icons.FOLDER_OPEN_OUTLINED, selected_icon=ft.Icons.FOLDER_OPEN, label="Files"),
         ],
     )
 
+    # NavigationRail не умеет прокручиваться сам: даём ему естественную высоту
+    # и прокручиваем оболочку, чтобы на низких экранах меню не выдавливало статус.
     rail_shell = ft.Container(
-        content=rail,
-        width=278,
-        height=780,
-        padding=18,
+        content=ft.Column([ft.Container(content=rail, height=680)], scroll=ft.ScrollMode.AUTO, spacing=0),
+        expand=True,
+        padding=12,
         bgcolor=SURFACE,
         border_radius=34,
         border=ft.Border.all(1, BORDER),
@@ -5442,6 +7907,7 @@ def main(page: ft.Page) -> None:
         border=ft.Border.all(1, "#ECECF1"),
         shadow=ft.BoxShadow(blur_radius=34, spread_radius=0, color="#12000000", offset=ft.Offset(0, 14)),
     )
+    cancel_row = ft.Row([cancel_button], alignment=ft.MainAxisAlignment.END, visible=False)
     status_shell = ft.Container(
         content=ft.Column(
             [
@@ -5449,26 +7915,21 @@ def main(page: ft.Page) -> None:
                     [
                         status_indicator,
                         state,
-                        ft.Container(expand=True),
                         spin,
                     ],
                     spacing=10,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
                 status_detail,
-                ft.Row(
-                    [cancel_button],
-                    alignment=ft.MainAxisAlignment.END,
-                ),
+                cancel_row,
             ],
             spacing=6,
         ),
-        padding=ft.Padding.symmetric(horizontal=11, vertical=8),
+        padding=ft.Padding.symmetric(horizontal=14, vertical=10),
         bgcolor=SURFACE,
         border_radius=16,
         border=ft.Border.all(1, BORDER),
         shadow=ft.BoxShadow(blur_radius=12, spread_radius=0, color="#0D000000", offset=ft.Offset(0, 4)),
-        width=264,
     )
     cancel_button.on_click = cancel_current_action
     def apply_theme(dark: bool) -> None:
@@ -5537,21 +7998,21 @@ def main(page: ft.Page) -> None:
         for root_control in page.controls:
             apply_control_theme(root_control, dark)
         ai_apply_chat_theme()
+        render_supply_results(push_update=False)
+        render_ads_results(push_update=False)
+        render_ads_view(push_update=False)
+        render_analysis_view(push_update=False)
+        render_actions_calendar(push_update=False)
+        render_dashboard(push_update=False)
+        render_abc_view(push_update=False)
+        render_wb_supply_results(push_update=False)
+        render_auto_panel(push_update=False)
         style_store_tabs()
-        set_status(state.value, status_detail.value, state.color if isinstance(state.color, str) else PRIMARY, busy=spin.visible)
+        set_status(state.value, status_detail.value, status_tone["value"], busy=spin.visible, cancellable=cancel_button.visible)
         page.update()
 
     theme_button.on_click = lambda _e: apply_theme(not theme_button.selected)
 
-    header = ft.Container(
-        content=ft.Row(
-            [
-                ft.Container(expand=True),
-            ],
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        ),
-        padding=ft.Padding.only(bottom=18),
-    )
     menu_bar_inner = ft.Container(
         content=ft.Row(
             [
@@ -5640,45 +8101,21 @@ def main(page: ft.Page) -> None:
         content=splash_card,
         visible=True,
     )
-    main_layout = ft.Column(
-        [
-            ft.Container(height=76),
-            header,
-            ft.Row(
-                [
-                    ft.Container(width=280),
-                    host_shell,
-                ],
-                expand=True,
-                vertical_alignment=ft.CrossAxisAlignment.START,
-            ),
-        ],
+    # Левая колонка в обычном потоке: меню сжимается/прокручивается,
+    # а статус задачи всегда остаётся видимым внизу.
+    sidebar = ft.Column(
+        [top_tools_shell, rail_shell, status_shell],
+        width=264,
+        spacing=12,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+    )
+    main_layout = ft.Row(
+        [sidebar, host_shell],
         expand=True,
+        spacing=16,
+        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
     )
     page.add(main_layout)
-    page.overlay.append(
-        ft.Container(
-            content=status_shell,
-            left=18,
-            bottom=24,
-            animate_position=200,
-        )
-    )
-    page.overlay.append(
-        ft.Container(
-            content=rail_shell,
-            left=24,
-            top=98,
-        )
-    )
-    page.overlay.append(
-        ft.Container(
-            content=top_tools_shell,
-            left=24,
-            top=18,
-            animate_position=200,
-        )
-    )
     page.overlay.append(splash_overlay)
     status_ui_ready["value"] = True
     set_status("Запуск", "Подготавливаем интерфейс и данные.", ACCENT, busy=True)
@@ -5690,6 +8127,11 @@ def main(page: ft.Page) -> None:
         refresh_dashboard()
         refresh_files()
         refresh_pricing_costs_preview()
+        render_supply_results(push_update=False)
+        render_ads_results(push_update=False)
+        render_ads_view(push_update=False)
+        render_analysis_view(push_update=False)
+        render_actions_calendar(push_update=False)
         splash_overlay.visible = False
         set_status("Готово", "Интерфейс готов к работе.", PRIMARY, busy=False)
         page.update()

@@ -293,7 +293,38 @@ def _accrual_money(value):
     return amount
 
 
-def get_transactions_by_posting(date_from, date_to, session: Optional[requests.Session] = None):
+# Начисления Ozon без привязки к отправлению (accrued_category = NON_ITEM): номер пустой или это номер
+# поставки/кампании. Коды сверены с отчётом о балансе (09.2026). Реклама и хранение уже вычитаются
+# из прибыли отдельно (Performance API и отчёт о балансе), поэтому здесь только показываются.
+ACCOUNT_CHARGE_NAMES = {
+    12: "Кросс-докинг",
+    77: "Обработка поставки: приёмка, бронирование места, излишки",
+    18: "Комиссия за ранний вывод средств",
+    20: "Гибкий график выплат",
+    41: "Оплата за клик (реклама)",
+    46: "Размещение товаров на складах Ozon",
+    50: "Бонусы продавца (рассылки)",
+    54: "Продвижение с оплатой за заказ",
+    75: "Трафареты (реклама)",
+}
+ACCOUNT_CHARGES_COUNTED_ELSEWHERE = {
+    41: "реклама — уже учтена в «Продвижение Ozon»",
+    75: "реклама — уже учтена в «Продвижение Ozon»",
+    46: "хранение — уже учтено в «Расход хранения FBO»",
+}
+ACCOUNT_CHARGES_SHEET = "Расходы вне заказов"
+
+
+def _is_account_charge(accrual: Dict[str, Any]) -> bool:
+    """Начисление не по отправлению: категория NON_ITEM и номер пустой или не номер отправления (без дефиса)."""
+    if accrual.get("accrued_category") != "NON_ITEM":
+        return False
+    number = accrual.get("unit_number")
+    return not number or "-" not in str(number)
+
+
+def get_transactions_by_posting(date_from, date_to, session: Optional[requests.Session] = None,
+                                account_charges: Optional[List[Dict[str, Any]]] = None):
     """Load daily accruals once, preserving the report's transaction field names.
 
     /v3/finance/transaction/list was retired on 2026-09-08. Daily accruals
@@ -302,7 +333,7 @@ def get_transactions_by_posting(date_from, date_to, session: Optional[requests.S
     """
     if session is None:
         with create_session() as owned_session:
-            return get_transactions_by_posting(date_from, date_to, owned_session)
+            return get_transactions_by_posting(date_from, date_to, owned_session, account_charges)
     day = isoparse(date_from).date()
     end = isoparse(date_to).date()
     if day > end:
@@ -326,6 +357,17 @@ def get_transactions_by_posting(date_from, date_to, session: Optional[requests.S
                     raise ValueError("Некорректный ответ начислений: ожидаются accruals и last_id.")
                 for accrual in data["accruals"]:
                     number = accrual.get("unit_number")
+                    if _is_account_charge(accrual):
+                        # Кросс-докинг, обработка поставки, ранний вывод и т.п. — расходы месяца, а не заказа.
+                        if account_charges is not None:
+                            fee = accrual.get("non_item_fee") or {}
+                            account_charges.append({
+                                "date": str(accrual.get("date") or date)[:10],
+                                "type_id": fee.get("type_id"),
+                                "unit_number": str(number or ""),
+                                "amount": _accrual_money(accrual["total_amount"]),
+                            })
+                        continue
                     if not number:
                         continue  # Account-wide charges have no posting to attach to.
                     if not isinstance(number, str):
@@ -446,7 +488,10 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
     # already clamps to "today", so this is a no-op when the report is generated soon after month-end.
     ACCRUAL_LOOKAHEAD_DAYS = 21
     accrual_date_to = (isoparse(date_to) + timedelta(days=ACCRUAL_LOOKAHEAD_DAYS)).isoformat()
-    transactions_by_posting = get_transactions_by_posting(date_from, accrual_date_to, session) if postings else {}
+    account_charges: List[Dict[str, Any]] = []
+    transactions_by_posting = (
+        get_transactions_by_posting(date_from, accrual_date_to, session, account_charges=account_charges) if postings else {}
+    )
 
     for idx, post in enumerate(postings, start=1):
         posting_number = post.get("posting_number", "")
@@ -561,7 +606,7 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
             status = "returned"
             amount_cell = amount
             sale_commission_cell = sale_commission
-            delivery_cost_cell = -amount + price + sale_commission
+            delivery_cost_cell = amount - price - sale_commission
             cost_price = 0.0
             profit_cell = amount
         elif status == "delivered" and not has_commission_data:
@@ -585,12 +630,12 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
         elif status == "delivered":
             amount_cell = amount
             sale_commission_cell = sale_commission
-            delivery_cost_cell = - amount + price + sale_commission
+            delivery_cost_cell = amount - price - sale_commission
             profit_cell = amount + cost_price
         elif status == "returned":
             amount_cell = amount
             sale_commission_cell = sale_commission
-            delivery_cost_cell = -amount + price + sale_commission
+            delivery_cost_cell = amount - price - sale_commission
             cost_price = 0.0
             profit_cell = amount
         else:
@@ -626,12 +671,51 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
     if "Артикул" in df.columns:
         df["Артикул"] = df["Артикул"].apply(_artikul_to_number)
     output_file = _safe_save_excel(df, output_file, sheet_name="Заказы")
+    month_from, month_to = str(date_from)[:10], str(date_to)[:10]
+    write_account_charges_sheet(output_file, [c for c in account_charges if month_from <= c["date"] <= month_to])
     print("\r✅ Обработка заказов: 100%")
     print(f"✅ Отчёт сохранён: {output_file}")
     return output_file
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
+
+
+def write_account_charges_sheet(filename: str, charges: List[Dict[str, Any]]) -> None:
+    """
+    Лист «Расходы вне заказов»: начисления Ozon за календарный месяц, не привязанные к отправлениям
+    (кросс-докинг, обработка поставки, ранний вывод средств…). Их вычитает calc_business_indicators.
+    """
+    if not os.path.exists(filename):
+        return
+    with ExitStack() as books:
+        wb = books.enter_context(closing(load_workbook(filename)))
+        if ACCOUNT_CHARGES_SHEET in wb.sheetnames:
+            wb.remove(wb[ACCOUNT_CHARGES_SHEET])
+        ws = wb.create_sheet(ACCOUNT_CHARGES_SHEET)
+        ws.append(["Дата", "Вид расхода", "Код Ozon", "Номер (поставки/кампании)", "Сумма", "В чистой прибыли"])
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for charge in sorted(charges, key=lambda c: (c["date"], str(c["type_id"]))):
+            type_id = charge["type_id"]
+            name = ACCOUNT_CHARGE_NAMES.get(type_id, f"Прочие услуги Ozon (код {type_id})")
+            counted = ACCOUNT_CHARGES_COUNTED_ELSEWHERE.get(type_id, "вычтено отдельной строкой")
+            ws.append([charge["date"], name, type_id, charge["unit_number"] or "—", float(charge["amount"]), counted])
+        for column, width in (("A", 12), ("B", 58), ("C", 10), ("D", 26), ("E", 12), ("F", 48)):
+            ws.column_dimensions[column].width = width
+        save_workbook_atomic(wb, filename)
+
+
+def read_account_charges(wb) -> Dict[str, float]:
+    """{вид расхода: сумма} по листу «Расходы вне заказов» — только то, что ещё не вычтено другими строками."""
+    if ACCOUNT_CHARGES_SHEET not in wb.sheetnames:
+        return {}
+    result: Dict[str, float] = {}
+    for row in wb[ACCOUNT_CHARGES_SHEET].iter_rows(min_row=2, values_only=True):
+        if not row or row[4] is None or row[2] in ACCOUNT_CHARGES_COUNTED_ELSEWHERE:
+            continue
+        result[str(row[1])] = result.get(str(row[1]), 0.0) + float(row[4])
+    return result
 
 def create_campaigns_sheet(filename: str, session: Optional[requests.Session] = None,
                            date_from: Optional[str] = None, date_to: Optional[str] = None):
@@ -813,11 +897,13 @@ def calc_business_indicators(
         wb = books.enter_context(closing(load_workbook(filename)))
         ws = wb["Заказы"] if "Заказы" in wb.sheetnames else wb.active
 
-        # Считаем Общую выручку, Чистую прибыль, Себестоимость
+        # Общая выручка — только проданное: доставленные заказы и возвраты (у возврата сумма продажи
+        # обнуляется или уходит в минус). Отмены, заказы в пути и ожидающие расчёта Ozon — не выручка.
         sales_revenue = 0
-        for cell in ws["F"][1:]:
-            if isinstance(cell.value, (int, float)):
-                sales_revenue += cell.value
+        for status_cell, price_cell in zip(ws["A"][1:], ws["F"][1:]):
+            status_text = str(status_cell.value or "").strip().lower()
+            if status_text in ("delivered", "returned") and isinstance(price_cell.value, (int, float)):
+                sales_revenue += price_cell.value
 
         net_profit = 0
         for cell in ws["K"][1:]:
@@ -879,14 +965,15 @@ def calc_business_indicators(
                 log = None
 
             if price is not None and price != 0:
-                revenue_for_avg_check += price
-                orders_nonzero_price += 1
+                if status == "delivered":
+                    revenue_for_avg_check += price
+                    orders_nonzero_price += 1
                 if comm is not None:
                     commission_total += abs(comm)
                     ratios_commission_pct.append(abs((comm / price) * 100))
                 if log is not None:
                     logistics_total += abs(log)
-                    ratios_logistics_pct.append((log / price) * 100)
+                    ratios_logistics_pct.append(abs((log / price) * 100))
 
         average_check = (revenue_for_avg_check / orders_nonzero_price) if orders_nonzero_price > 0 else 0
         avg_commission_pct = (sum(ratios_commission_pct) / len(ratios_commission_pct)) if ratios_commission_pct else 0
@@ -894,11 +981,14 @@ def calc_business_indicators(
 
         # Вычитаем затраты на продвижение Ozon (CPC + Звёздные товары) и внешний маркетинг из чистой прибыли
         total_marketing_cost = ozon_promotion_total + external_marketing_cost
-        net_profit = net_profit - total_marketing_cost - fbo_storage_cost
+        # Расходы Ozon вне заказов (кросс-докинг, обработка поставки, ранний вывод…) — суммы со знаком минус.
+        account_charges = read_account_charges(wb)
+        account_charges_total = sum(account_charges.values())
+        net_profit = net_profit - total_marketing_cost - fbo_storage_cost + account_charges_total
         net_profit_margin = (net_profit / sales_revenue) * 100 if sales_revenue > 0 else 0
-        cogs = sales_revenue + cost_price
-        gross_profit_margin = (cogs / sales_revenue) * 100 if sales_revenue > 0 else 0
-        operating_expenses = cogs - net_profit
+        gross_profit = sales_revenue + cost_price
+        gross_profit_margin = (gross_profit / sales_revenue) * 100 if sales_revenue > 0 else 0
+        operating_expenses = gross_profit - net_profit
 
         # Записываем результат
         ws["P1"] = "Общая выручка"
@@ -909,8 +999,8 @@ def calc_business_indicators(
         ws["Q3"] = cost_price
         ws["P4"] = "Рентабельность по чистой прибыли (Net Profit Margin) %"
         ws["Q4"] = net_profit_margin
-        ws["P5"] = "COGS (валовая прибыль)"
-        ws["Q5"] = cogs
+        ws["P5"] = "Валовая прибыль"
+        ws["Q5"] = gross_profit
         ws["P6"] = "Gross Profit Margin Рентабельность по валовой прибыли %"
         ws["Q6"] = gross_profit_margin
         ws["P7"] = "Операционные расходы"
@@ -946,8 +1036,14 @@ def calc_business_indicators(
         ws["Q21"] = logistics_total
         ws["P22"] = "Заказы, ожидающие расчёта Ozon (не учтены в прибыли/себестоимости)"
         ws["Q22"] = pending_count
+        ws["P23"] = "Расходы Ozon вне заказов"
+        ws["Q23"] = abs(account_charges_total)
 
-        row_cursor = 23
+        row_cursor = 24
+        for label, value in sorted(account_charges.items(), key=lambda item: item[1]):
+            ws.cell(row=row_cursor, column=16, value=f"Вне заказов — {label}")
+            ws.cell(row=row_cursor, column=17, value=abs(value))
+            row_cursor += 1
         if payout_summary:
             pairs = [
                 ("Выплачено Ozon за период (реальный перевод)", payout_summary["payments"]),

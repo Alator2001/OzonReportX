@@ -414,14 +414,14 @@ def run_fbo_supply_flow(venv_python: Path, repo_root: Path):
     print_step("Рассчитать поставку FBO")
     ensure_env(repo_root)
     ensure_reports_dir(repo_root)
-    fbo_script = repo_root / "scripts" / "fbo_supply_report.py"
+    fbo_script = repo_root / "scripts" / "fbo_supply_plan.py"
     if not fbo_script.exists():
         print("Модуль расчёта поставок FBO не найден.")
         return
-    print("Будет рассчитано:")
-    print("- среднедневные продажи")
-    print("- текущий остаток FBO")
-    print("- дефицит и рекомендуемая поставка")
+    print("Будет рассчитано (параметры — в fbo_supply_settings.json):")
+    print("- прогноз спроса на окно поставки с учётом сезонности")
+    print("- остатки FBO по кластерам, в пути и в заявках")
+    print("- сколько штук каждого артикула везти на каждый склад FBO")
     if prompt_yes_no("Продолжить расчёт поставки FBO?", default_yes=True):
         run([str(venv_python), str(fbo_script)], cwd=repo_root)
     else:

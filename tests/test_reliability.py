@@ -188,7 +188,7 @@ except FileBusyError:
         book.reset_mock()
         with patch.object(recommended, "load_workbook", return_value=book):
             with self.assertRaises(ValueError):
-                recommended.load_rates_from_report(target)
+                recommended.load_cost_structure(target)
         book.close.assert_called_once()
 
     def test_abc_closes_source_when_parsing_fails(self):

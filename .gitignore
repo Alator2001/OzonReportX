@@ -9,6 +9,11 @@ scripts/__pycache__/performance_api.cpython-314.pyc
 /ABC&XYZ reports
 /stocks reports
 margin_settings.json
+fbo_supply_settings.json
+wb_supply_settings.json
+ads_settings.json
+/ads reports
+/analytics history
 /balance reports
 /wb reports/
 /wb_costs.xlsx
@@ -45,3 +50,4 @@ Desktop.ini
 
 # Transfer archives with secrets (scripts/transfer_data.py)
 /OzonReportX_transfer_*.zip
+/actions history

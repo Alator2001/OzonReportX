@@ -1,22 +1,24 @@
 # -*- coding: utf-8 -*-
 """
 Рассчёт рекомендуемых цен продажи по артикулам.
-Использует данные из предыдущего месячного отчёта (Комиссия Ozon %, Логистика %)
+Использует данные из предыдущего месячного отчёта (комиссия Ozon %, логистика в ₽ за штуку)
 и себестоимость из costs.xlsx. Добавляет в costs.xlsx две колонки:
 «Минимальная цена продажи» (маржа = ввод пользователя, по умолчанию 0.25)
 и «Желательная цена продажи» (маржа = 0.30).
 
-Формула: (x - (Комиссия% + Логистика%)*x - Себестоимость) / x = маржа
-=> x = Себестоимость / (1 - (Комиссия% + Логистика%) - маржа)
+Формула: (x - Комиссия%*x - Логистика ₽ - Себестоимость) / x = маржа
+=> x = (Себестоимость + Логистика ₽) / (1 - Комиссия% - маржа)
 """
 
+import math
 import os
+import re
 import sys
 import subprocess
 import json
 from contextlib import ExitStack, closing
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List, Any, Tuple
 
 import pandas as pd
@@ -88,6 +90,8 @@ COL_DESIRED_PRICE = "Желательная цена продажи"
 COL_CURRENT_PRICE = "Текущая цена на Ozon"
 COL_MARKETING_PRICE = "Цена с учётом акций и скидок"
 COL_CURRENT_MARGIN = "Текущая ожидаемая рентабельность"
+COL_EXPECTED_PROFIT = "Ожидаемая чистая прибыль"
+COL_LOGISTICS = "Логистика за шт., ₽ (прошлый месяц)"
 # COL_ACTIONS больше не используется - вместо неё будут отдельные колонки для каждой акции
 
 
@@ -543,6 +547,171 @@ def get_products_in_action(action_id: int, action_name: str, offer_ids_set: set[
     return result
 
 
+def get_product_id_mapping(offer_ids: List[str]) -> Dict[int, str]:
+    """
+    Маппинг product_id -> нормализованный offer_id через /v5/product/info/prices.
+    """
+    product_id_to_offer_id: Dict[int, str] = {}
+    url = "https://api-seller.ozon.ru/v5/product/info/prices"
+    for i in range(0, len(offer_ids), 1000):
+        chunk = offer_ids[i:i + 1000]
+        cursor = ""
+        while True:
+            payload = {"cursor": cursor, "filter": {"offer_id": chunk, "visibility": "ALL"}, "limit": 1000}
+            try:
+                response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as e:
+                print(f"   ⚠️ Ошибка при создании маппинга: {e}")
+                break
+            items = data.get("items", [])
+            for item in items:
+                product_id = item.get("product_id")
+                offer_id_raw = item.get("offer_id", "")
+                if product_id and offer_id_raw:
+                    product_id_to_offer_id[product_id] = _normalize_offer_id(str(offer_id_raw))
+            cursor = data.get("cursor", "")
+            if not cursor or not items:
+                break
+    return product_id_to_offer_id
+
+
+ACTION_TYPE_ELASTIC = "ELASTIC_BOOSTING"
+
+
+def parse_fixed_boost(description: str) -> Optional[float]:
+    """
+    Фиксированный акционный бустинг из описания акции («бустинг ... — 55%»).
+    Ozon не отдаёт его отдельным полем для акций с фиксированным бустингом.
+    """
+    text = re.sub(r"<[^>]+>", "", description or "")
+    match = re.search(r"бустинг[^0-9%\n]{0,80}?(\d+(?:[.,]\d+)?)\s*%", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return float(match.group(1).replace(",", "."))
+
+
+def describe_action(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Краткая информация об акции: id, название, тип и фиксированный бустинг (если есть)."""
+    action_id = action.get("id") or action.get("action_id")
+    return {
+        "id": action_id,
+        "name": action.get("title") or action.get("name") or f"Акция {action_id}",
+        "action_type": action.get("action_type") or "",
+        "fixed_boost": parse_fixed_boost(action.get("description") or ""),
+        "date_end": action.get("date_end") or "",
+    }
+
+
+def boost_at_price(action_info: Dict[str, Any], product: Dict[str, Any], price: float) -> Optional[float]:
+    """
+    Акционный бустинг товара при заданной цене.
+    Эластичный бустинг линейно растёт от min_boost (цена price_min_elastic)
+    до max_boost (цена price_max_elastic); в остальных акциях бустинг фиксированный.
+    """
+    if action_info.get("action_type") == ACTION_TYPE_ELASTIC:
+        try:
+            high = float(product.get("price_min_elastic") or 0)
+            low = float(product.get("price_max_elastic") or 0)
+            min_boost = float(product.get("min_boost") or 0)
+            max_boost = float(product.get("max_boost") or 0)
+        except (TypeError, ValueError):
+            return None
+        if max_boost <= 0:
+            return None
+        if price >= high or high <= low:
+            return min_boost if price >= high else max_boost
+        if price <= low:
+            return max_boost
+        return round(min_boost + (high - price) / (high - low) * (max_boost - min_boost), 1)
+    return action_info.get("fixed_boost")
+
+
+def fetch_action_products(action_id: int, endpoint: str = "products") -> List[Dict[str, Any]]:
+    """
+    Все товары акции (/v1/actions/products) или кандидаты (/v1/actions/candidates)
+    с полной информацией: цены, остатки, бустинг.
+    """
+    url = f"https://api-seller.ozon.ru/v1/actions/{endpoint}"
+    products: List[Dict[str, Any]] = []
+    last_id = None
+    while True:
+        payload: Dict[str, Any] = {"action_id": action_id, "limit": 100}
+        if last_id:
+            payload["last_id"] = last_id
+        try:
+            response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
+            response.raise_for_status()
+            result = response.json().get("result") or {}
+        except Exception as e:
+            print(f"⚠️ Ошибка при получении товаров акции {action_id}: {e}")
+            break
+        batch = result.get("products") or []
+        products.extend(batch)
+        last_id = result.get("last_id")
+        if not batch or not last_id or last_id == "0":
+            break
+    return products
+
+
+def get_product_skus(product_ids: List[int]) -> Dict[int, int]:
+    """Маппинг product_id -> SKU через /v3/product/info/list."""
+    result: Dict[int, int] = {}
+    url = "https://api-seller.ozon.ru/v3/product/info/list"
+    for i in range(0, len(product_ids), 1000):
+        chunk = [str(pid) for pid in product_ids[i:i + 1000]]
+        try:
+            response = requests.post(url, headers=OZON_HEADERS, json={"product_id": chunk}, timeout=60)
+            response.raise_for_status()
+            items = response.json().get("items") or []
+        except Exception as e:
+            print(f"⚠️ Не удалось получить SKU товаров: {e}")
+            continue
+        for item in items:
+            sku = item.get("sku") or next((s.get("sku") for s in item.get("sources") or [] if s.get("sku")), None)
+            if item.get("id") and sku:
+                result[int(item["id"])] = int(sku)
+    return result
+
+
+def get_search_visibility(skus: List[int], days: int = 14) -> Dict[int, Dict[str, Any]]:
+    """
+    Видимость товаров в поиске за последние дни (/v1/analytics/product-queries):
+    сколько покупателей увидели товар и средняя позиция. Ozon может не отдавать
+    эти поля (null) — тогда значения будут None.
+    """
+    result: Dict[int, Dict[str, Any]] = {}
+    if not skus:
+        return result
+    # Без Premium Ozon отдаёт аналитику только по вчерашний день включительно.
+    period_end = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None) - timedelta(days=1)
+    date_from = (period_end - timedelta(days=days)).isoformat() + "Z"
+    date_to = period_end.isoformat() + "Z"
+    url = "https://api-seller.ozon.ru/v1/analytics/product-queries"
+    for i in range(0, len(skus), 1000):
+        chunk = [str(sku) for sku in skus[i:i + 1000]]
+        page = 0
+        while True:
+            payload = {"date_from": date_from, "date_to": date_to, "skus": chunk, "page": page, "page_size": 1000}
+            try:
+                response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=60)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as e:
+                print(f"⚠️ Не удалось получить видимость в поиске: {e}")
+                break
+            for item in data.get("items") or []:
+                result[int(item["sku"])] = {
+                    "views": item.get("unique_view_users"),
+                    "position": item.get("position"),
+                }
+            page += 1
+            if page >= int(data.get("page_count") or 0):
+                break
+    return result
+
+
 def get_actions_for_products(
     offer_ids: List[str],
 ) -> tuple[Dict[str, Dict[str, float]], List[Dict[str, Any]], Dict[str, int]]:
@@ -584,49 +753,9 @@ def get_actions_for_products(
     log_verbose(f"Найдено {len(actions)} акций")
     log_verbose("Получение товаров в акциях...")
     
-    # Создаём маппинг product_id -> offer_id для кэширования
-    # Сначала пытаемся получить маппинг через API /v5/product/info/prices
-    # где есть и product_id и offer_id
     log_verbose("Создание маппинга product_id -> offer_id...")
-    product_id_to_offer_id: Dict[int, str] = {}
-    
-    # Получаем маппинг через API /v5/product/info/prices
-    url = "https://api-seller.ozon.ru/v5/product/info/prices"
-    cursor = ""
-    has_more = True
-    
-    while has_more:
-        payload = {
-            "cursor": cursor,
-            "filter": {
-                "offer_id": normalized_offer_ids,
-                "visibility": "ALL"
-            },
-            "limit": 100
-        }
-        
-        try:
-            response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            
-            items = data.get("items", [])
-            cursor = data.get("cursor", "")
-            
-            for item in items:
-                product_id = item.get("product_id")
-                offer_id_raw = item.get("offer_id", "")
-                if product_id and offer_id_raw:
-                    offer_id_normalized = _normalize_offer_id(str(offer_id_raw))
-                    product_id_to_offer_id[product_id] = offer_id_normalized
-            
-            has_more = bool(cursor) and len(items) >= 100
-            if not has_more:
-                break
-        except Exception as e:
-            print(f"   ⚠️ Ошибка при создании маппинга: {e}")
-            break
-    
+    product_id_to_offer_id = get_product_id_mapping(normalized_offer_ids)
+
     log_verbose(f"Маппинг: {len(product_id_to_offer_id)} товаров.")
     
     # Словарь для накопления результатов: {offer_id: {название_акции: цена}}
@@ -637,18 +766,14 @@ def get_actions_for_products(
     
     # Обрабатываем каждую акцию
     for idx, action in enumerate(actions, 1):
-        action_id = action.get("id") or action.get("action_id")
+        action_info = describe_action(action)
+        action_id = action_info["id"]
         if not action_id:
             continue
         
-        action_name = action.get("title") or action.get("name") or f"Акция {action_id}"
+        action_name = action_info["name"]
         log_verbose(f"Обработка акции {idx}/{len(actions)}: {action_name}")
-        
-        # Сохраняем информацию об акции
-        actions_info_list.append({
-            "id": action_id,
-            "name": action_name
-        })
+        actions_info_list.append(action_info)
         
         products_in_action = get_products_in_action(action_id, action_name, offer_ids_set, product_id_to_offer_id)
         
@@ -678,15 +803,16 @@ def deactivate_products_in_action(action_id: int, product_ids: List[int]) -> Dic
     """
     if not OZON_CLIENT_ID or not OZON_API_KEY:
         print("⚠️ OZON_CLIENT_ID или OZON_API_KEY не настроены. Пропускаем удаление из акций.")
-        return {"product_ids": [], "rejected": []}
+        return {"product_ids": [], "rejected": [], "errors": ["OZON_CLIENT_ID или OZON_API_KEY не настроены."]}
 
     if not product_ids:
-        return {"product_ids": [], "rejected": []}
+        return {"product_ids": [], "rejected": [], "errors": []}
 
     url = "https://api-seller.ozon.ru/v1/actions/products/deactivate"
     batch_size = 100
     removed_ids: List[int] = []
     rejected: List[Dict[str, Any]] = []
+    errors: List[str] = []
 
     for i in range(0, len(product_ids), batch_size):
         batch = product_ids[i:i + batch_size]
@@ -703,6 +829,7 @@ def deactivate_products_in_action(action_id: int, product_ids: List[int]) -> Dic
             rejected.extend(result.get("rejected", []) or [])
         except requests.exceptions.RequestException as e:
             print(f"⚠️ Ошибка при удалении товаров из акции {action_id}: {e}")
+            errors.append(f"{len(batch)} товаров не отправлено: {e}")
             if hasattr(e, "response") and e.response is not None:
                 try:
                     error_data = e.response.json()
@@ -711,8 +838,9 @@ def deactivate_products_in_action(action_id: int, product_ids: List[int]) -> Dic
                     print(f"   Ответ сервера: {e.response.text[:200]}")
         except Exception as e:
             print(f"⚠️ Неожиданная ошибка при удалении из акции {action_id}: {e}")
+            errors.append(f"{len(batch)} товаров не отправлено: {e}")
 
-    return {"product_ids": removed_ids, "rejected": rejected}
+    return {"product_ids": removed_ids, "rejected": rejected, "errors": errors}
 
 
 def get_action_candidates(action_id: int, product_id_to_offer_id: Dict[int, str], offer_ids_set: set[str]) -> Dict[int, Dict[str, Any]]:
@@ -789,15 +917,16 @@ def activate_products_in_action(action_id: int, products: List[Dict[str, Any]]) 
     """
     if not OZON_CLIENT_ID or not OZON_API_KEY:
         print("⚠️ OZON_CLIENT_ID или OZON_API_KEY не настроены. Пропускаем добавление в акции.")
-        return {"product_ids": [], "rejected": []}
+        return {"product_ids": [], "rejected": [], "errors": ["OZON_CLIENT_ID или OZON_API_KEY не настроены."]}
 
     if not products:
-        return {"product_ids": [], "rejected": []}
+        return {"product_ids": [], "rejected": [], "errors": []}
 
     url = "https://api-seller.ozon.ru/v1/actions/products/activate"
     batch_size = 1000  # Максимум 1000 товаров за запрос
     added_ids: List[int] = []
     rejected: List[Dict[str, Any]] = []
+    errors: List[str] = []
 
     for i in range(0, len(products), batch_size):
         batch = products[i:i + batch_size]
@@ -815,6 +944,7 @@ def activate_products_in_action(action_id: int, products: List[Dict[str, Any]]) 
             rejected.extend(result.get("rejected", []) or [])
         except requests.exceptions.RequestException as e:
             print(f"⚠️ Ошибка при добавлении товаров в акцию {action_id}: {e}")
+            errors.append(f"{len(batch)} товаров не отправлено: {e}")
             if hasattr(e, "response") and e.response is not None:
                 try:
                     error_data = e.response.json()
@@ -823,8 +953,20 @@ def activate_products_in_action(action_id: int, products: List[Dict[str, Any]]) 
                     print(f"   Ответ сервера: {e.response.text[:200]}")
         except Exception as e:
             print(f"⚠️ Неожиданная ошибка при добавлении в акцию {action_id}: {e}")
+            errors.append(f"{len(batch)} товаров не отправлено: {e}")
 
-    return {"product_ids": added_ids, "rejected": rejected}
+    return {"product_ids": added_ids, "rejected": rejected, "errors": errors}
+
+
+def pick_action_price(min_price: float, desired_price: float, max_action_price: float) -> Optional[int]:
+    """
+    Целая цена для участия в акции: как можно ближе к желаемой, но не выше
+    максимальной цены акции и не ниже минимальной. None, если такой цены нет.
+    """
+    price = math.floor(min(desired_price, max_action_price))
+    if price < min_price:
+        return None
+    return price
 
 
 def collect_deactivation_candidates_from_sheet(
@@ -945,99 +1087,124 @@ def get_report_path(repo_root: Path, year: int, month: int) -> Path:
     return repo_root / REPORTS_DIR_NAME / name
 
 
-def load_rates_from_report(report_path: Path) -> float:
+LOGISTICS_COLUMN = "Логистика (Включает операционные ошибки продавца)"
+LOGISTICS_MIN_SHIPMENTS = 2        # меньше доставок артикула — берём среднее серии
+LOGISTICS_MIN_GROUP_SHIPMENTS = 3  # меньше доставок серии — берём среднее по магазину
+
+
+def logistics_group(article: Optional[str]) -> Optional[str]:
+    """Серия артикула — первые две цифры (11xx, 12xx, 70xx): обычно один размер и похожая доставка."""
+    text = _normalize_offer_id(str(article)) if article else ""
+    return text[:2] if text.isdigit() and len(text) >= 3 else None
+
+
+class CostStructure:
     """
-    Читает значения «Комиссии Ozon %» (Q15) и «Логистика %» (Q16) из листа «Заказы»
-    месячного отчёта и возвращает их сумму в виде десятичной доли (например, 0.15 для 15%).
+    Расходы Ozon на продажу по прошлому месяцу:
+    - комиссия — доля от цены (Ozon берёт её процентом);
+    - логистика — рубли за штуку: при росте цены доставка не дорожает.
+    Логистика артикула — его среднее за месяц, если доставок хотя бы две; иначе среднее его серии
+    (первые две цифры артикула), если по серии хотя бы три доставки; иначе среднее по магазину.
+    """
+
+    def __init__(self, commission_rate: float, logistics_avg: float, logistics_by_article: Dict[str, Tuple[float, int]], report_name: str = ""):
+        self.commission_rate = commission_rate
+        self.logistics_avg = logistics_avg
+        self.logistics_by_article = logistics_by_article
+        self.report_name = report_name
+        groups: Dict[str, List[float]] = {}
+        for article, (avg, count) in logistics_by_article.items():
+            group = logistics_group(article)
+            if group:
+                entry = groups.setdefault(group, [0.0, 0])
+                entry[0] += avg * count
+                entry[1] += count
+        self.logistics_by_group = {g: (rub / count, int(count)) for g, (rub, count) in groups.items() if count}
+
+    def logistics_source(self, article: Optional[str]) -> Tuple[float, str]:
+        """Логистика в рублях за штуку и откуда она взята: «артикул», «серия» или «магазин»."""
+        own = self.logistics_by_article.get(_normalize_offer_id(str(article))) if article else None
+        if own and own[1] >= LOGISTICS_MIN_SHIPMENTS:
+            return own[0], "артикул"
+        group = self.logistics_by_group.get(logistics_group(article) or "")
+        if group and group[1] >= LOGISTICS_MIN_GROUP_SHIPMENTS:
+            return group[0], "серия"
+        return self.logistics_avg, "магазин"
+
+    def logistics_for(self, article: Optional[str]) -> float:
+        """Логистика в рублях за штуку для артикула."""
+        return self.logistics_source(article)[0]
+
+    def summary(self) -> str:
+        own = sum(1 for _, count in self.logistics_by_article.values() if count >= LOGISTICS_MIN_SHIPMENTS)
+        groups = ", ".join(f"{g}xx — {avg:.0f} ₽" for g, (avg, count) in sorted(self.logistics_by_group.items())
+                           if count >= LOGISTICS_MIN_GROUP_SHIPMENTS)
+        return (f"комиссия {self.commission_rate * 100:.1f}% от цены, логистика в среднем {self.logistics_avg:.0f} ₽ за штуку; "
+                f"своё среднее у {own} артикулов, по сериям: {groups or 'нет данных'}, остальным — среднее по магазину")
+
+
+def load_cost_structure(report_path: Path) -> CostStructure:
+    """
+    Читает из листа «Заказы» месячного отчёта комиссию Ozon (Q15, %) и логистику по строкам заказов
+    в рублях, считает среднюю логистику за штуку по магазину и по каждому артикулу.
     """
     with ExitStack() as books:
         if not report_path.exists():
             raise FileNotFoundError(f"Файл отчёта не найден: {report_path}")
-
-        # Пробуем сначала с data_only=True (для вычисленных значений)
-        # Если не получится, попробуем без него (для формул)
-        wb = None
         try:
             wb = books.enter_context(closing(load_workbook(report_path, data_only=True)))
-        except Exception:
-            pass
-    
-        if wb is None:
-            try:
-                wb = books.enter_context(closing(load_workbook(report_path, data_only=False)))
-            except Exception as e:
-                raise ValueError(f"Не удалось открыть файл отчёта: {e}")
-    
+        except Exception as e:
+            raise ValueError(f"Не удалось открыть файл отчёта: {e}")
         if ORDER_SHEET not in wb.sheetnames:
             raise ValueError(f"В файле отчёта нет листа «{ORDER_SHEET}».")
-
         ws = wb[ORDER_SHEET]
 
-        # Читаем значения из ячеек Q15 (Комиссии Ozon %) и Q16 (Логистика %)
-        commission_pct = ws["Q15"].value
-        logistics_pct = ws["Q16"].value
-    
-        # Если значения не прочитались, пробуем альтернативный способ через pandas
-        if commission_pct is None or logistics_pct is None:
-            try:
-                df_summary = pd.read_excel(report_path, sheet_name=ORDER_SHEET, header=None, usecols="P:Q", skiprows=14, nrows=2)
-                if len(df_summary) >= 2:
-                    if pd.notna(df_summary.iloc[0, 1]):
-                        commission_pct = df_summary.iloc[0, 1]
-                    if pd.notna(df_summary.iloc[1, 1]):
-                        logistics_pct = df_summary.iloc[1, 1]
-            except Exception:
-                pass
-
-        def to_float(val):
-            """Преобразует значение в float, обрабатывая None и строки."""
+        def to_float(val) -> Optional[float]:
             if val is None:
-                return 0.0
+                return None
             if isinstance(val, str):
-                val = val.strip().replace(",", ".")
+                val = val.strip().replace(",", ".").replace(" ", "")
                 if val in ("-", ""):
-                    return 0.0
+                    return None
             try:
                 return float(val)
             except (TypeError, ValueError):
-                return 0.0
+                return None
 
-        commission_pct_raw = commission_pct
-        logistics_pct_raw = logistics_pct
-    
-        commission_pct = to_float(commission_pct)
-        logistics_pct = to_float(logistics_pct)
+        commission_pct = to_float(ws["Q15"].value) or 0.0
+        header = [str(cell.value).strip() if cell.value is not None else "" for cell in ws[1]]
+        try:
+            article_idx = header.index("Артикул")
+            qty_idx = header.index("Количество шт.")
+            logistics_idx = header.index(LOGISTICS_COLUMN)
+        except ValueError:
+            raise ValueError(f"В листе «{ORDER_SHEET}» нет колонок «Артикул», «Количество шт.» или «{LOGISTICS_COLUMN}».")
 
-        # Значения в процентах, преобразуем в десятичную долю (15% -> 0.15)
-        commission_rate = commission_pct / 100.0
-        logistics_rate = logistics_pct / 100.0
+        totals: Dict[str, List[float]] = {}  # артикул -> [рубли логистики, штуки, доставки]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if len(row) <= max(article_idx, qty_idx, logistics_idx):
+                continue
+            article = _artikul_normalize(row[article_idx])
+            logistics = to_float(row[logistics_idx])
+            qty = to_float(row[qty_idx]) or 0
+            if not article or logistics is None or qty <= 0:
+                continue
+            entry = totals.setdefault(_normalize_offer_id(article), [0.0, 0.0, 0])
+            entry[0] += abs(logistics)
+            entry[1] += qty
+            entry[2] += 1
 
-        # Общая доля комиссии + логистики
-        total_rate = commission_rate + logistics_rate
-
-        # Проверка: если комиссия и логистика равны 0 или очень малы, значит отчёт неполный
-        if total_rate < 0.01:  # Меньше 1% - подозрительно мало
-            # Пытаемся определить месяц и год из имени файла
-            report_name = report_path.stem  # без расширения
-            period_info = report_name  # например "Декабрь 2025"
-        
-            error_msg = (
-                f"\n❌ ОШИБКА: Не удалось прочитать значения комиссии и логистики из отчёта.\n"
+        total_rub = sum(v[0] for v in totals.values())
+        total_units = sum(v[1] for v in totals.values())
+        if commission_pct < 1 or total_units <= 0:
+            raise ValueError(
+                f"\n❌ ОШИБКА: Не удалось прочитать комиссию и логистику из отчёта.\n"
                 f"   Файл: {report_path.name}\n"
-                f"   Комиссия Ozon % (Q15): {commission_pct_raw}\n"
-                f"   Логистика % (Q16): {logistics_pct_raw}\n\n"
-                f"   Возможные причины:\n"
-                f"   1. Отчёт не был сохранён после генерации (формулы не вычислены)\n"
-                f"   2. В отчёте отсутствуют данные о комиссиях и логистике\n"
-                f"   3. Отчёт был повреждён или изменён вручную\n\n"
-                f"   РЕШЕНИЕ: Запустите генерацию месячного отчёта заново для периода\n"
-                f"   «{period_info}» и убедитесь, что отчёт сохранён корректно.\n"
-                f"   После генерации откройте файл отчёта в Excel и сохраните его,\n"
-                f"   чтобы формулы вычислились, затем повторите расчёт цен.\n"
+                f"   Комиссия Ozon % (Q15): {ws['Q15'].value}; строк с логистикой: {sum(v[2] for v in totals.values())}\n\n"
+                f"   РЕШЕНИЕ: Сформируйте месячный отчёт за «{report_path.stem}» заново и повторите расчёт цен.\n"
             )
-            raise ValueError(error_msg)
-
-        return total_rate
+        by_article = {article: (rub / units, int(count)) for article, (rub, units, count) in totals.items()}
+        return CostStructure(commission_pct / 100.0, total_rub / total_units, by_article, report_path.stem)
 
 
 def load_costs_df(costs_path: Path) -> pd.DataFrame:
@@ -1067,56 +1234,42 @@ def load_costs_df(costs_path: Path) -> pd.DataFrame:
 
 def compute_prices(
     cost: float,
-    rate: float,
+    commission_rate: float,
+    logistics: float,
     min_margin: float,
     desired_margin: float,
 ) -> tuple[float | None, float | None]:
     """
-    Вычисляет рекомендуемые цены по формуле:
-    (x - rate*x - cost) / x = margin
-    => x - rate*x - cost = margin*x
-    => x*(1 - rate - margin) = cost
-    => x = cost / (1 - rate - margin)
-    
-    Пример:
-    - rate = 0.6 (60% комиссии+логистики из отчёта)
-    - cost = 250 (себестоимость)
-    - margin = 0.3 (30% желательная рентабельность)
-    - x = 250 / (1 - 0.6 - 0.3) = 250 / 0.1 = 2500
-    
-    Проверка: (2500 - 0.6*2500 - 250) / 2500 = 750 / 2500 = 0.3 ✓
-    
+    Рекомендуемые цены: комиссия — доля от цены, логистика — рубли за штуку.
+    (x - commission*x - logistics - cost) / x = margin
+    => x = (cost + logistics) / (1 - commission - margin)
+
+    Пример: себестоимость 250 ₽, логистика 150 ₽, комиссия 50%, маржа 20%:
+    x = (250 + 150) / (1 - 0.5 - 0.2) = 400 / 0.3 = 1333 ₽.
+    Проверка: (1333 - 667 - 150 - 250) / 1333 = 0.2 ✓
+
     Если знаменатель <= 0 или cost <= 0, возвращаем (None, None).
     """
     if cost is None or cost <= 0:
         return None, None
-    denom_min = 1.0 - rate - min_margin
-    denom_desired = 1.0 - rate - desired_margin
+    base = cost + max(0.0, logistics or 0.0)
+    denom_min = 1.0 - commission_rate - min_margin
+    denom_desired = 1.0 - commission_rate - desired_margin
     if denom_min <= 0 or denom_desired <= 0:
         return None, None
-    min_price = round(cost / denom_min)
-    desired_price = round(cost / denom_desired)
-    return min_price, desired_price
+    return round(base / denom_min), round(base / denom_desired)
 
 
-def compute_current_margin(price: float | None, cost: float, rate: float) -> float | None:
+def compute_current_margin(price: float | None, cost: float, commission_rate: float, logistics: float) -> float | None:
     """
-    Вычисляет текущую ожидаемую рентабельность по формуле:
-    margin = (price - rate*price - cost) / price
-    
-    Пример:
-    - price = 2500 (текущая цена на Ozon)
-    - rate = 0.6 (60% комиссии+логистики)
-    - cost = 250 (себестоимость)
-    - margin = (2500 - 0.6*2500 - 250) / 2500 = 750 / 2500 = 0.3 (30%)
-    
+    Текущая ожидаемая рентабельность: (цена − комиссия×цена − логистика ₽ − себестоимость) / цена.
+    Логистика в рублях, поэтому при росте цены доля доставки в ней уменьшается.
     Если price <= 0 или None, возвращает None.
     """
     if price is None or price <= 0:
         return None
     try:
-        margin = (price - rate * price - cost) / price
-        return margin
+        return (price - commission_rate * price - (logistics or 0.0) - cost) / price
     except (TypeError, ValueError, ZeroDivisionError):
         return None
 
@@ -1323,8 +1476,8 @@ def run(
                 )
     
         log_verbose(f"Отчёт: {report_path}")
-        total_rate = load_rates_from_report(report_path)
-        log_verbose(f"Комиссия+логистика: {total_rate*100:.2f}%")
+        structure = load_cost_structure(report_path)
+        log_verbose(f"Расходы Ozon: {structure.summary()}")
         df, key_col, cost_col = load_costs_df(costs_path)
         log_verbose(f"Загружено записей: {len(df)}")
 
@@ -1385,12 +1538,13 @@ def run(
                 cost_val = float(row.get(cost_col, 0) or 0)
             except (TypeError, ValueError):
                 cost_val = 0.0
-            min_p, des_p = compute_prices(cost_val, total_rate, min_margin, desired_margin)
+            art = _artikul_normalize(row.get(key_col))
+            logistics = structure.logistics_for(art)
+            min_p, des_p = compute_prices(cost_val, structure.commission_rate, logistics, min_margin, desired_margin)
             min_prices.append(min_p)
             desired_prices.append(des_p)
         
             # Получаем текущую цену с Ozon
-            art = _artikul_normalize(row.get(key_col))
             if art:
                 # Пробуем найти по исходному артикулу и по нормализованному
                 art_normalized = _normalize_offer_id(art)
@@ -1405,7 +1559,7 @@ def run(
             # Рассчитываем текущую ожидаемую рентабельность
             # Используем цену с акциями, если она есть, иначе обычную цену
             price_for_margin = marketing_price if marketing_price is not None else current_price
-            margin = compute_current_margin(price_for_margin, cost_val, total_rate)
+            margin = compute_current_margin(price_for_margin, cost_val, structure.commission_rate, logistics)
             # Преобразуем в проценты и округляем до 2 знаков
             current_margins.append(round(margin * 100, 2) if margin is not None else None)
         
@@ -1598,11 +1752,9 @@ def run(
                         except (TypeError, ValueError):
                             continue
                     
-                        # Проверяем, можно ли установить цену в диапазоне [min_price, desired_price]
-                        # Цена должна быть не меньше min_price и не больше min(desired_price, max_action_price)
-                        target_price = min(desired_price, max_action_price_val)
+                        target_price = pick_action_price(min_price, desired_price, max_action_price_val)
                     
-                        if target_price >= min_price:
+                        if target_price is not None:
                             # Проверяем, не участвует ли уже товар в акции
                             current_action_price = product_info.get("action_price", 0)
                             if current_action_price == 0 or current_action_price is None:
@@ -1610,7 +1762,7 @@ def run(
                                 stock = product_info.get("stock", 0) or 0
                                 products_to_add.append({
                                     "product_id": product_id,
-                                    "action_price": int(target_price),  # Используем целевую цену
+                                    "action_price": target_price,
                                     "stock": int(stock) if stock else 0
                                 })
                 

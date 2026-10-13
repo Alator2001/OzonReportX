@@ -77,8 +77,55 @@ class AccrualTests(unittest.TestCase):
         row = save.call_args.args[0].iloc[0]
         self.assertEqual(row["Цена продажи"], 1000)
         self.assertEqual(row["Комиссия за продажу Ozon"], -200)
-        self.assertEqual(row["Логистика (Включает операционные ошибки продавца)"], 150)
+        # Логистика — расход, со знаком минус, как комиссия: 1000 − 200 − 150 = 650 начислено.
+        self.assertEqual(row["Логистика (Включает операционные ошибки продавца)"], -150)
         self.assertEqual(row["Прибыль"], 550)
+
+    def test_charges_outside_postings_are_collected_not_attached(self):
+        def non_item(number, amount, type_id):
+            row = {"unit_number": number, "total_amount": money(amount), "accrued_category": "NON_ITEM",
+                   "date": "2026-09-07", "non_item_fee": {"type_id": type_id}}
+            if not number:
+                row.pop("unit_number")
+            return row
+        session = self.session({"accruals": [
+            accrual("0115-1", "650", 1000, "-200"),
+            non_item("2000064870634", "-550.8", 12),          # кросс-докинг по номеру поставки
+            non_item(None, "-71.71", 18),                       # ранний вывод — без номера
+            non_item("0115-1", "-29.7", 93),                    # штраф по отправлению — остаётся у заказа
+        ], "last_id": ""})
+        charges = []
+        result = monthly.get_transactions_by_posting("2026-09-07", "2026-09-07", session, account_charges=charges)
+        self.assertEqual(sum(x["amount"] for x in result["0115-1"]), Decimal("620.3"))
+        self.assertNotIn("2000064870634", result)
+        self.assertEqual([(c["type_id"], c["amount"]) for c in charges], [(12, Decimal("-550.8")), (18, Decimal("-71.71"))])
+
+    def test_profit_subtracts_charges_outside_orders_and_revenue_counts_only_sold(self):
+        from openpyxl import Workbook, load_workbook
+        path = self.directory / "report.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Заказы"
+        ws.append(["Статус", "Номер", "Название", "Артикул", "Кол-во", "Цена продажи", "Комиссия", "Логистика", "Начислено", "Себестоимость", "Прибыль"])
+        ws.append(["delivered", "a", "", 1, 1, 1000, -200, -150, 650, -100, 550])
+        ws.append(["cancelled", "b", "", 1, 1, 900, "-", "-", -20, 0, -20])
+        ws.append(["delivering", "c", "", 1, 1, 800, "-", "-", 0, 0, "-"])
+        wb.save(path)
+        monthly.write_account_charges_sheet(str(path), [
+            {"date": "2026-09-07", "type_id": 12, "unit_number": "2000064870634", "amount": Decimal("-550.8")},
+            {"date": "2026-09-15", "type_id": 18, "unit_number": "", "amount": Decimal("-71.71")},
+            {"date": "2026-09-17", "type_id": 41, "unit_number": "42244585", "amount": Decimal("-62.52")},  # реклама — учтена отдельно
+        ])
+        monthly.calc_business_indicators(str(path), ozon_promotion_cost_override=0, external_marketing_cost_override=0)
+        result = load_workbook(path, data_only=True)
+        sheet = result["Заказы"]
+        metrics = {sheet.cell(row=r, column=16).value: sheet.cell(row=r, column=17).value for r in range(1, 40)}
+        self.assertEqual(metrics["Общая выручка"], 1000)                     # без отмены и заказа в пути
+        self.assertEqual(metrics["Средний чек"], 1000)
+        self.assertAlmostEqual(metrics["Чистая прибыль"], 550 - 20 - 550.8 - 71.71)
+        self.assertAlmostEqual(metrics["Расходы Ozon вне заказов"], 622.51)
+        self.assertEqual(metrics["Валовая прибыль"], 900)
+        self.assertEqual(result["Расходы вне заказов"].max_row, 4)
 
     def test_accrual_window_looks_ahead_21_days_past_month_end(self):
         """Real data: the sale-with-commission accrual lands 2-19 days after shipment (median ~6),

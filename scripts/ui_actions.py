@@ -12,11 +12,8 @@ if str(script_dir) not in sys.path:
 from recommended_prices import run as recommended_prices_run, save_margin_settings
 from update_prices import run as update_prices_run
 from price_management import (
-    action_add_to_actions,
     action_get_current_prices_and_actions,
     action_process_discount_requests,
-    action_remove_unprofitable_actions,
-    refresh_costs_views,
 )
 from utils import set_prompt_force
 
@@ -50,6 +47,12 @@ def cmd_recommended_prices(args: argparse.Namespace) -> int:
 def cmd_refresh_pricing(_args: argparse.Namespace) -> int:
     set_prompt_force(True)
     ok = action_get_current_prices_and_actions(repo_root)
+    try:
+        # Своя история для раздела «Анализ»: Ozon не отдаёт прошлые цены, остатки и индексы.
+        from organic_analysis import snapshot_after_sync
+        snapshot_after_sync(repo_root)
+    except Exception as exc:
+        print(f"⚠️ Не удалось сохранить снимок для анализа: {exc}")
     return 0 if ok else 1
 
 
@@ -61,22 +64,6 @@ def cmd_update_min_prices(_args: argparse.Namespace) -> int:
 def cmd_discount_requests(_args: argparse.Namespace) -> int:
     set_prompt_force(True)
     ok = action_process_discount_requests(repo_root)
-    return 0 if ok else 1
-
-
-def cmd_remove_unprofitable(_args: argparse.Namespace) -> int:
-    set_prompt_force(True)
-    ok = action_remove_unprofitable_actions(repo_root)
-    if ok:
-        refresh_costs_views(repo_root)
-    return 0 if ok else 1
-
-
-def cmd_add_to_actions(_args: argparse.Namespace) -> int:
-    set_prompt_force(True)
-    ok = action_add_to_actions(repo_root)
-    if ok:
-        refresh_costs_views(repo_root)
     return 0 if ok else 1
 
 
@@ -114,18 +101,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Обработать заявки на скидку.",
     )
     discount_parser.set_defaults(handler=cmd_discount_requests)
-
-    remove_parser = subparsers.add_parser(
-        "remove-unprofitable-actions",
-        help="Удалить невыгодные акции.",
-    )
-    remove_parser.set_defaults(handler=cmd_remove_unprofitable)
-
-    add_parser = subparsers.add_parser(
-        "add-to-actions",
-        help="Добавить товары в акции.",
-    )
-    add_parser.set_defaults(handler=cmd_add_to_actions)
 
     return parser
 

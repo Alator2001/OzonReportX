@@ -23,22 +23,30 @@ from recommended_prices import (
     COSTS_FILENAME,
     compute_prices,
     get_product_prices_from_ozon,
-    get_actions_for_products,
     COL_MIN_PRICE,
     COL_DESIRED_PRICE,
     COL_CURRENT_PRICE,
     COL_MARKETING_PRICE,
     COL_CURRENT_MARGIN,
+    COL_EXPECTED_PROFIT,
+    COL_LOGISTICS,
     compute_current_margin,
     get_report_path,
     get_prev_month_year,
-    load_rates_from_report,
+    load_cost_structure,
     generate_monthly_report,
     MONTHS_RU,
-    collect_deactivation_candidates_from_sheet,
     deactivate_products_in_action,
-    get_action_candidates,
     activate_products_in_action,
+    pick_action_price,
+    get_actions_list,
+    describe_action,
+    boost_at_price,
+    fetch_action_products,
+    get_product_id_mapping,
+    get_product_skus,
+    get_search_visibility,
+    ACTION_TYPE_ELASTIC,
     _artikul_normalize,
     _normalize_offer_id,
     get_discount_requests,
@@ -168,8 +176,8 @@ def action_calculate_optimal_prices(repo_root: Path) -> bool:
             return False
     
     log_verbose(f"Файл отчёта: {report_path}")
-    total_rate = load_rates_from_report(report_path)
-    log_verbose(f"Комиссия+логистика: {total_rate*100:.2f}%")
+    structure = load_cost_structure(report_path)
+    print(f"Расходы Ozon из отчёта: {structure.summary()}.")
     df, key_col, cost_col = load_costs_df(costs_path)
     log_verbose(f"Загружено записей: {len(df)}")
     
@@ -194,7 +202,8 @@ def action_calculate_optimal_prices(repo_root: Path) -> bool:
     for _, row in df.iterrows():
         raw = row.get(cost_col, 0)
         cost_val = _parse_cost(raw)
-        min_p, des_p = compute_prices(cost_val, total_rate, min_margin, desired_margin)
+        logistics = structure.logistics_for(_artikul_normalize(row.get(key_col)))
+        min_p, des_p = compute_prices(cost_val, structure.commission_rate, logistics, min_margin, desired_margin)
         min_prices.append(min_p)
         desired_prices.append(des_p)
 
@@ -203,7 +212,7 @@ def action_calculate_optimal_prices(repo_root: Path) -> bool:
     if filled_min == 0 and len(df) > 0:
         print("⚠️ Не удалось рассчитать ни одной цены. Проверьте:")
         print(f"   — столбец «{cost_col}»: все значения должны быть положительными числами (можно с запятой);")
-        print(f"   — комиссия+логистика из отчёта: {total_rate*100:.1f}%. Сумма с маржой не должна превышать 100%.")
+        print(f"   — комиссия из отчёта: {structure.commission_rate*100:.1f}%. Комиссия с маржой не должна превышать 100%.")
         print(f"   (Маржа мин/жел: {min_margin*100:.0f}% / {desired_margin*100:.0f}%).")
 
     # Обновляем колонки
@@ -264,8 +273,8 @@ def action_get_current_prices(repo_root: Path) -> bool:
                 print("❌ Невозможно рассчитать рентабельность без отчёта.")
                 return False
     
-        total_rate = load_rates_from_report(report_path)
-        log_verbose(f"Комиссия+логистика: {total_rate*100:.2f}%")
+        structure = load_cost_structure(report_path)
+        print(f"Расходы Ozon из отчёта: {structure.summary()}.")
         log_verbose("Получение цен с Ozon...")
         offer_ids_list = []
         for _, row in df.iterrows():
@@ -283,6 +292,8 @@ def action_get_current_prices(repo_root: Path) -> bool:
         current_prices = []
         marketing_prices = []
         current_margins = []
+        expected_profits = []
+        logistics_used = []
     
         for _, row in df.iterrows():
             try:
@@ -303,17 +314,23 @@ def action_get_current_prices(repo_root: Path) -> bool:
             marketing_prices.append(round(marketing_price) if marketing_price is not None else None)
         
             price_for_margin = marketing_price if marketing_price is not None else current_price
-            margin = compute_current_margin(price_for_margin, cost_val, total_rate)
+            logistics = structure.logistics_for(art)
+            logistics_used.append(round(logistics))
+            margin = compute_current_margin(price_for_margin, cost_val, structure.commission_rate, logistics)
             current_margins.append(round(margin * 100, 2) if margin is not None else None)
+            # Прибыль с единицы по той же формуле, что и рентабельность: цена × (1 − комиссия) − логистика ₽ − себестоимость.
+            expected_profits.append(round(margin * price_for_margin) if margin is not None else None)
     
         # Обновляем колонки
-        for c in [COL_CURRENT_PRICE, COL_MARKETING_PRICE, COL_CURRENT_MARGIN]:
+        for c in [COL_CURRENT_PRICE, COL_MARKETING_PRICE, COL_CURRENT_MARGIN, COL_EXPECTED_PROFIT, COL_LOGISTICS]:
             if c in df.columns:
                 df = df.drop(columns=[c])
     
         df[COL_CURRENT_PRICE] = current_prices
         df[COL_MARKETING_PRICE] = marketing_prices
         df[COL_CURRENT_MARGIN] = current_margins
+        df[COL_EXPECTED_PROFIT] = expected_profits
+        df[COL_LOGISTICS] = logistics_used
     
         write_costs_dataframe(df, costs_path)
     
@@ -357,6 +374,16 @@ def action_get_current_prices(repo_root: Path) -> bool:
                 data_range = f"{margin_col_letter}2:{margin_col_letter}{len(df) + 1}"
                 ws.conditional_formatting.add(data_range, green_rule)
                 ws.conditional_formatting.add(data_range, red_rule)
+        
+            # Отрицательная ожидаемая прибыль — красным
+            for col_idx, cell in enumerate(ws[1], start=1):
+                if cell.value == COL_EXPECTED_PROFIT:
+                    profit_letter = cell.column_letter
+                    ws.conditional_formatting.add(
+                        f"{profit_letter}2:{profit_letter}{len(df) + 1}",
+                        CellIsRule(operator="lessThan", formula=[0], fill=PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")),
+                    )
+                    break
         
             # Форматирование для текущей цены: красный < мин, зелёный >= мин, более зелёный >= желательной
             current_price_col_idx = None
@@ -426,6 +453,37 @@ def action_get_current_prices(repo_root: Path) -> bool:
         return True
 
 
+# Колонка бустинга на листе «Акции» стоит рядом с колонкой цены акции.
+BOOST_COLUMN_SUFFIX = " — бустинг, %"
+
+
+def boost_column_name(action_name: str) -> str:
+    return f"{action_name}{BOOST_COLUMN_SUFFIX}"
+
+
+def collect_action_participation(
+    offer_ids: List[str],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, float]], Dict[str, Dict[str, Optional[float]]]]:
+    """
+    Акции и участие в них товаров: (акции, {артикул: {акция: цена}}, {артикул: {акция: бустинг %}}).
+    """
+    actions = [action for action in (describe_action(a) for a in get_actions_list()) if action["id"]]
+    if not actions:
+        return [], {}, {}
+    pid_to_offer = get_product_id_mapping(sorted({_normalize_offer_id(oid) for oid in offer_ids if oid}))
+    prices: Dict[str, Dict[str, float]] = {}
+    boosts: Dict[str, Dict[str, Optional[float]]] = {}
+    for action_info in actions:
+        for product in fetch_action_products(action_info["id"], "products"):
+            offer_id = pid_to_offer.get(product.get("id"))
+            price = float(product.get("action_price") or 0)
+            if not offer_id or price <= 0:
+                continue
+            prices.setdefault(offer_id, {})[action_info["name"]] = price
+            boosts.setdefault(offer_id, {})[action_info["name"]] = _current_boost(action_info, product, price)
+    return actions, prices, boosts
+
+
 @locked_costs
 def action_get_active_actions(repo_root: Path) -> bool:
     """
@@ -451,8 +509,8 @@ def action_get_active_actions(repo_root: Path) -> bool:
             if art:
                 offer_ids_list.append(art)
     
-        # Получаем информацию об акциях
-        actions_map, actions_info_list, _ = get_actions_for_products(offer_ids_list)
+        # Получаем акции, цены и бустинг товаров в них
+        actions_info_list, prices_by_offer, boosts_by_offer = collect_action_participation(offer_ids_list)
     
         if not actions_info_list:
             print("⚠️ Активные акции не найдены.")
@@ -477,32 +535,16 @@ def action_get_active_actions(repo_root: Path) -> bool:
         if COL_MIN_PRICE in df.columns:
             actions_df_data[COL_MIN_PRICE] = df[COL_MIN_PRICE].values
     
-        # Получаем цены в акциях для каждого товара
-        action_prices_dicts = {}
-        for action_info in actions_info_list:
-            action_name = action_info["name"]
-            action_prices_dicts[action_name] = []
-    
+        # Для каждой акции — колонка цены и рядом колонка бустинга
+        offers = []
         for _, row in df.iterrows():
             art = _artikul_normalize(row.get(key_col))
-            if art:
-                art_normalized = _normalize_offer_id(art)
-                art_actions = actions_map.get(art) or actions_map.get(art_normalized) or {}
-            else:
-                art_actions = {}
-        
-            for action_info in actions_info_list:
-                action_name = action_info["name"]
-                action_price = art_actions.get(action_name)
-                if action_price is not None:
-                    action_prices_dicts[action_name].append(round(action_price))
-                else:
-                    action_prices_dicts[action_name].append(None)
-    
-        # Добавляем колонки акций
+            offers.append(_normalize_offer_id(art) if art else "")
         for action_info in actions_info_list:
             action_name = action_info["name"]
-            actions_df_data[action_name] = action_prices_dicts[action_name]
+            prices = [prices_by_offer.get(offer, {}).get(action_name) for offer in offers]
+            actions_df_data[action_name] = [round(price) if price is not None else None for price in prices]
+            actions_df_data[boost_column_name(action_name)] = [boosts_by_offer.get(offer, {}).get(action_name) for offer in offers]
     
         actions_df = pd.DataFrame(actions_df_data)
     
@@ -523,9 +565,17 @@ def action_get_active_actions(repo_root: Path) -> bool:
                 ws_actions.cell(row=1, column=c_idx, value=col_name)
         
             # Записываем данные
+            boost_col_indices = {
+                c_idx for c_idx, col_name in enumerate(actions_df.columns, start=1)
+                if str(col_name).endswith(BOOST_COLUMN_SUFFIX)
+            }
             for r_idx, row in enumerate(actions_df.itertuples(index=False), start=2):
                 for c_idx, value in enumerate(row, start=1):
-                    ws_actions.cell(row=r_idx, column=c_idx, value=value)
+                    if pd.isna(value):
+                        value = None
+                    cell = ws_actions.cell(row=r_idx, column=c_idx, value=value)
+                    if c_idx in boost_col_indices and value is not None:
+                        cell.number_format = '0.#"%"'
         
             # Применяем условное форматирование
             if COL_MIN_PRICE in actions_df.columns:
@@ -539,7 +589,7 @@ def action_get_active_actions(repo_root: Path) -> bool:
                     min_price_col_letter = get_column_letter(min_price_col_idx)
                 
                     for col_idx, col_name in enumerate(actions_df.columns, start=1):
-                        if col_name == key_col or col_name == COL_MIN_PRICE:
+                        if col_name == key_col or col_name == COL_MIN_PRICE or str(col_name).endswith(BOOST_COLUMN_SUFFIX):
                             continue
                     
                         action_col_letter = get_column_letter(col_idx)
@@ -558,7 +608,7 @@ def action_get_active_actions(repo_root: Path) -> bool:
         
             save_workbook_atomic(wb, costs_path)
             wb.close()
-            print(f"✅ Создан лист «Акции» с {len(actions_info_list)} колонками акций.")
+            print(f"✅ Создан лист «Акции»: {len(actions_info_list)} акций, для каждой — цена и бустинг.")
         except Exception as e:
             print(f"⚠️ Ошибка при создании листа «Акции»: {e}")
             import traceback
@@ -568,242 +618,617 @@ def action_get_active_actions(repo_root: Path) -> bool:
         return True
 
 
-def action_remove_unprofitable_actions(repo_root: Path) -> bool:
-    """
-    Действие 5: Удалить невыгодные акции.
-    Удаление товаров из акций, где цена меньше минимальной.
-    """
-    with ExitStack() as books:
-        print_step("Удалить невыгодные акции")
-    
-        costs_path = repo_root / COSTS_FILENAME
-    
-        if not costs_path.exists():
-            print(f"❌ Файл {COSTS_FILENAME} не найден.")
-            return False
-    
-        # Проверяем наличие листа "Акции"
+def _load_offer_price_limits(df, key_col: str) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    """{нормализованный артикул: (минимальная цена, желательная цена)} из costs.xlsx."""
+    def _positive(value) -> Optional[float]:
         try:
-            wb = books.enter_context(closing(load_workbook(costs_path)))
-            if "Акции" not in wb.sheetnames:
-                print("⚠️ Лист «Акции» не найден.")
-                if prompt_yes_no("Получить информацию об активных акциях сейчас?", default_yes=True):
-                    if not action_get_active_actions(repo_root):
-                        return False
-                    wb = books.enter_context(closing(load_workbook(costs_path)))
-                else:
-                    print("❌ Невозможно удалить из акций без информации об акциях.")
-                    return False
-        except Exception as e:
-            print(f"❌ Ошибка при открытии файла: {e}")
-            return False
-    
-        df, key_col, cost_col = load_costs_df(costs_path)
-    
-        # Получаем артикулы и маппинг
-        offer_ids_list = []
-        for _, row in df.iterrows():
-            art = _artikul_normalize(row.get(key_col))
-            if art:
-                offer_ids_list.append(art)
-    
-        _, actions_info_list, offer_id_to_product_id = get_actions_for_products(offer_ids_list)
-    
-        if not actions_info_list:
-            print("⚠️ Активные акции не найдены.")
-            return False
-    
-        ws_actions = wb['Акции']
-        action_name_to_id = {a["name"]: a["id"] for a in actions_info_list}
-    
-        if not offer_id_to_product_id or not action_name_to_id:
-            print("⚠️ Недостаточно данных для удаления из акций.")
-            return False
-    
-        candidates = collect_deactivation_candidates_from_sheet(
-            ws_actions,
-            key_col,
-            COL_MIN_PRICE,
-            action_name_to_id,
-            offer_id_to_product_id,
-        )
-    
-        if not candidates:
-            print("✅ Товары с ценой ниже минимальной не найдены.")
-            return True
-    
-        total_to_remove = sum(len(ids) for ids in candidates.values())
-        print(f"Найдено {total_to_remove} товаров для удаления из {len(candidates)} акций.")
-    
-        if not prompt_yes_no("Продолжить удаление?", default_yes=False):
-            print("❌ Удаление отменено.")
-            return False
-    
-        log_verbose("Удаление товаров из акций...")
-        for action_id, product_ids in candidates.items():
-            result = deactivate_products_in_action(action_id, product_ids)
-            removed = result.get("product_ids", []) or []
-            rejected = result.get("rejected", []) or []
-            log_verbose(f"Акция {action_id}: удалено {len(removed)}, не удалено {len(rejected)}")
-        print("✅ Удаление из акций завершено.")
-        return True
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(number) or number <= 0:
+            return None
+        return number
 
-
-def action_add_to_actions(repo_root: Path) -> bool:
-    """
-    Действие 6: Добавить товары в акции.
-    Добавление товаров, если допустимая цена в диапазоне минимальной и желаемой.
-    """
-    print_step("Добавить товары в акции")
-    
-    costs_path = repo_root / COSTS_FILENAME
-    
-    if not costs_path.exists():
-        print(f"❌ Файл {COSTS_FILENAME} не найден.")
-        return False
-    
-    # Проверяем наличие минимальной и желательной цены
-    df, key_col, cost_col = load_costs_df(costs_path)
-    
-    if COL_MIN_PRICE not in df.columns or COL_DESIRED_PRICE not in df.columns:
-        print(f"⚠️ Колонки «{COL_MIN_PRICE}» или «{COL_DESIRED_PRICE}» не найдены.")
-        if prompt_yes_no("Рассчитать оптимальные цены сейчас?", default_yes=True):
-            if not action_calculate_optimal_prices(repo_root):
-                return False
-            df, key_col, cost_col = load_costs_df(costs_path)
-        else:
-            print("❌ Невозможно добавить в акции без оптимальных цен.")
-            return False
-    
-    # Получаем артикулы и маппинг
-    offer_ids_list = []
-    for _, row in df.iterrows():
-        art = _artikul_normalize(row.get(key_col))
-        if art:
-            offer_ids_list.append(art)
-    
-    _, actions_info_list, offer_id_to_product_id = get_actions_for_products(offer_ids_list)
-    
-    if not actions_info_list:
-        print("⚠️ Активные акции не найдены.")
-        return False
-    
-    # Создаём маппинг product_id -> offer_id
-    product_id_to_offer_id = {}
-    for offer_id, product_id in offer_id_to_product_id.items():
-        product_id_to_offer_id[product_id] = offer_id
-    
-    offer_ids_set_for_candidates = set()
-    for oid in offer_ids_list:
-        normalized = _normalize_offer_id(oid)
-        if normalized:
-            offer_ids_set_for_candidates.add(normalized)
-            offer_ids_set_for_candidates.add(oid)
-    
-    # Создаём маппинг product_id -> (min_price, desired_price)
-    product_id_to_prices: Dict[int, Tuple[float, float]] = {}
+    limits: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
     for _, row in df.iterrows():
         art = _artikul_normalize(row.get(key_col))
         if not art:
             continue
-        
-        art_normalized = _normalize_offer_id(art)
-        product_id = offer_id_to_product_id.get(art_normalized) or offer_id_to_product_id.get(art)
-        
-        if product_id:
-            min_p = row.get(COL_MIN_PRICE)
-            des_p = row.get(COL_DESIRED_PRICE)
-            if min_p is not None and des_p is not None:
-                try:
-                    min_price_val = float(min_p)
-                    des_price_val = float(des_p)
-                    if min_price_val > 0 and des_price_val > 0:
-                        product_id_to_prices[product_id] = (min_price_val, des_price_val)
-                except (TypeError, ValueError):
-                    pass
-    
-    if not product_id_to_prices:
-        print("⚠️ Не найдено товаров с рассчитанными ценами.")
-        return False
-    
-    log_verbose("Проверка кандидатов для добавления в акции...")
-    preview_rows = []
-    for action_info in actions_info_list:
-        action_id = action_info["id"]
-        action_name = action_info["name"]
-        candidates = get_action_candidates(action_id, product_id_to_offer_id, offer_ids_set_for_candidates)
-        if not candidates:
-            continue
-        products_to_add = []
-        for product_id, product_info in candidates.items():
-            if product_id not in product_id_to_prices:
-                continue
-            
-            min_price, desired_price = product_id_to_prices[product_id]
-            
-            max_action_price = product_info.get("max_action_price")
-            if max_action_price is None:
-                continue
-            
+        min_price = _positive(row.get(COL_MIN_PRICE)) if COL_MIN_PRICE in df.columns else None
+        desired_price = _positive(row.get(COL_DESIRED_PRICE)) if COL_DESIRED_PRICE in df.columns else None
+        limits[_normalize_offer_id(art)] = (min_price, desired_price)
+    return limits
+
+
+# Подъём цены в акции меньше этого порога не предлагаем, чтобы не гонять мелкие правки.
+RAISE_MIN_STEP_RUB = 10.0
+RAISE_MIN_STEP_SHARE = 0.01
+
+
+def _empty_plan(ok: bool, message: str) -> Dict[str, Any]:
+    return {"ok": ok, "message": message, "items": []}
+
+
+def _load_plan_context(repo_root: Path, need_desired: bool) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Общая подготовка для планов: лимиты цен из costs.xlsx, акции и маппинг товаров.
+    Возвращает (context, None) или (None, план с ошибкой).
+    """
+    costs_path = repo_root / COSTS_FILENAME
+    if not costs_path.exists():
+        return None, _empty_plan(False, f"Файл {COSTS_FILENAME} не найден.")
+    df, key_col, _cost_col = load_costs_df(costs_path)
+    required = [COL_MIN_PRICE, COL_DESIRED_PRICE] if need_desired else [COL_MIN_PRICE]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        names = " и ".join(f"«{col}»" for col in missing)
+        return None, _empty_plan(False, f"Не найдены колонки {names}. Сначала рассчитайте оптимальные цены.")
+    limits = _load_offer_price_limits(df, key_col)
+    if not limits:
+        return None, _empty_plan(False, f"В {COSTS_FILENAME} нет артикулов.")
+    actions = [describe_action(action) for action in get_actions_list()]
+    actions = [action for action in actions if action["id"]]
+    if not actions:
+        return None, _empty_plan(True, "Активные акции не найдены.")
+    return {"limits": limits, "actions": actions, "pid_to_offer": get_product_id_mapping(list(limits))}, None
+
+
+def _boost_fields(action_info: Dict[str, Any], product: Dict[str, Any]) -> Dict[str, Any]:
+    """Диапазон бустинга и цена, при которой достигается максимальный бустинг."""
+    if action_info.get("action_type") == ACTION_TYPE_ELASTIC and float(product.get("max_boost") or 0) > 0:
+        return {
+            "boost_min": float(product.get("min_boost") or 0),
+            "boost_max": float(product.get("max_boost") or 0),
+            "max_boost_price": float(product.get("price_max_elastic") or 0) or None,
+        }
+    fixed = action_info.get("fixed_boost")
+    return {"boost_min": fixed, "boost_max": fixed, "max_boost_price": None}
+
+
+def _current_boost(action_info: Dict[str, Any], product: Dict[str, Any], price: float) -> Optional[float]:
+    reported = product.get("current_boost")
+    if reported:
+        return float(reported)
+    return boost_at_price(action_info, product, price)
+
+
+def _moscow_date(value: Optional[str]) -> Optional[str]:
+    """Дата из ответа Ozon (UTC, «2026-10-06T21:00:00Z») по московскому времени: «2026-10-07»."""
+    if not value:
+        return None
+    from datetime import datetime, timedelta
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)[:10]
+    return (moment + timedelta(hours=3)).date().isoformat()
+
+
+def _fetch_action_participants(action_id: Any) -> List[Dict[str, Any]]:
+    """Все товары-участники акции с повторами: Ozon иногда отвечает дольше 30 секунд."""
+    import time
+    import requests
+    from recommended_prices import OZON_HEADERS
+
+    products: List[Dict[str, Any]] = []
+    last_id = None
+    while True:
+        payload: Dict[str, Any] = {"action_id": action_id, "limit": 100}
+        if last_id:
+            payload["last_id"] = last_id
+        for attempt in range(2):
             try:
-                max_action_price_val = float(max_action_price)
-            except (TypeError, ValueError):
+                response = requests.post("https://api-seller.ozon.ru/v1/actions/products", headers=OZON_HEADERS, json=payload, timeout=45)
+                response.raise_for_status()
+                break
+            except requests.RequestException:
+                if attempt == 1:
+                    raise
+                time.sleep(3)
+        result = response.json().get("result") or {}
+        batch = result.get("products") or []
+        products.extend(batch)
+        last_id = result.get("last_id")
+        # Неполная страница — последняя: лишний запрос по last_id Ozon иногда держит очень долго.
+        if len(batch) < 100 or not last_id or last_id == "0":
+            return products
+
+
+def load_actions_calendar(repo_root: Path) -> Dict[str, Any]:
+    """
+    Календарь акций: даты, тип, бустинг, сколько ваших товаров участвует из возможных,
+    даты автодобавления Ozon и список участников с ценой в акции и бустингом.
+    """
+    from datetime import datetime
+
+    df, key_col, _ = load_costs_df(repo_root / COSTS_FILENAME)
+    offers = sorted({_normalize_offer_id(a) for a in (_artikul_normalize(v) for v in df[key_col]) if a})
+    pid_to_offer = get_product_id_mapping(offers)
+    from concurrent.futures import ThreadPoolExecutor
+
+    raw_actions = [raw for raw in get_actions_list() if describe_action(raw)["id"]]
+
+    def participants_of(raw: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        try:
+            return _fetch_action_participants(describe_action(raw)["id"]), None
+        except Exception as exc:
+            return [], f"Ozon не отдал список участников: {exc}"
+
+    # Параллельно: одна зависшая акция не задерживает остальные.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        loaded = list(pool.map(participants_of, raw_actions))
+
+    actions = []
+    for raw, (raw_products, error) in zip(raw_actions, loaded):
+        info = describe_action(raw)
+        participants = []
+        for product in raw_products:
+            action_price = float(product.get("action_price") or 0)
+            base_price = float(product.get("price") or 0)
+            participants.append({
+                "offer_id": pid_to_offer.get(product.get("id")) or f"id {product.get('id')}",
+                "action_price": action_price,
+                "price": base_price,
+                "discount": round(1 - action_price / base_price, 3) if base_price and action_price else None,
+                "boost": _current_boost(info, product, action_price) if action_price else None,
+            })
+        participants.sort(key=lambda item: (len(item["offer_id"]), item["offer_id"]))
+        actions.append({
+            "id": str(info["id"]),
+            "name": info["name"],
+            "type": info["action_type"],
+            "fixed_boost": info["fixed_boost"],
+            "start": _moscow_date(raw.get("date_start")),
+            "end": _moscow_date(raw.get("date_end")),
+            "auto_add_dates": [d for d in (_moscow_date(x) for x in raw.get("auto_add_dates") or []) if d],
+            "freeze_date": _moscow_date(raw.get("freeze_date")),
+            "can_add": int(raw.get("potential_products_count") or 0),   # сколько товаров ещё можно добавить
+            "participating": len(participants) if error is None else int(raw.get("participating_products_count") or 0),
+            "error": error,
+            "participants": participants,
+        })
+    actions.sort(key=lambda a: (a["start"] or "", a["name"]))
+    return {"loaded": datetime.now().isoformat(timespec="seconds"), "actions": actions}
+
+
+def _attach_visibility(items: List[Dict[str, Any]]) -> bool:
+    """Добавляет к позициям видимость в поиске за 14 дней. True, если Ozon отдал хоть что-то."""
+    product_ids = sorted({item["product_id"] for item in items})
+    skus = get_product_skus(product_ids)
+    visibility = get_search_visibility(sorted(set(skus.values())))
+    available = False
+    for item in items:
+        data = visibility.get(skus.get(item["product_id"]), {})
+        item["views"] = data.get("views")
+        item["position"] = data.get("position")
+        available = available or item["views"] is not None or item["position"] is not None
+    return available
+
+
+def _plan_message(items: List[Dict[str, Any]]) -> str:
+    labels = {"add": "добавить", "raise": "поднять цену", "remove": "удалить"}
+    counts = {kind: sum(1 for item in items if item["kind"] == kind) for kind in labels}
+    parts = [f"{labels[kind]}: {count}" for kind, count in counts.items() if count]
+    action_count = len({item["action_id"] for item in items})
+    return f"{', '.join(parts).capitalize()} — в {action_count} акциях."
+
+
+def build_action_removal_plan(repo_root: Path) -> Dict[str, Any]:
+    """
+    Собирает по свежим данным Ozon список товаров, у которых цена в акции
+    ниже минимальной цены продажи. Ничего не отправляет.
+    """
+    context, error_plan = _load_plan_context(repo_root, need_desired=False)
+    if error_plan:
+        return error_plan
+    limits, pid_to_offer = context["limits"], context["pid_to_offer"]
+
+    items: List[Dict[str, Any]] = []
+    for action_info in context["actions"]:
+        for product in fetch_action_products(action_info["id"], "products"):
+            offer_id = pid_to_offer.get(product.get("id"))
+            min_price = limits.get(offer_id or "", (None, None))[0]
+            action_price = float(product.get("action_price") or 0)
+            if min_price is None or action_price <= 0 or action_price >= min_price:
                 continue
-            
-            target_price = min(desired_price, max_action_price_val)
-            
-            if target_price >= min_price:
-                current_action_price = product_info.get("action_price", 0)
-                if current_action_price == 0 or current_action_price is None:
-                    stock = product_info.get("stock", 0) or 0
-                    offer_id = product_id_to_offer_id.get(product_id, "—")
-                    products_to_add.append({
-                        "product_id": product_id,
-                        "action_price": int(target_price),
-                        "stock": int(stock) if stock else 0
-                    })
-                    preview_rows.append({
-                        "product_id": product_id,
-                        "offer_id": offer_id,
-                        "action_name": action_name,
-                        "action_price": int(target_price),
-                        "stock": int(stock) if stock else 0,
-                    })
-
-    if not preview_rows:
-        print("⚠️ Не найдено товаров, которые можно добавить в акции.")
-        return False
-
-    print("✅ Кандидаты для добавления в акции:")
-    for row in preview_rows:
-        print(f"   {row['offer_id']} | {row['action_name']} | {row['action_price']}")
-
-    if not prompt_yes_no("Продолжить добавление товаров в акции?", default_yes=False):
-        print("❌ Добавление отменено.")
-        return False
-
-    total_added = 0
-    for action_info in actions_info_list:
-        action_id = action_info["id"]
-        action_name = action_info["name"]
-        products_to_add = []
-        for row in preview_rows:
-            if row["action_name"] != action_name:
-                continue
-            products_to_add.append({
-                "product_id": row["product_id"],
-                "action_price": row["action_price"],
-                "stock": row["stock"],
+            boost = _current_boost(action_info, product, action_price)
+            items.append({
+                "kind": "remove",
+                "action_id": action_info["id"],
+                "action_name": action_info["name"],
+                "action_type": action_info["action_type"],
+                "product_id": product["id"],
+                "offer_id": offer_id,
+                "action_price": action_price,
+                "current_price": action_price,
+                "min_price": min_price,
+                "boost_now": boost,
+                "boost_new": None,
+                **_boost_fields(action_info, product),
+                "selected": True,
             })
 
-        if products_to_add:
-            result = activate_products_in_action(action_id, products_to_add)
-            added = result.get("product_ids", []) or []
-            rejected = result.get("rejected", []) or []
-            total_added += len(added)
-            log_verbose(f"Акция {action_name}: добавлено {len(added)}, не добавлено {len(rejected)}")
-    print(f"✅ Добавление в акции завершено. Всего добавлено: {total_added} товаров.")
-    return True
+    if not items:
+        return _empty_plan(True, "Товаров с ценой в акции ниже минимальной не найдено.")
+    visibility_available = _attach_visibility(items)
+    return {"ok": True, "message": _plan_message(items), "items": items, "visibility_available": visibility_available}
+
+
+def build_action_add_plan(repo_root: Path) -> Dict[str, Any]:
+    """
+    Собирает план для акций: добавить товары, которые ещё не участвуют,
+    и поднять цену участвующим, если её можно приблизить к желательной.
+    Цена всегда не ниже минимальной и не выше максимума акции. Ничего не отправляет.
+    """
+    context, error_plan = _load_plan_context(repo_root, need_desired=True)
+    if error_plan:
+        return error_plan
+    limits, pid_to_offer = context["limits"], context["pid_to_offer"]
+
+    items: List[Dict[str, Any]] = []
+    for action_info in context["actions"]:
+        base = {
+            "action_id": action_info["id"],
+            "action_name": action_info["name"],
+            "action_type": action_info["action_type"],
+        }
+        for endpoint in ("candidates", "products"):
+            for product in fetch_action_products(action_info["id"], endpoint):
+                offer_id = pid_to_offer.get(product.get("id"))
+                min_price, desired_price = limits.get(offer_id or "", (None, None))
+                if min_price is None or desired_price is None:
+                    continue
+                try:
+                    max_action_price = float(product.get("max_action_price"))
+                except (TypeError, ValueError):
+                    continue
+                price = pick_action_price(min_price, desired_price, max_action_price)
+                if price is None:
+                    continue
+                current_price = float(product.get("action_price") or 0)
+                item = {
+                    **base,
+                    "product_id": product["id"],
+                    "offer_id": offer_id,
+                    "action_price": price,
+                    "min_price": min_price,
+                    "desired_price": desired_price,
+                    "max_action_price": max_action_price,
+                    "stock": int(product.get("stock") or 0),
+                    "boost_new": boost_at_price(action_info, product, price),
+                    **_boost_fields(action_info, product),
+                }
+                if current_price <= 0:
+                    if endpoint == "products":
+                        continue
+                    item.update(kind="add", current_price=None, boost_now=None, selected=True)
+                else:
+                    # Ниже минимальной — задача удаления; поднимаем только заметно.
+                    step = max(RAISE_MIN_STEP_RUB, current_price * RAISE_MIN_STEP_SHARE)
+                    if current_price < min_price or price - current_price < step:
+                        continue
+                    boost_now = _current_boost(action_info, product, current_price)
+                    boost_new = item["boost_new"]
+                    # Подъём, который снижает бустинг, по умолчанию не отмечаем.
+                    keeps_boost = boost_now is None or boost_new is None or boost_new >= boost_now
+                    item.update(kind="raise", current_price=current_price, boost_now=boost_now, selected=keeps_boost)
+                items.append(item)
+
+    if not items:
+        return _empty_plan(True, "Не найдено товаров, которые можно выгодно добавить в акции или поднять в цене.")
+    visibility_available = _attach_visibility(items)
+    return {"ok": True, "message": _plan_message(items), "items": items, "visibility_available": visibility_available}
+
+
+def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """
+    Отправляет план в Ozon (mode: "remove" или "add" — добавление и подъём цены)
+    и перепроверяет по факту: позиция считается выполненной, только если Ozon
+    после отправки показывает новое состояние товара в акции.
+    """
+    items = [item for item in plan.get("items") or [] if item.get("selected", True)]
+    by_action: Dict[Any, List[Dict[str, Any]]] = {}
+    for item in items:
+        by_action.setdefault(item["action_id"], []).append(item)
+
+    confirmed = 0
+    rejected: List[Dict[str, Any]] = []
+    unconfirmed: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for action_id, action_items in by_action.items():
+        action_name = action_items[0]["action_name"]
+        by_product = {item["product_id"]: item for item in action_items}
+        if mode == "remove":
+            result = deactivate_products_in_action(action_id, list(by_product))
+        else:
+            result = activate_products_in_action(
+                action_id,
+                [
+                    {"product_id": item["product_id"], "action_price": item["action_price"], "stock": item["stock"]}
+                    for item in action_items
+                ],
+            )
+        rejected_ids = set()
+        for entry in result.get("rejected") or []:
+            product_id = entry.get("product_id")
+            rejected_ids.add(product_id)
+            rejected.append({
+                "action_name": action_name,
+                "offer_id": by_product.get(product_id, {}).get("offer_id", str(product_id)),
+                "reason": entry.get("reason") or "причина не указана",
+            })
+        errors.extend(f"{action_name}: {error}" for error in result.get("errors") or [])
+
+        actual = {product["id"]: product for product in fetch_action_products(action_id, "products")}
+        for product_id, item in by_product.items():
+            if product_id in rejected_ids:
+                continue
+            product = actual.get(product_id)
+            if mode == "remove":
+                applied = product is None
+            else:
+                applied = product is not None and abs(float(product.get("action_price") or 0) - item["action_price"]) < 0.5
+            if applied:
+                confirmed += 1
+            else:
+                unconfirmed.append({"action_name": action_name, "offer_id": item["offer_id"]})
+
+    verb = "Удалено из акций" if mode == "remove" else "Применено в акциях"
+    message = f"{verb}: {confirmed} из {len(items)} (проверено по данным Ozon)."
+    if rejected:
+        message += f" Ozon отклонил: {len(rejected)}."
+    if unconfirmed:
+        message += f" Не применилось без объяснения: {len(unconfirmed)}."
+    if errors:
+        message += f" Ошибок запросов: {len(errors)}."
+    return {
+        "ok": confirmed == len(items) and not errors,
+        "done": confirmed,
+        "expected": len(items),
+        "rejected": rejected,
+        "unconfirmed": unconfirmed,
+        "errors": errors,
+        "message": message,
+    }
+
+
+def _ru_date(value: str) -> str:
+    return f"{value[8:10]}.{value[5:7]}"
+
+
+def upcoming_action_scope(raw_action: Dict[str, Any], today: str) -> Optional[Dict[str, Any]]:
+    """
+    Акция «предстоящая», если она ещё не началась или у неё впереди дата автодобавления Ozon.
+    Возвращает {"start", "auto_add": [даты ≥ сегодня]} или None. Даты — «YYYY-MM-DD» по Москве.
+    """
+    start = _moscow_date(raw_action.get("date_start"))
+    auto_add = sorted(d for d in (_moscow_date(x) for x in raw_action.get("auto_add_dates") or []) if d and d >= today)
+    if (start and start > today) or auto_add:
+        return {"start": start, "auto_add": auto_add}
+    return None
+
+
+def plan_upcoming_action_items(
+    action_info: Dict[str, Any],
+    scope: Dict[str, Any],
+    participants: List[Dict[str, Any]],
+    candidates: List[Dict[str, Any]],
+    limits: Dict[str, Tuple[Optional[float], Optional[float]]],
+    pid_to_offer: Dict[Any, str],
+) -> List[Dict[str, Any]]:
+    """
+    Порядок в одной предстоящей акции (ничего не отправляет):
+    • участник с ценой ниже минимальной — поднять цену до приемлемой, если акция позволяет, иначе удалить;
+    • кандидат, для которого есть цена не ниже минимальной, — добавить сейчас по цене ближе к желаемой
+      (раньше, чем Ozon добавит его сам по своей цене);
+    • кандидат, у которого максимум акции ниже минимальной цены, — предупреждение: Ozon может добавить его
+      сам, а отключить автодобавление через API нельзя.
+    """
+    base = {"action_id": action_info["id"], "action_name": action_info["name"], "action_type": action_info["action_type"]}
+    auto_text = ", ".join(_ru_date(d) for d in scope["auto_add"])
+    starts_text = f"акция начнётся {_ru_date(scope['start'])}" if scope.get("start") and not scope["auto_add"] else ""
+    items: List[Dict[str, Any]] = []
+
+    def price_of(product: Dict[str, Any], key: str) -> Optional[float]:
+        try:
+            value = float(product.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    for product in participants:
+        offer_id = pid_to_offer.get(product.get("id"))
+        min_price, desired_price = limits.get(offer_id or "", (None, None))
+        current = price_of(product, "action_price")
+        if min_price is None or current is None or current >= min_price:
+            continue
+        auto = product.get("add_mode") == "AUTO"
+        who = "Ozon добавил товар сам" if auto else "Товар в акции"
+        max_price = price_of(product, "max_action_price")
+        target = pick_action_price(min_price, desired_price or min_price, max_price) if max_price else None
+        item = {
+            **base,
+            "product_id": product["id"],
+            "offer_id": offer_id,
+            "min_price": min_price,
+            "desired_price": desired_price,
+            "max_action_price": max_price,
+            "stock": int(product.get("stock") or 0),
+            "current_price": current,
+            "boost_now": _current_boost(action_info, product, current),
+            "added_by_ozon": auto,
+            "selected": True,
+            **_boost_fields(action_info, product),
+        }
+        if target is not None and target > current:
+            item.update(kind="raise", action_price=target, boost_new=boost_at_price(action_info, product, target),
+                        note=f"{who} по цене ниже минимальной — поднимаем до приемлемой.")
+        else:
+            item.update(kind="remove", action_price=current, boost_new=None,
+                        note=f"{who}, а максимальная цена акции ниже вашей минимальной — удаляем.")
+        items.append(item)
+
+    for product in candidates:
+        offer_id = pid_to_offer.get(product.get("id"))
+        min_price, desired_price = limits.get(offer_id or "", (None, None))
+        max_price = price_of(product, "max_action_price")
+        if min_price is None or max_price is None:
+            continue
+        target = pick_action_price(min_price, desired_price or min_price, max_price)
+        item = {
+            **base,
+            "product_id": product["id"],
+            "offer_id": offer_id,
+            "min_price": min_price,
+            "desired_price": desired_price,
+            "max_action_price": max_price,
+            "stock": int(product.get("stock") or 0),
+            "current_price": None,
+            "boost_now": None,
+            "added_by_ozon": False,
+            **_boost_fields(action_info, product),
+        }
+        if target is not None:
+            when = f"Ozon может добавить сам {auto_text} — добавляем заранее по своей цене." if auto_text else (starts_text.capitalize() + ".")
+            item.update(kind="add", action_price=target, boost_new=boost_at_price(action_info, product, target), selected=True, note=when)
+            items.append(item)
+        elif auto_text:
+            gap = f"{min_price - max_price:,.0f}".replace(",", " ")
+            item.update(kind="watch", action_price=max_price, boost_new=None, selected=False,
+                        note=f"Ozon может добавить сам {auto_text}: цена в акции будет на {gap} ₽ ниже минимальной.")
+            items.append(item)
+    return items
+
+
+def build_upcoming_actions_plan(repo_root: Path, today: Optional[str] = None) -> Dict[str, Any]:
+    """
+    План «порядок в предстоящих акциях»: акции, которые ещё не начались или куда Ozon скоро
+    добавит товары сам. Ничего не отправляет.
+    """
+    from datetime import datetime, timedelta, timezone
+    from concurrent.futures import ThreadPoolExecutor
+
+    today = today or (datetime.now(timezone.utc) + timedelta(hours=3)).date().isoformat()
+    context, error_plan = _load_plan_context(repo_root, need_desired=False)
+    if error_plan:
+        return error_plan
+    limits, pid_to_offer = context["limits"], context["pid_to_offer"]
+    raw_by_id = {str(raw.get("id")): raw for raw in get_actions_list()}
+    targets = []
+    for action_info in context["actions"]:
+        scope = upcoming_action_scope(raw_by_id.get(str(action_info["id"])) or {}, today)
+        if scope:
+            targets.append((action_info, scope))
+    if not targets:
+        return _empty_plan(True, "Предстоящих акций и запланированных автодобавлений Ozon нет.")
+
+    def load(target):
+        action_info, scope = target
+        return (_fetch_action_participants(action_info["id"]), fetch_action_products(action_info["id"], "candidates"))
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        loaded = list(pool.map(load, targets))
+
+    items: List[Dict[str, Any]] = []
+    for (action_info, scope), (participants, candidates) in zip(targets, loaded):
+        items.extend(plan_upcoming_action_items(action_info, scope, participants, candidates, limits, pid_to_offer))
+
+    names = ", ".join(f"«{info['name']}»" for info, _ in targets)
+    if not items:
+        return _empty_plan(True, f"Проверены предстоящие акции ({names}): всё в порядке, менять нечего.")
+    labels = {"add": "добавить", "raise": "поднять цену", "remove": "удалить", "watch": "под присмотром"}
+    counts = [f"{label}: {sum(1 for item in items if item['kind'] == kind)}" for kind, label in labels.items()
+              if any(item["kind"] == kind for item in items)]
+    message = f"Предстоящие акции ({names}). " + ", ".join(counts).capitalize() + "."
+    visibility_available = _attach_visibility(items)
+    return {"ok": True, "message": message, "items": items, "visibility_available": visibility_available}
+
+
+def execute_upcoming_actions_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Отправляет отмеченные позиции плана предстоящих акций: удаления и добавления/подъёмы отдельно."""
+    selected = [item for item in plan.get("items") or [] if item.get("selected") and item["kind"] in ("add", "raise", "remove")]
+    results = []
+    removals = [item for item in selected if item["kind"] == "remove"]
+    additions = [item for item in selected if item["kind"] in ("add", "raise")]
+    if removals:
+        results.append(execute_action_plan({"items": removals}, "remove"))
+    if additions:
+        results.append(execute_action_plan({"items": additions}, "add"))
+    done = sum(r["done"] for r in results)
+    merged = {
+        "done": done,
+        "expected": len(selected),
+        "rejected": [x for r in results for x in r["rejected"]],
+        "unconfirmed": [x for r in results for x in r["unconfirmed"]],
+        "errors": [x for r in results for x in r["errors"]],
+    }
+    message = f"Применено в предстоящих акциях: {done} из {len(selected)} (проверено по данным Ozon)."
+    if merged["rejected"]:
+        message += f" Ozon отклонил: {len(merged['rejected'])}."
+    if merged["unconfirmed"]:
+        message += f" Не применилось без объяснения: {len(merged['unconfirmed'])}."
+    if merged["errors"]:
+        message += f" Ошибок запросов: {len(merged['errors'])}."
+    merged.update(ok=done == len(selected) and not merged["errors"], message=message)
+    return merged
+
+
+def _format_boost(value: Optional[float]) -> str:
+    return "—" if value is None else f"{value:g}%"
+
+
+def _run_action_plan(plan: Dict[str, Any], mode: str, question: str) -> bool:
+    """Печатает план, спрашивает подтверждение, отправляет и печатает итог."""
+    message = str(plan.get("message") or "")
+    if not plan.get("ok"):
+        print(f"❌ {message}")
+        return False
+    print(message)
+    if not plan["items"]:
+        return True
+    labels = {"add": "добавить", "raise": "поднять", "remove": "удалить"}
+    for item in plan["items"]:
+        if item["kind"] == "remove":
+            prices = f"в акции {item['action_price']:.0f} руб. < мин. {item['min_price']:.0f} руб."
+            boost = f"буст {_format_boost(item['boost_now'])} будет потерян"
+        elif item["kind"] == "raise":
+            prices = f"{item['current_price']:.0f} -> {item['action_price']} руб."
+            boost = f"буст {_format_boost(item['boost_now'])} -> {_format_boost(item['boost_new'])}"
+        else:
+            prices = f"{item['action_price']} руб. (мин. {item['min_price']:.0f} руб.)"
+            boost = f"буст {_format_boost(item['boost_new'])}"
+        mark = "" if item.get("selected", True) else " (не отмечено: снижает буст)"
+        print(f"   [{labels[item['kind']]}{mark}] {item['offer_id']} | {item['action_name']} | {prices} | {boost}")
+    if not prompt_yes_no(question, default_yes=False):
+        print("❌ Отменено, в Ozon ничего не отправлено.")
+        return False
+    result = execute_action_plan(plan, mode)
+    print(("✅ " if result["ok"] else "⚠️ ") + result["message"])
+    for entry in result["rejected"]:
+        print(f"   ✖ {entry['offer_id']} | {entry['action_name']}: {entry['reason']}")
+    for entry in result["unconfirmed"]:
+        print(f"   ✖ {entry['offer_id']} | {entry['action_name']}: Ozon не применил изменение")
+    for error in result["errors"]:
+        print(f"   ✖ {error}")
+    return result["ok"]
+
+
+def action_remove_unprofitable_actions(repo_root: Path) -> bool:
+    """
+    Действие 5: Удалить невыгодные акции.
+    Удаление товаров из акций, где цена в акции меньше минимальной.
+    """
+    print_step("Удалить невыгодные акции")
+    return _run_action_plan(build_action_removal_plan(repo_root), "remove", "Удалить эти товары из акций?")
+
+
+def action_add_to_actions(repo_root: Path) -> bool:
+    """
+    Действие 6: Добавить товары в акции и поднять цены участвующим.
+    Цена в диапазоне от минимальной до желательной, не выше максимума акции.
+    """
+    print_step("Добавить товары в акции")
+    return _run_action_plan(build_action_add_plan(repo_root), "add", "Применить эти изменения в акциях?")
 
 
 @locked_costs
