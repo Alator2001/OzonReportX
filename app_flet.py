@@ -4,6 +4,7 @@ import os
 import asyncio
 import json
 import queue
+import signal
 import re
 import requests
 import subprocess
@@ -123,8 +124,9 @@ ROOT = Path(__file__).resolve().parent
 SCRIPTS = ROOT / "scripts"
 PYTHON = next(
     (p for p in [ROOT / ".venv" / "Scripts" / "python.exe", ROOT / ".venv" / "bin" / "python"] if p.exists()),
-    Path("python"),
+    Path(sys.executable),
 )
+MONO_FONT = "Consolas" if os.name == "nt" else "Menlo" if sys.platform == "darwin" else "monospace"
 
 BG = "#F5F5F7"
 SURFACE = "#FFFFFF"
@@ -212,6 +214,23 @@ def open_path(path: Path) -> None:
     subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
 
 
+def kill_process_tree(proc: subprocess.Popen, force: bool = False) -> None:
+    """Stop the child process together with the scripts it started."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return
+    # stream_process starts children in their own session, so the group id equals the child pid.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
 def stream_process(
     cmd: list[str],
     on_line,
@@ -239,12 +258,13 @@ def stream_process(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        start_new_session=os.name != "nt",
     )
     if proc_holder is not None:
         proc_holder["proc"] = proc
     try:
         if cancel_event is not None and cancel_event.is_set():
-            proc.kill()
+            kill_process_tree(proc, force=True)
         lines = deque(maxlen=500)
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -268,7 +288,10 @@ def stream_process(
         return proc.returncode, "".join(lines).strip()
     finally:
         if proc.poll() is None:
-            proc.kill()
+            try:
+                kill_process_tree(proc, force=True)
+            except Exception:
+                proc.kill()
             proc.wait()
         if proc.stdout is not None:
             proc.stdout.close()
@@ -1269,10 +1292,38 @@ def themed_color(color: str | None, dark: bool) -> str | None:
     return light_to_dark.get(color, color) if dark else dark_to_light.get(color, color)
 
 
+UI_STATE_PATH = ROOT / ".cache" / "ui_state.json"
+
+
+def load_ui_state(path: Path = UI_STATE_PATH) -> dict:
+    """Настройки внешнего вида между запусками; повреждённый или пустой файл — значения по умолчанию."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_ui_state(updates: dict, path: Path = UI_STATE_PATH) -> None:
+    state = load_ui_state(path)
+    state.update(updates)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def system_prefers_dark(brightness: ft.Brightness | None) -> bool:
+    """Тема системы (macOS/Windows); если Flet её не сообщил — тёмная, как раньше."""
+    return brightness != ft.Brightness.LIGHT
+
+
 def main(page: ft.Page) -> None:
     page.title = "OzonReportX"
-    page.theme_mode = ft.ThemeMode.DARK
-    page.bgcolor = "#1A1F23"
+    start_dark = system_prefers_dark(page.platform_brightness)
+    page.theme_mode = ft.ThemeMode.DARK if start_dark else ft.ThemeMode.LIGHT
+    page.bgcolor = "#1A1F23" if start_dark else BG
     page.padding = 16
     try:
         page.window.maximized = True
@@ -1288,7 +1339,11 @@ def main(page: ft.Page) -> None:
     page.window_min_height = 640
     # Страница не прокручивается: прокрутка внутри разделов и меню.
     page.scroll = None
-    current_dark = {"value": True}
+    current_dark = {"value": start_dark}
+    # Пока пользователь не выбрал тему кнопкой, приложение повторяет тему системы.
+    follow_system_theme = {"value": True}
+    # Свёрнутое боковое меню: только иконки, чтобы на маленьком экране осталось место для содержимого.
+    sidebar_collapsed = {"value": bool(load_ui_state().get("sidebar_collapsed", False))}
 
     today = date.today()
     prev = today.replace(day=1) - timedelta(days=1)
@@ -1547,7 +1602,7 @@ def main(page: ft.Page) -> None:
             size=12,
             color="#F3F4F6" if current_dark["value"] else TEXT,
             selectable=True,
-            font_family="Consolas",
+            font_family=MONO_FONT,
         )
 
     def _sync_log_theme() -> None:
@@ -1608,6 +1663,7 @@ def main(page: ft.Page) -> None:
             status_shell.bgcolor = "#1F252A" if current_dark["value"] else "#FBFCFF"
             status_shell.border = ft.Border.all(1, "#353D42" if current_dark["value"] else "#E1E5EE")
         spin.visible = busy
+        status_shell.tooltip = f"{title}. {detail_text}" if sidebar_collapsed["value"] and detail_text else (title if sidebar_collapsed["value"] else None)
         cancel_button.visible = (busy and cancellable) or active_proc["proc"] is not None
         cancel_row.visible = cancel_button.visible
         if status_ui_ready["value"] and page.controls:
@@ -1826,7 +1882,12 @@ def main(page: ft.Page) -> None:
         ai_model_select.focused_border_color = PRIMARY
         ai_model_select.label_style = ft.TextStyle(color=tokens["muted"], size=11)
         ai_model_select.bgcolor = "transparent"
-        ai_tools_button.content = ft.Text("Инструменты", size=12, weight=ft.FontWeight.W_700, color=tokens["text"])
+        ai_tools_button.content = (
+            ft.Icon(ft.Icons.HANDYMAN_OUTLINED, size=20, color=tokens["text"])
+            if sidebar_collapsed["value"]
+            else ft.Text("Инструменты", size=12, weight=ft.FontWeight.W_700, color=tokens["text"])
+        )
+        ai_tools_button.tooltip = "Инструменты"
         ai_tools_button.menu_bgcolor = "#22272B" if current_dark["value"] else "#FBFCFF"
         ai_top_title.color = tokens["text"]
         ai_top_subtitle.color = tokens["muted"]
@@ -2338,15 +2399,7 @@ def main(page: ft.Page) -> None:
         if proc is None:
             return
         try:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-            else:
-                proc.terminate()
+            kill_process_tree(proc)
         except Exception:
             try:
                 proc.kill()
@@ -7832,7 +7885,14 @@ def main(page: ft.Page) -> None:
         icon=ft.Icons.DARK_MODE_OUTLINED,
         selected_icon=ft.Icons.LIGHT_MODE_OUTLINED,
         tooltip="Переключить тему",
-        selected=True,
+        selected=start_dark,
+    )
+
+    sidebar_button = ft.IconButton(
+        icon=ft.Icons.MENU_OPEN_ROUNDED,
+        selected_icon=ft.Icons.MENU_ROUNDED,
+        tooltip="Свернуть меню",
+        selected=False,
     )
 
     store_buttons = {}
@@ -7846,7 +7906,7 @@ def main(page: ft.Page) -> None:
             button.bgcolor = ("#0D6B5B" if dark else "#DCEFE9") if selected else "transparent"
             button.content.controls[0].color = ("#FFFFFF" if dark else PRIMARY) if selected else ("#A1A1A6" if dark else MUTED)
             button.content.controls[1].color = ("#FFFFFF" if dark else TEXT) if selected else ("#A1A1A6" if dark else MUTED)
-            button.content.controls[2].visible = selected
+            button.content.controls[2].visible = selected and not sidebar_collapsed["value"]
             button.content.controls[2].color = "#FFFFFF" if dark else PRIMARY
 
     def select_store(key):
@@ -8013,6 +8073,8 @@ def main(page: ft.Page) -> None:
         theme_button.selected = dark
         theme_button.icon_color = "#B6C0BC" if dark else "#4F5B66"
         theme_button.selected_icon_color = "#B6C0BC" if dark else "#4F5B66"
+        sidebar_button.icon_color = "#B6C0BC" if dark else "#4F5B66"
+        sidebar_button.selected_icon_color = "#B6C0BC" if dark else "#4F5B66"
         menu_bar_inner.bgcolor = "#23282D" if dark else "#FFFFFF"
         menu_bar_inner.border = ft.Border.all(1, "#384046" if dark else "#E5E7EF")
         apply_control_theme(rail_brand_card, dark)
@@ -8037,7 +8099,61 @@ def main(page: ft.Page) -> None:
         set_status(state.value, status_detail.value, status_tone["value"], busy=spin.visible, cancellable=cancel_button.visible)
         page.update()
 
-    theme_button.on_click = lambda _e: apply_theme(not theme_button.selected)
+    def toggle_theme(_e=None) -> None:
+        dark = not theme_button.selected
+        # Выбор, совпадающий с системой, снова включает автоматическое следование за ней.
+        follow_system_theme["value"] = dark == system_prefers_dark(page.platform_brightness)
+        apply_theme(dark)
+
+    def on_platform_brightness_change(_e) -> None:
+        if follow_system_theme["value"]:
+            # Flet 0.84 присылает обычный Event без поля brightness, но к этому моменту обновляет страницу.
+            dark = system_prefers_dark(page.platform_brightness)
+            if dark != current_dark["value"]:
+                apply_theme(dark)
+
+    theme_button.on_click = toggle_theme
+
+    def apply_sidebar_layout() -> None:
+        collapsed = sidebar_collapsed["value"]
+        sidebar.width = 92 if collapsed else 264
+        sidebar_button.selected = collapsed
+        sidebar_button.tooltip = "Развернуть меню" if collapsed else "Свернуть меню"
+        tools = [menu_bar_inner, theme_button, sidebar_button]
+        top_tools_shell.content = (
+            ft.Column(tools, spacing=4, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+            if collapsed
+            else ft.Row(tools, spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        )
+        menu_bar_inner.padding = ft.Padding.symmetric(horizontal=4 if collapsed else 10, vertical=6)
+        rail.extended = not collapsed
+        rail.label_type = ft.NavigationRailLabelType.NONE if collapsed else ft.NavigationRailLabelType.ALL
+        rail.min_width = 56 if collapsed else 92
+        for destination in rail.destinations:
+            destination.tooltip = destination.label if collapsed else None
+        rail_shell.padding = 6 if collapsed else 12
+        rail_brand_card.width = 56 if collapsed else 216
+        rail_brand_card.padding = 4 if collapsed else 7
+        for button in store_buttons.values():
+            button.content.controls[1].visible = not collapsed
+            button.padding = ft.Padding.symmetric(horizontal=14 if collapsed else 12, vertical=11)
+        state.visible = not collapsed
+        status_detail.visible = not collapsed
+        cancel_button.content = ft.Icon(ft.Icons.CLOSE_ROUNDED, size=16, color="white") if collapsed else "Отмена"
+        cancel_button.tooltip = "Отмена" if collapsed else None
+        status_shell.padding = ft.Padding.symmetric(horizontal=8 if collapsed else 14, vertical=10)
+        style_store_tabs()
+        ai_apply_chat_theme()
+        set_status(state.value, status_detail.value, status_tone["value"], busy=spin.visible, cancellable=cancel_button.visible)
+
+    def toggle_sidebar(_e=None) -> None:
+        sidebar_collapsed["value"] = not sidebar_collapsed["value"]
+        save_ui_state({"sidebar_collapsed": sidebar_collapsed["value"]})
+        apply_sidebar_layout()
+        page.update()
+
+    sidebar_button.on_click = toggle_sidebar
+    page.on_platform_brightness_change = on_platform_brightness_change
 
     menu_bar_inner = ft.Container(
         content=ft.Row(
@@ -8058,6 +8174,7 @@ def main(page: ft.Page) -> None:
             [
                 menu_bar_inner,
                 theme_button,
+                sidebar_button,
             ],
             spacing=10,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -8145,7 +8262,8 @@ def main(page: ft.Page) -> None:
     page.overlay.append(splash_overlay)
     status_ui_ready["value"] = True
     set_status("Запуск", "Подготавливаем интерфейс и данные.", ACCENT, busy=True)
-    apply_theme(True)
+    apply_sidebar_layout()
+    apply_theme(start_dark)
 
     async def initialize_app() -> None:
         page.update()

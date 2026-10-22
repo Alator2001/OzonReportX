@@ -1,7 +1,8 @@
 # 15. Тесты
 
 ```bash
-.venv/Scripts/python.exe -m unittest discover -s tests
+.venv/Scripts/python.exe -m unittest discover -s tests   # Windows
+.venv/bin/python -m unittest discover -s tests           # macOS
 ```
 
 Только так: тесты импортируют друг друга как модули верхнего уровня (`import test_technical_fixes`),

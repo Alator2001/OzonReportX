@@ -73,7 +73,6 @@ Ozon отвечает 400, ошибка глотается, возвращает
 
 ### 9. Мелочи автообновления
 - `CURRENT_VERSION = "1.0.0"` в `_auto_update.py` — запасное значение, если нет `version.txt`.
-- Временная папка жёстко задана как `~/AppData/Local/Temp/ozonreportx_update` (только Windows).
 - Список `preserve` не содержит `fbo_supply_settings.json`, `wb_supply_settings.json`, `ads_settings.json`,
   `actions history`, `analytics history`, `ads reports`. Сейчас это безопасно: файлов нет в zipball
   релиза (они в `.gitignore`), и обновление их не трогает.

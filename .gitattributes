@@ -1,0 +1,3 @@
+# Скрипты запуска для macOS должны оставаться с LF, иначе bash их не выполнит.
+*.command text eol=lf
+*.sh text eol=lf

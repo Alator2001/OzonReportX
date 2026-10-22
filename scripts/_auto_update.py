@@ -115,6 +115,16 @@ def create_backup(repo_root):
     return backup_dir
 
 
+def restore_launcher_permissions(folder):
+    """zipfile не сохраняет права доступа: возвращаем бит запуска скриптам macOS/Linux."""
+    if os.name == "nt":
+        return
+    for pattern in ("*.command", "*.sh"):
+        for script in Path(folder).rglob(pattern):
+            if script.is_file():
+                script.chmod(script.stat().st_mode | 0o755)
+
+
 def apply_update(source_dir, repo_root):
     """Применяет обновление, копируя файлы"""
     print("Установка обновления...")
@@ -141,6 +151,7 @@ def apply_update(source_dir, repo_root):
                 shutil.copytree(item, pending / item.name)
             else:
                 shutil.copy2(item, pending / item.name)
+        restore_launcher_permissions(pending)
 
         applied = []
         try:
@@ -232,7 +243,7 @@ def check_and_update(assume_yes=False, restart=True):
     
     # Процесс обновления
     repo_root = Path(__file__).resolve().parent.parent
-    temp_dir = Path.home() / "AppData" / "Local" / "Temp" / "ozonreportx_update"
+    temp_dir = Path(tempfile.gettempdir()) / "ozonreportx_update"
     
     try:
         # Создаём временную папку

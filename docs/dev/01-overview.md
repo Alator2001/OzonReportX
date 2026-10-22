@@ -34,9 +34,11 @@ OzonReportX — локальное настольное приложение п�
 ```
 OzonReportX/
 ├── app_flet.py               # настольное приложение (Flet), ~8 тыс. строк, всё в main(page)
-├── OzonReportX_UI.bat        # запуск приложения (основной способ)
+├── OzonReportX_UI.bat        # запуск приложения (основной способ), Windows
 ├── OzonReportX.bat           # консольное меню (старый интерфейс, first_run_setup.py)
 ├── Export_Data.bat / Import_Data.bat   # перенос данных на другой компьютер
+├── *.command                 # те же четыре лаунчера для macOS (bash, должны быть исполняемыми)
+├── .gitattributes            # держит *.command и *.sh с LF
 ├── version.txt               # текущая версия, читается автообновлением
 ├── .env.example              # шаблон ключей API
 ├── config/
@@ -92,6 +94,21 @@ OzonReportX/
 ключи настраиваются мастером в самом приложении (`needs_setup` → `open_marketplace_settings`,
 `app_flet.py:8164`), обновление — кнопкой в «Настройках».
 
+### macOS — `OzonReportX_UI.command`
+
+Делает то же самое, что `.bat`, но с `.venv/bin/python`. Системный Python ищется как `python3.14`,
+затем `python3` (команды `python` на macOS нет); в `PATH` добавляются `/opt/homebrew/bin` и `/usr/local/bin`,
+потому что при двойном клике в Finder профиль оболочки может не подхватить Homebrew.
+Лаунчеры `OzonReportX.command`, `Export_Data.command`, `Import_Data.command` повторяют соответствующие `.bat`.
+
+Код приложения кроссплатформенный: интерпретатор ищется в `.venv/Scripts/python.exe` и `.venv/bin/python`
+(запасной вариант — `sys.executable`), файлы открываются через `open`, блокировки — через `fcntl`,
+отмена задачи убивает всю группу процессов (см. [02](02-app-architecture.md#отмена)).
+
+Права на запуск `.command` хранятся в git (`100755`). Новый лаунчер добавляйте с
+`git update-index --chmod=+x <файл>`. Автообновление распаковывает zipball через `zipfile`, который права
+не сохраняет, поэтому `apply_update` заново ставит бит запуска на `*.command` и `*.sh`.
+
 ### Консольный путь — `OzonReportX.bat`
 
 Запускает `first_run_setup.py` без флагов: окружение → мастер ключей в терминале
@@ -103,7 +120,8 @@ OzonReportX/
 
 `ensure_deps` ставит `config/requirements.lock.txt` (если его нет — `requirements.txt`)
 и запоминает SHA-256 файла в `.venv/.bootstrap_done`. Пока хеш не изменился, установка пропускается.
-После изменения зависимостей обновите lock-файл: `.venv\Scripts\python.exe -m pip freeze`.
+После изменения зависимостей обновите lock-файл: `.venv\Scripts\python.exe -m pip freeze`
+(на macOS — `.venv/bin/python -m pip freeze`). Lock-файл не должен содержать пакетов только для одной ОС.
 
 Python — **3.14** (`.python-version`). Ключевые библиотеки: `flet 0.84`, `pandas 2.3`,
 `openpyxl 3.1`, `requests 2.32`, `matplotlib`, `plotly`, `python-dotenv`.
@@ -119,6 +137,8 @@ Python — **3.14** (`.python-version`). Ключевые библиотеки: 
 .venv/Scripts/python.exe scripts/fbo_supply_plan.py --lead-days 14 --cover-days 30 --service-level 0.9
 .venv/Scripts/python.exe scripts/ui_actions.py refresh-pricing
 ```
+
+На macOS вместо `.venv/Scripts/python.exe` — `.venv/bin/python`.
 
 Модули импортируют друг друга двумя способами — как пакет (`from scripts.x import ...`, когда
 импортирует `app_flet.py`) и как соседний файл (`from x import ...`, когда скрипт запущен напрямую).
@@ -211,10 +231,22 @@ Python — **3.14** (`.python-version`). Ключевые библиотеки: 
 предварительно копируя перезаписываемые файлы в `backup_<дата>/`, и отбрасывает пути вне проекта.
 Список переносимого неполный — см. [99](99-known-issues.md).
 
+Особенности для macOS (общие для обеих ОС, тесты — `tests/test_transfer_data.py`):
+- `import` принимает и zip, и распакованную папку: Safari по умолчанию распаковывает скачанный zip сам.
+- Пропускаются `__MACOSX/`, `._*` и `.DS_Store`. Если все записи лежат в одной лишней папке
+  (архив пересжат через Finder), она снимается — кроме случая, когда это папка программы, например `reports`.
+- Имена приводятся к NFC и при экспорте, и при импорте: macOS может хранить кириллицу разложенной (NFD:
+  «й» = «и» + знак), а приложение ищет месяцы в именах отчётов регулярками с составными буквами.
+- `Import_Data.command`: Finder не передаёт перетащенный на `.command` файл, поэтому архив берётся из аргумента,
+  затем самый свежий `OzonReportX_transfer_*` в папке проекта, затем в `~/Downloads`, иначе — окно выбора
+  файла (`osascript … choose file`). Перед импортом показывается путь и спрашивается подтверждение.
+- `Export_Data.command` после экспорта показывает архив в Finder (`open -R`).
+
 ## Тесты
 
 ```bash
-.venv/Scripts/python.exe -m unittest discover -s tests
+.venv/Scripts/python.exe -m unittest discover -s tests   # Windows
+.venv/bin/python -m unittest discover -s tests           # macOS
 ```
 
 Запускать именно через `discover -s tests`: тесты импортируют друг друга как модули верхнего

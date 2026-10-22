@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from collections import deque
@@ -394,6 +395,66 @@ class OfflineTests(unittest.TestCase):
         proc.kill.assert_called_once()
         self.assertIsNone(holder["proc"])
         self.assertTrue(proc.stdout.closed)
+
+    def test_ui_state_round_trip_and_bad_file(self):
+        path = self.directory / "ui_state.json"
+        load = ui_function("load_ui_state", {"json": __import__("json"), "Path": Path, "UI_STATE_PATH": path})
+        save = ui_function("save_ui_state", {"json": __import__("json"), "Path": Path, "UI_STATE_PATH": path, "load_ui_state": load})
+        self.assertEqual(load(path), {})
+        save({"sidebar_collapsed": True}, path)
+        save({"other": 1}, path)
+        self.assertEqual(load(path), {"sidebar_collapsed": True, "other": 1})
+        path.write_text("{broken", encoding="utf-8")
+        self.assertEqual(load(path), {})
+
+    def test_theme_follows_system_brightness(self):
+        brightness = types.SimpleNamespace(LIGHT="light", DARK="dark")
+        fn = ui_function("system_prefers_dark", {"ft": types.SimpleNamespace(Brightness=brightness)})
+        self.assertFalse(fn("light"))
+        self.assertTrue(fn("dark"))
+        # Flet did not report the system theme: keep the previous dark default.
+        self.assertTrue(fn(None))
+
+    @unittest.skipIf(os.name == "nt", "process groups are POSIX-only")
+    def test_cancel_kills_grandchild_processes(self):
+        import signal
+        kill_tree = ui_function("kill_process_tree", {"os": os, "subprocess": subprocess, "signal": signal})
+        fn = ui_function("stream_process", {
+            "os": os, "subprocess": subprocess, "ROOT": ROOT, "kill_process_tree": kill_tree,
+        })
+        # The child prints its grandchild's pid and waits on it, like recommended_prices -> Monthly_sales_report.
+        script = (
+            "import subprocess, sys\n"
+            "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "print(g.pid, flush=True)\n"
+            "g.wait()\n"
+        )
+        holder = {}
+        grandchild = []
+        def on_line(line):
+            grandchild.append(int(line))
+            kill_tree(holder["proc"])
+        fn([sys.executable, "-c", script], on_line, proc_holder=holder)
+        for _ in range(50):
+            try:
+                os.kill(grandchild[0], 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(grandchild[0], signal.SIGKILL)
+            self.fail("grandchild survived cancellation")
+
+    @unittest.skipIf(os.name == "nt", "execute bit is POSIX-only")
+    def test_update_restores_launcher_execute_bit(self):
+        repo = self.directory / "repo"
+        source = self.directory / "release"
+        repo.mkdir(); source.mkdir()
+        launcher = source / "OzonReportX_UI.command"
+        launcher.write_text("#!/bin/bash\n", encoding="utf-8")
+        launcher.chmod(0o644)
+        updater.apply_update(source, repo)
+        self.assertTrue(os.access(repo / "OzonReportX_UI.command", os.X_OK))
 
     def test_update_copy_failure_keeps_installed_files(self):
         repo = self.directory / "repo"
