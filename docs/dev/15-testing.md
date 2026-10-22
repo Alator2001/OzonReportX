@@ -21,7 +21,7 @@
 - **Без пользовательских файлов.** Временные файлы — в `.cache/technical-fix-tests/` (через `tempfile`),
   `costs.xlsx` и отчёты пользователя не трогаются.
 - Чистую логику (расчёты, планы) выносите в функции без сети — их легко проверить на подставных данных
-  (`build_plan`, `analyze_product`, `analyze_item`, `plan_upcoming_action_items`, `action_exit_price`).
+  (`build_plan`, `analyze_product`, `analyze_item`, `_plan_entry_prices`, `action_exit_price`).
 - Для изменений, которые отправляют что-то во внешний API, проверяйте **точный payload** (адрес, тело, единицы
   денег) — именно здесь ломается при переходах Ozon на новые версии методов.
 

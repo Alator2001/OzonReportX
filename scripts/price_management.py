@@ -799,147 +799,329 @@ def _attach_visibility(items: List[Dict[str, Any]]) -> bool:
     return available
 
 
-def _unify_exit_prices(items: List[Dict[str, Any]]) -> None:
-    """У товара одна цена на все акции: каждой позиции удаления — наибольшая цена выхода этого товара."""
-    best: Dict[Any, int] = {}
+PLAN_PRICE_CONFLICT_NOTE = "Не отправляем: цена добавления вернёт товар в акцию, из которой он выводится в этом же плане."
+
+
+def _plan_entry_prices(entries: List[Tuple[Any, Any, float, Optional[float], Optional[float], bool]]) -> Dict[str, Dict[Any, int]]:
+    """
+    Одна цена товара на все акции плана (единая цена Ozon).
+    entries: (product_id, action_id, минимальная, желательная, лимит акции, обязательная). Обязательная акция —
+    где товар уже участвует и остаётся: цена не должна быть выше её лимита. Необязательная — куда товар только
+    добавляется. Акции, где цены не ниже минимальной нет, не учитываются.
+
+    Необязательные акции перебираются от высокого лимита к низкому. Акция входит в общую цену, если снижает её
+    незаметно (не больше max(10 ₽, 1%), как и порог подъёма); иначе — в "costly" с ценой, которая станет у товара
+    во всех акциях, если всё же добавить его туда (решает пользователь).
+    Возвращает {"price": {product_id: цена}, "costly": {(product_id, action_id): цена}}.
+    """
+    by_product: Dict[Any, List[Tuple[Any, float, float, float, bool]]] = {}
+    for product_id, action_id, min_price, desired_price, max_action_price, required in entries:
+        desired_price = desired_price or min_price
+        if not max_action_price or pick_action_price(min_price, desired_price, max_action_price) is None:
+            continue
+        by_product.setdefault(product_id, []).append((action_id, min_price, desired_price, max_action_price, required))
+
+    prices: Dict[Any, int] = {}
+    costly: Dict[Any, int] = {}
+    for product_id, rows in by_product.items():
+        min_price, desired_price = rows[0][1], rows[0][2]
+        required_caps = [cap for _, _, _, cap, required in rows if required]
+        price = pick_action_price(min_price, desired_price, min(required_caps)) if required_caps else None
+        optional = sorted((row for row in rows if not row[4]), key=lambda row: -row[3])
+        for action_id, _, _, cap, _ in optional:
+            lowered = pick_action_price(min_price, desired_price, cap if price is None else min(cap, price))
+            if lowered is None:
+                continue
+            if price is None or price - lowered <= max(RAISE_MIN_STEP_RUB, price * RAISE_MIN_STEP_SHARE):
+                price = lowered
+            else:
+                costly[(product_id, action_id)] = lowered
+        if price is not None:
+            prices[product_id] = price
+    return {"price": prices, "costly": costly}
+
+
+def _costly_note(price: Optional[int], lowered: int) -> str:
+    def rub(value: float) -> str:
+        return f"{value:,.0f}".replace(",", " ")
+    if price is None:
+        return f"Не отмечено: цена товара во всех акциях станет {rub(lowered)} ₽."
+    return (f"Не отмечено: участие снизит цену товара во всех акциях с {rub(price)} до {rub(lowered)} ₽ "
+            f"(−{rub(price - lowered)} ₽). Отметьте, если бустинг того стоит.")
+
+
+def _unify_plan_prices(items: List[Dict[str, Any]]) -> None:
+    """
+    Единая цена Ozon: у товара одна цена на все акции, поэтому и в плане у него одна цена.
+    • добавление и подъём — наименьшая из целевых цен отмеченных позиций товара (она не выше лимита каждой
+      из этих акций); у неотмеченных остаётся своя цена — та, что станет у товара, если их отметить;
+    • вывод — наибольшая из цен выхода, а если товар в этом же плане добавляется в другую акцию по цене
+      не ниже её, то цена добавления: она тоже выводит товар, и цена не скачет дважды;
+    • если цена добавления вернёт товар в акцию, из которой он выводится, добавление и подъём снимаются
+      с отметки — вывод из невыгодной акции важнее.
+    """
+    entry: Dict[Any, float] = {}
+    exit_: Dict[Any, int] = {}
     for item in items:
-        if item.get("kind") == "remove" and item.get("exit_price"):
-            best[item["product_id"]] = max(item["exit_price"], best.get(item["product_id"], 0))
+        product_id = item["product_id"]
+        if item.get("kind") in ("add", "raise") and item.get("selected", True):
+            entry[product_id] = min(item["action_price"], entry.get(product_id, item["action_price"]))
+        elif item.get("kind") == "remove" and item.get("exit_price"):
+            exit_[product_id] = max(item["exit_price"], exit_.get(product_id, 0))
     for item in items:
-        if item.get("kind") == "remove" and item.get("exit_price"):
-            item["exit_price"] = best[item["product_id"]]
+        product_id = item["product_id"]
+        if item.get("kind") in ("add", "raise") and item.get("selected", True):
+            item["action_price"] = entry[product_id]
+            if product_id in exit_ and entry[product_id] < exit_[product_id]:
+                item.update(selected=False, conflict=True, note=PLAN_PRICE_CONFLICT_NOTE)
+        elif item.get("kind") == "remove" and item.get("exit_price"):
+            price = exit_[product_id]
+            if entry.get(product_id, 0) >= price:
+                price = entry[product_id]
+            item["exit_price"] = price
 
 
 def _plan_message(items: List[Dict[str, Any]]) -> str:
-    labels = {"add": "добавить", "raise": "поднять цену", "remove": "удалить"}
+    labels = {"add": "добавить", "raise": "поднять цену", "remove": "удалить", "watch": "предупреждений об автодобавлении"}
     counts = {kind: sum(1 for item in items if item["kind"] == kind) for kind in labels}
     parts = [f"{labels[kind]}: {count}" for kind, count in counts.items() if count]
     action_count = len({item["action_id"] for item in items})
     return f"{', '.join(parts).capitalize()} — в {action_count} акциях."
 
 
+def _moscow_today() -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).date().isoformat()
+
+
+def _future_start(action_info: Dict[str, Any], today: str) -> Optional[str]:
+    """Дата начала акции по Москве («YYYY-MM-DD»), если акция ещё не началась, иначе None."""
+    start = _moscow_date(action_info.get("date_start"))
+    return start if start and start > today else None
+
+
+def _removal_note(added_by_ozon: bool, action_start: Optional[str]) -> Optional[str]:
+    parts = []
+    if action_start:
+        parts.append(f"Акция начнётся {_ru_date(action_start)} — до этого цена товара не меняется.")
+    if added_by_ozon:
+        parts.append("Ozon добавил товар сам (автодобавление).")
+    return " ".join(parts) or None
+
+
 def build_action_removal_plan(repo_root: Path) -> Dict[str, Any]:
     """
-    Собирает по свежим данным Ozon список товаров, у которых цена в акции
-    ниже минимальной цены продажи. Ничего не отправляет.
+    Собирает по свежим данным Ozon товары, у которых цена в акции ниже минимальной цены продажи
+    (в том числе в акциях, которые ещё не начались). Для каждого:
+    • акция позволяет цену не ниже минимальной — поднять цену до приемлемой (`raise`), бустинг сохраняется;
+    • не позволяет — вывести из акции ценой выше её лимита (`remove`).
+    У товара одна цена на все акции (`_plan_entry_prices`): подъём не выше лимита акций, где товар остаётся.
+    Ничего не отправляет.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     context, error_plan = _load_plan_context(repo_root, need_desired=False)
     if error_plan:
         return error_plan
     limits, pid_to_offer = context["limits"], context["pid_to_offer"]
+    today = _moscow_today()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        loaded = list(pool.map(lambda action_info: fetch_action_products(action_info["id"], "products"), context["actions"]))
+
+    entries = []
+    for action_info, products in zip(context["actions"], loaded):
+        for product in products:
+            min_price, desired_price = limits.get(pid_to_offer.get(product.get("id")) or "", (None, None))
+            if min_price is not None:
+                entries.append((product["id"], action_info["id"], min_price, desired_price,
+                                float(product.get("max_action_price") or 0), True))
+    entry_prices = _plan_entry_prices(entries)["price"]
 
     items: List[Dict[str, Any]] = []
-    for action_info in context["actions"]:
-        for product in fetch_action_products(action_info["id"], "products"):
+    for action_info, products in zip(context["actions"], loaded):
+        action_start = _future_start(action_info, today)
+        for product in products:
             offer_id = pid_to_offer.get(product.get("id"))
             min_price, desired_price = limits.get(offer_id or "", (None, None))
             action_price = float(product.get("action_price") or 0)
             if min_price is None or action_price <= 0 or action_price >= min_price:
                 continue
-            boost = _current_boost(action_info, product, action_price)
             max_action_price = float(product.get("max_action_price") or 0) or None
-            exit_price = action_exit_price(max_action_price, min_price)
-            items.append({
-                "kind": "remove",
+            product_price = float(product.get("price") or 0) or None
+            added_by_ozon = product.get("add_mode") == "AUTO"
+            own = pick_action_price(min_price, desired_price or min_price, max_action_price) if max_action_price else None
+            target = min(own, entry_prices.get(product["id"], own)) if own is not None else None
+            item = {
                 "action_id": action_info["id"],
                 "action_name": action_info["name"],
                 "action_type": action_info["action_type"],
                 "product_id": product["id"],
                 "offer_id": offer_id,
-                "action_price": action_price,
                 "current_price": action_price,
                 "min_price": min_price,
                 "desired_price": desired_price,
                 "max_action_price": max_action_price,
-                "exit_price": exit_price,
-                "boost_now": boost,
-                "boost_new": None,
+                "stock": int(product.get("stock") or 0),
+                "product_price": product_price,
+                "action_start": action_start,
+                "added_by_ozon": added_by_ozon,
+                "boost_now": _current_boost(action_info, product, action_price),
                 **_boost_fields(action_info, product),
-                "selected": exit_price is not None,
-            })
+            }
+            notes = [_removal_note(added_by_ozon, action_start)]
+            if target is not None and target > action_price:
+                notes.insert(0, "Акция позволяет цену не ниже минимальной — поднимаем цену вместо вывода, бустинг сохранится.")
+                item.update(kind="raise", action_price=target, boost_new=boost_at_price(action_info, product, target), selected=True)
+            else:
+                exit_price = action_exit_price(max_action_price, min_price, product_price)
+                item.update(kind="remove", action_price=action_price, exit_price=exit_price, boost_new=None,
+                            selected=exit_price is not None)
+            item["note"] = " ".join(note for note in notes if note) or None
+            items.append(item)
 
     if not items:
         return _empty_plan(True, "Товаров с ценой в акции ниже минимальной не найдено.")
-    _unify_exit_prices(items)
+    _unify_plan_prices(items)
     visibility_available = _attach_visibility(items)
     return {"ok": True, "message": _plan_message(items), "items": items, "visibility_available": visibility_available}
+
+
+def _auto_add_watch(
+    action_info: Dict[str, Any], product: Dict[str, Any], offer_id: Optional[str],
+    min_price: float, desired_price: Optional[float], max_action_price: float, today: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Предупреждение: Ozon добавит кандидата в акцию сам по цене ниже минимальной. Ozon добавляет товар, пока лимит
+    акции не ниже минимальной цены, записанной в Ozon (`min_seller_price`), — если она ниже вашей, Ozon считает
+    невыгодную цену допустимой. None, если дат автодобавления впереди нет или минимальная в Ozon выше лимита.
+    """
+    dates = sorted(d for d in (_moscow_date(x) for x in action_info.get("auto_add_dates") or []) if d and d >= today)
+    ozon_min = float(product.get("min_seller_price") or 0) or None
+    if not dates or (ozon_min is not None and ozon_min > max_action_price):
+        return None
+    gap = f"{min_price - max_action_price:,.0f}".replace(",", " ")
+    return {
+        "kind": "watch",
+        "action_id": action_info["id"],
+        "action_name": action_info["name"],
+        "action_type": action_info["action_type"],
+        "product_id": product["id"],
+        "offer_id": offer_id,
+        "action_price": max_action_price,
+        "min_price": min_price,
+        "desired_price": desired_price,
+        "max_action_price": max_action_price,
+        "ozon_min_price": ozon_min,
+        "auto_add": dates,
+        "current_price": None,
+        "boost_now": None,
+        "boost_new": None,
+        "selected": False,
+        "note": f"Ozon может добавить сам {', '.join(_ru_date(d) for d in dates)}: цена в акции будет на {gap} ₽ ниже минимальной.",
+        **_boost_fields(action_info, product),
+    }
 
 
 def build_action_add_plan(repo_root: Path) -> Dict[str, Any]:
     """
     Собирает план для акций: добавить товары, которые ещё не участвуют,
     и поднять цену участвующим, если её можно приблизить к желательной.
-    Цена всегда не ниже минимальной и не выше максимума акции. Ничего не отправляет.
+    Цена всегда не ниже минимальной и не выше максимума акции. У товара одна цена на все акции (единая цена
+    Ozon, `_plan_entry_prices`): она не выше лимита акций, где товар уже участвует по цене не ниже минимальной,
+    и акций, куда он добавляется без заметной потери в цене. Акция, ради которой цену пришлось бы заметно
+    снизить, попадает в план без отметки.
+    Кандидат, для которого цены не ниже минимальной нет, но Ozon скоро добавит его сам (дата автодобавления впереди,
+    а минимальная цена в Ozon не выше лимита акции), — предупреждение `watch`: только для сведения, не отправляется.
+    Ничего не отправляет.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     context, error_plan = _load_plan_context(repo_root, need_desired=True)
     if error_plan:
         return error_plan
     limits, pid_to_offer = context["limits"], context["pid_to_offer"]
+    today = _moscow_today()
+
+    targets = [(action_info, endpoint) for action_info in context["actions"] for endpoint in ("candidates", "products")]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        loaded = list(pool.map(lambda target: fetch_action_products(target[0]["id"], target[1]), targets))
+
+    rows = []
+    watches: List[Dict[str, Any]] = []
+    for (action_info, endpoint), products in zip(targets, loaded):
+        for product in products:
+            offer_id = pid_to_offer.get(product.get("id"))
+            min_price, desired_price = limits.get(offer_id or "", (None, None))
+            if min_price is None or desired_price is None:
+                continue
+            try:
+                max_action_price = float(product.get("max_action_price"))
+            except (TypeError, ValueError):
+                continue
+            current_price = float(product.get("action_price") or 0)
+            if current_price <= 0 and endpoint == "products":
+                continue
+            if current_price <= 0 and pick_action_price(min_price, desired_price, max_action_price) is None:
+                watch = _auto_add_watch(action_info, product, offer_id, min_price, desired_price, max_action_price, today)
+                if watch:
+                    watches.append(watch)
+                continue
+            # Участник ниже минимальной — задача удаления, его акцию не учитываем.
+            if 0 < current_price < min_price or pick_action_price(min_price, desired_price, max_action_price) is None:
+                continue
+            rows.append((action_info, endpoint, product, offer_id, min_price, desired_price, max_action_price, current_price))
+    entry = _plan_entry_prices([(row[2]["id"], row[0]["id"], row[4], row[5], row[6], row[7] > 0) for row in rows])
 
     items: List[Dict[str, Any]] = []
-    for action_info in context["actions"]:
-        base = {
+    for action_info, endpoint, product, offer_id, min_price, desired_price, max_action_price, current_price in rows:
+        common = entry["price"].get(product["id"])
+        lowered = entry["costly"].get((product["id"], action_info["id"]))
+        price = lowered or common
+        if price is None:
+            continue
+        item = {
             "action_id": action_info["id"],
             "action_name": action_info["name"],
             "action_type": action_info["action_type"],
+            "product_id": product["id"],
+            "offer_id": offer_id,
+            "action_price": price,
+            "min_price": min_price,
+            "desired_price": desired_price,
+            "max_action_price": max_action_price,
+            "stock": int(product.get("stock") or 0),
+            "boost_new": boost_at_price(action_info, product, price),
+            **_boost_fields(action_info, product),
         }
-        for endpoint in ("candidates", "products"):
-            for product in fetch_action_products(action_info["id"], endpoint):
-                offer_id = pid_to_offer.get(product.get("id"))
-                min_price, desired_price = limits.get(offer_id or "", (None, None))
-                if min_price is None or desired_price is None:
-                    continue
-                try:
-                    max_action_price = float(product.get("max_action_price"))
-                except (TypeError, ValueError):
-                    continue
-                price = pick_action_price(min_price, desired_price, max_action_price)
-                if price is None:
-                    continue
-                current_price = float(product.get("action_price") or 0)
-                item = {
-                    **base,
-                    "product_id": product["id"],
-                    "offer_id": offer_id,
-                    "action_price": price,
-                    "min_price": min_price,
-                    "desired_price": desired_price,
-                    "max_action_price": max_action_price,
-                    "stock": int(product.get("stock") or 0),
-                    "boost_new": boost_at_price(action_info, product, price),
-                    **_boost_fields(action_info, product),
-                }
-                if current_price <= 0:
-                    if endpoint == "products":
-                        continue
-                    item.update(kind="add", current_price=None, boost_now=None, selected=True)
-                else:
-                    # Ниже минимальной — задача удаления; поднимаем только заметно.
-                    step = max(RAISE_MIN_STEP_RUB, current_price * RAISE_MIN_STEP_SHARE)
-                    if current_price < min_price or price - current_price < step:
-                        continue
-                    boost_now = _current_boost(action_info, product, current_price)
-                    boost_new = item["boost_new"]
-                    # Подъём, который снижает бустинг, по умолчанию не отмечаем.
-                    keeps_boost = boost_now is None or boost_new is None or boost_new >= boost_now
-                    item.update(kind="raise", current_price=current_price, boost_now=boost_now, selected=keeps_boost)
-                items.append(item)
+        if current_price <= 0:
+            item.update(kind="add", current_price=None, boost_now=None, selected=lowered is None)
+            if lowered is not None:
+                item.update(costly=True, note=_costly_note(common, lowered))
+        else:
+            # Поднимаем только заметно.
+            step = max(RAISE_MIN_STEP_RUB, current_price * RAISE_MIN_STEP_SHARE)
+            if price - current_price < step:
+                continue
+            boost_now = _current_boost(action_info, product, current_price)
+            boost_new = item["boost_new"]
+            # Подъём, который снижает бустинг, по умолчанию не отмечаем.
+            keeps_boost = boost_now is None or boost_new is None or boost_new >= boost_now
+            item.update(kind="raise", current_price=current_price, boost_now=boost_now, selected=keeps_boost)
+        items.append(item)
+    items.extend(watches)
 
     if not items:
         return _empty_plan(True, "Не найдено товаров, которые можно выгодно добавить в акции или поднять в цене.")
+    _unify_plan_prices(items)
     visibility_available = _attach_visibility(items)
     return {"ok": True, "message": _plan_message(items), "items": items, "visibility_available": visibility_available}
 
 
-def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
+def _send_plan_items(items: List[Dict[str, Any]], removing: bool) -> Dict[str, Any]:
     """
-    Отправляет план в Ozon (mode: "remove" или "add" — добавление и подъём цены)
-    и перепроверяет по факту: позиция считается выполненной, только если Ozon
-    после отправки показывает новое состояние товара в акции.
+    Отправляет позиции одного вида (вывод или добавление/подъём) по акциям и перепроверяет по факту:
+    позиция выполнена, только если Ozon после отправки показывает новое состояние товара в акции.
     """
-    items = [item for item in plan.get("items") or [] if item.get("selected", True)]
-    if mode == "remove":
-        _unify_exit_prices(items)
     by_action: Dict[Any, List[Dict[str, Any]]] = {}
     for item in items:
         by_action.setdefault(item["action_id"], []).append(item)
@@ -951,7 +1133,7 @@ def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
     for action_id, action_items in by_action.items():
         action_name = action_items[0]["action_name"]
         by_product = {item["product_id"]: item for item in action_items}
-        if mode == "remove":
+        if removing:
             # Единая цена Ozon: товар выходит из бустинга, когда его цена выше лимита акции.
             without_price = [item for item in action_items if not item.get("exit_price")]
             for item in without_price:
@@ -984,7 +1166,7 @@ def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
             if product_id in rejected_ids:
                 continue
             product = actual.get(product_id)
-            if mode == "remove":
+            if removing:
                 applied = product is None
             else:
                 applied = product is not None and abs(float(product.get("action_price") or 0) - item["action_price"]) < 0.5
@@ -992,9 +1174,36 @@ def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
                 confirmed += 1
             else:
                 unconfirmed.append({"action_name": action_name, "offer_id": item["offer_id"]})
+    return {"done": confirmed, "rejected": rejected, "unconfirmed": unconfirmed, "errors": errors}
 
-    verb = "Удалено из акций" if mode == "remove" else "Применено в акциях"
-    message = f"{verb}: {confirmed} из {len(items)} (проверено по данным Ozon)."
+
+def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """
+    Отправляет отмеченные позиции плана в Ozon (mode: "remove" — «Удалить невыгодные», вывод и подъём цены;
+    "add" — добавление и подъём). Сначала выводы, затем добавления и подъёмы; у товара одна цена на все позиции
+    (`_unify_plan_prices`). Добавление, которое вернёт товар в акцию, откуда он выводится, не отправляется.
+    Предупреждения `watch` не отправляются никогда.
+    """
+    selected = [item for item in plan.get("items") or []
+                if item.get("selected", True) and item["kind"] in ("add", "raise", "remove")]
+    _unify_plan_prices(selected)
+    skipped = [item for item in selected if not item.get("selected", True)]
+    selected = [item for item in selected if item.get("selected", True)]
+    removals = [item for item in selected if item["kind"] == "remove"]
+    entries = [item for item in selected if item["kind"] in ("add", "raise")]
+    results = []
+    if removals:
+        results.append(_send_plan_items(removals, removing=True))
+    if entries:
+        results.append(_send_plan_items(entries, removing=False))
+
+    done = sum(r["done"] for r in results)
+    rejected = [x for r in results for x in r["rejected"]]
+    unconfirmed = [x for r in results for x in r["unconfirmed"]]
+    errors = ([f"{item['action_name']}: {item['offer_id']} — {PLAN_PRICE_CONFLICT_NOTE}" for item in skipped]
+              + [x for r in results for x in r["errors"]])
+    verb = "Удалено из акций" if mode == "remove" and not entries else "Применено в акциях"
+    message = f"{verb}: {done} из {len(selected)} (проверено по данным Ozon)."
     if rejected:
         message += f" Ozon отклонил: {len(rejected)}."
     if unconfirmed:
@@ -1002,9 +1211,9 @@ def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
     if errors:
         message += f" Ошибок запросов: {len(errors)}."
     return {
-        "ok": confirmed == len(items) and not errors,
-        "done": confirmed,
-        "expected": len(items),
+        "ok": done == len(selected) and not errors,
+        "done": done,
+        "expected": len(selected),
         "rejected": rejected,
         "unconfirmed": unconfirmed,
         "errors": errors,
@@ -1014,185 +1223,6 @@ def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
 
 def _ru_date(value: str) -> str:
     return f"{value[8:10]}.{value[5:7]}"
-
-
-def upcoming_action_scope(raw_action: Dict[str, Any], today: str) -> Optional[Dict[str, Any]]:
-    """
-    Акция «предстоящая», если она ещё не началась или у неё впереди дата автодобавления Ozon.
-    Возвращает {"start", "auto_add": [даты ≥ сегодня]} или None. Даты — «YYYY-MM-DD» по Москве.
-    """
-    start = _moscow_date(raw_action.get("date_start"))
-    auto_add = sorted(d for d in (_moscow_date(x) for x in raw_action.get("auto_add_dates") or []) if d and d >= today)
-    if (start and start > today) or auto_add:
-        return {"start": start, "auto_add": auto_add}
-    return None
-
-
-def plan_upcoming_action_items(
-    action_info: Dict[str, Any],
-    scope: Dict[str, Any],
-    participants: List[Dict[str, Any]],
-    candidates: List[Dict[str, Any]],
-    limits: Dict[str, Tuple[Optional[float], Optional[float]]],
-    pid_to_offer: Dict[Any, str],
-) -> List[Dict[str, Any]]:
-    """
-    Порядок в одной предстоящей акции (ничего не отправляет):
-    • участник с ценой ниже минимальной — поднять цену до приемлемой, если акция позволяет, иначе удалить;
-    • кандидат, для которого есть цена не ниже минимальной, — добавить сейчас по цене ближе к желаемой
-      (раньше, чем Ozon добавит его сам по своей цене);
-    • кандидат, у которого максимум акции ниже минимальной цены, — предупреждение: Ozon может добавить его
-      сам, а отключить автодобавление через API нельзя.
-    """
-    base = {"action_id": action_info["id"], "action_name": action_info["name"], "action_type": action_info["action_type"]}
-    auto_text = ", ".join(_ru_date(d) for d in scope["auto_add"])
-    starts_text = f"акция начнётся {_ru_date(scope['start'])}" if scope.get("start") and not scope["auto_add"] else ""
-    items: List[Dict[str, Any]] = []
-
-    def price_of(product: Dict[str, Any], key: str) -> Optional[float]:
-        try:
-            value = float(product.get(key))
-        except (TypeError, ValueError):
-            return None
-        return value if value > 0 else None
-
-    for product in participants:
-        offer_id = pid_to_offer.get(product.get("id"))
-        min_price, desired_price = limits.get(offer_id or "", (None, None))
-        current = price_of(product, "action_price")
-        if min_price is None or current is None or current >= min_price:
-            continue
-        auto = product.get("add_mode") == "AUTO"
-        who = "Ozon добавил товар сам" if auto else "Товар в акции"
-        max_price = price_of(product, "max_action_price")
-        target = pick_action_price(min_price, desired_price or min_price, max_price) if max_price else None
-        item = {
-            **base,
-            "product_id": product["id"],
-            "offer_id": offer_id,
-            "min_price": min_price,
-            "desired_price": desired_price,
-            "max_action_price": max_price,
-            "stock": int(product.get("stock") or 0),
-            "current_price": current,
-            "boost_now": _current_boost(action_info, product, current),
-            "added_by_ozon": auto,
-            "selected": True,
-            **_boost_fields(action_info, product),
-        }
-        if target is not None and target > current:
-            item.update(kind="raise", action_price=target, boost_new=boost_at_price(action_info, product, target),
-                        note=f"{who} по цене ниже минимальной — поднимаем до приемлемой.")
-        else:
-            exit_price = action_exit_price(max_price, min_price)
-            item.update(kind="remove", action_price=current, boost_new=None, exit_price=exit_price, selected=exit_price is not None,
-                        note=f"{who}, а максимальная цена акции ниже вашей минимальной — выводим из акции.")
-        items.append(item)
-
-    for product in candidates:
-        offer_id = pid_to_offer.get(product.get("id"))
-        min_price, desired_price = limits.get(offer_id or "", (None, None))
-        max_price = price_of(product, "max_action_price")
-        if min_price is None or max_price is None:
-            continue
-        target = pick_action_price(min_price, desired_price or min_price, max_price)
-        item = {
-            **base,
-            "product_id": product["id"],
-            "offer_id": offer_id,
-            "min_price": min_price,
-            "desired_price": desired_price,
-            "max_action_price": max_price,
-            "stock": int(product.get("stock") or 0),
-            "current_price": None,
-            "boost_now": None,
-            "added_by_ozon": False,
-            **_boost_fields(action_info, product),
-        }
-        if target is not None:
-            when = f"Ozon может добавить сам {auto_text} — добавляем заранее по своей цене." if auto_text else (starts_text.capitalize() + ".")
-            item.update(kind="add", action_price=target, boost_new=boost_at_price(action_info, product, target), selected=True, note=when)
-            items.append(item)
-        elif auto_text:
-            gap = f"{min_price - max_price:,.0f}".replace(",", " ")
-            item.update(kind="watch", action_price=max_price, boost_new=None, selected=False,
-                        note=f"Ozon может добавить сам {auto_text}: цена в акции будет на {gap} ₽ ниже минимальной.")
-            items.append(item)
-    return items
-
-
-def build_upcoming_actions_plan(repo_root: Path, today: Optional[str] = None) -> Dict[str, Any]:
-    """
-    План «порядок в предстоящих акциях»: акции, которые ещё не начались или куда Ozon скоро
-    добавит товары сам. Ничего не отправляет.
-    """
-    from datetime import datetime, timedelta, timezone
-    from concurrent.futures import ThreadPoolExecutor
-
-    today = today or (datetime.now(timezone.utc) + timedelta(hours=3)).date().isoformat()
-    context, error_plan = _load_plan_context(repo_root, need_desired=False)
-    if error_plan:
-        return error_plan
-    limits, pid_to_offer = context["limits"], context["pid_to_offer"]
-    raw_by_id = {str(raw.get("id")): raw for raw in get_actions_list()}
-    targets = []
-    for action_info in context["actions"]:
-        scope = upcoming_action_scope(raw_by_id.get(str(action_info["id"])) or {}, today)
-        if scope:
-            targets.append((action_info, scope))
-    if not targets:
-        return _empty_plan(True, "Предстоящих акций и запланированных автодобавлений Ozon нет.")
-
-    def load(target):
-        action_info, scope = target
-        return (_fetch_action_participants(action_info["id"]), fetch_action_products(action_info["id"], "candidates"))
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        loaded = list(pool.map(load, targets))
-
-    items: List[Dict[str, Any]] = []
-    for (action_info, scope), (participants, candidates) in zip(targets, loaded):
-        items.extend(plan_upcoming_action_items(action_info, scope, participants, candidates, limits, pid_to_offer))
-
-    _unify_exit_prices(items)
-    names = ", ".join(f"«{info['name']}»" for info, _ in targets)
-    if not items:
-        return _empty_plan(True, f"Проверены предстоящие акции ({names}): всё в порядке, менять нечего.")
-    labels = {"add": "добавить", "raise": "поднять цену", "remove": "удалить", "watch": "под присмотром"}
-    counts = [f"{label}: {sum(1 for item in items if item['kind'] == kind)}" for kind, label in labels.items()
-              if any(item["kind"] == kind for item in items)]
-    message = f"Предстоящие акции ({names}). " + ", ".join(counts).capitalize() + "."
-    visibility_available = _attach_visibility(items)
-    return {"ok": True, "message": message, "items": items, "visibility_available": visibility_available}
-
-
-def execute_upcoming_actions_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """Отправляет отмеченные позиции плана предстоящих акций: удаления и добавления/подъёмы отдельно."""
-    selected = [item for item in plan.get("items") or [] if item.get("selected") and item["kind"] in ("add", "raise", "remove")]
-    results = []
-    removals = [item for item in selected if item["kind"] == "remove"]
-    additions = [item for item in selected if item["kind"] in ("add", "raise")]
-    if removals:
-        results.append(execute_action_plan({"items": removals}, "remove"))
-    if additions:
-        results.append(execute_action_plan({"items": additions}, "add"))
-    done = sum(r["done"] for r in results)
-    merged = {
-        "done": done,
-        "expected": len(selected),
-        "rejected": [x for r in results for x in r["rejected"]],
-        "unconfirmed": [x for r in results for x in r["unconfirmed"]],
-        "errors": [x for r in results for x in r["errors"]],
-    }
-    message = f"Применено в предстоящих акциях: {done} из {len(selected)} (проверено по данным Ozon)."
-    if merged["rejected"]:
-        message += f" Ozon отклонил: {len(merged['rejected'])}."
-    if merged["unconfirmed"]:
-        message += f" Не применилось без объяснения: {len(merged['unconfirmed'])}."
-    if merged["errors"]:
-        message += f" Ошибок запросов: {len(merged['errors'])}."
-    merged.update(ok=done == len(selected) and not merged["errors"], message=message)
-    return merged
 
 
 def _format_boost(value: Optional[float]) -> str:
@@ -1210,8 +1240,17 @@ def _run_action_plan(plan: Dict[str, Any], mode: str, question: str) -> bool:
         return True
     labels = {"add": "добавить", "raise": "поднять", "remove": "удалить"}
     for item in plan["items"]:
+        if item["kind"] == "watch":
+            ozon_min = f", минимальная в Ozon {item['ozon_min_price']:.0f} руб." if item.get("ozon_min_price") else ""
+            print(f"   [внимание] {item['offer_id']} | {item['action_name']} | {item['note']}{ozon_min}")
+            continue
         if item["kind"] == "remove":
-            prices = f"в акции {item['action_price']:.0f} руб. < мин. {item['min_price']:.0f} руб."
+            starts = f"с {_ru_date(item['action_start'])} " if item.get("action_start") else ""
+            prices = f"{starts}в акции {item['action_price']:.0f} руб. < мин. {item['min_price']:.0f} руб."
+            if item.get("exit_price"):
+                prices += f", выход по {item['exit_price']} руб."
+            if item.get("added_by_ozon"):
+                prices += ", добавил Ozon"
             boost = f"буст {_format_boost(item['boost_now'])} будет потерян"
         elif item["kind"] == "raise":
             prices = f"{item['current_price']:.0f} -> {item['action_price']} руб."
@@ -1219,7 +1258,8 @@ def _run_action_plan(plan: Dict[str, Any], mode: str, question: str) -> bool:
         else:
             prices = f"{item['action_price']} руб. (мин. {item['min_price']:.0f} руб.)"
             boost = f"буст {_format_boost(item['boost_new'])}"
-        mark = "" if item.get("selected", True) else " (не отмечено: снижает буст)"
+        reason = "заметно снижает цену товара во всех акциях" if item.get("costly") else "снижает буст"
+        mark = "" if item.get("selected", True) else f" (не отмечено: {reason})"
         print(f"   [{labels[item['kind']]}{mark}] {item['offer_id']} | {item['action_name']} | {prices} | {boost}")
     if not prompt_yes_no(question, default_yes=False):
         print("❌ Отменено, в Ozon ничего не отправлено.")

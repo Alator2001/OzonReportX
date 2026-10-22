@@ -493,6 +493,8 @@ def describe_action(action: Dict[str, Any]) -> Dict[str, Any]:
         "name": action.get("title") or action.get("name") or f"Акция {action_id}",
         "action_type": action.get("action_type") or "",
         "fixed_boost": parse_fixed_boost(action.get("description") or ""),
+        "date_start": action.get("date_start") or "",
+        "auto_add_dates": action.get("auto_add_dates") or [],
         "date_end": action.get("date_end") or "",
     }
 
@@ -848,17 +850,21 @@ def activate_products_in_action(action_id: int, products: List[Dict[str, Any]]) 
     return {"product_ids": added_ids, "deactivated_product_ids": deactivated_ids, "rejected": rejected, "warnings": warnings, "errors": errors}
 
 
-def action_exit_price(max_action_price: Optional[float], min_price: Optional[float]) -> Optional[int]:
+def action_exit_price(
+    max_action_price: Optional[float], min_price: Optional[float], current_price: Optional[float] = None
+) -> Optional[int]:
     """
     Цена продавца, с которой товар выходит из «Эластичного» или «Максимального бустинга» при единой цене Ozon:
     отдельного удаления нет, товар покидает акцию, когда его цена выше лимита акции (max_action_price —
-    с ценой, равной лимиту, товар в акции остаётся). Берём наименьшую цену, которая и выводит из акции,
-    и не ниже минимальной: max(минимальная, лимит + 1 ₽). Желательную не берём — при единой цене это
+    с ценой, равной лимиту, товар в акции остаётся). Берём наименьшую цену, которая выводит из акции,
+    не ниже минимальной и не ниже текущей цены товара (current_price, поле `price`):
+    max(минимальная, лимит + 1 ₽, текущая). Текущая важна для акций, которые ещё не начались: товар уже
+    продаётся дороже лимита, и вывод не должен снижать его цену. Желательную не берём — при единой цене это
     станет ценой товара, а она обычно намного выше. None, если лимит неизвестен.
     """
     if not max_action_price or max_action_price <= 0:
         return None
-    return max(math.floor(max_action_price) + 1, math.ceil(min_price or 0))
+    return max(math.floor(max_action_price) + 1, math.ceil(min_price or 0), math.ceil(current_price or 0))
 
 
 def pick_action_price(min_price: float, desired_price: float, max_action_price: float) -> Optional[int]:
@@ -1616,8 +1622,11 @@ def run(
                 else:
                     print("⚠️ Недостаточно данных для удаления из акций.")
             
-                # Добавляем товары в акции, если можно установить цену в диапазоне [min_price, desired_price]
+                # Кандидаты, которых можно добавить по цене в диапазоне [min_price, desired_price], — только сообщаем.
+                # При единой цене Ozon добавление в акцию меняет цену товара во всех акциях: без подтверждения
+                # цены не меняем, добавляет кнопка «Добавить выгодные» на вкладке «Акции» (одна цена на товар).
                 print("\n➕ Проверка кандидатов для добавления в акции...")
+                found_to_add = 0
             
                 # Для каждой акции проверяем кандидатов
                 for action_info in actions_info_list:
@@ -1665,18 +1674,15 @@ def run(
                                     "stock": int(stock) if stock else 0
                                 })
                 
-                    # Добавляем товары в акцию
                     if products_to_add:
-                        print(f"      Найдено {len(products_to_add)} товаров для добавления")
-                        result = activate_products_in_action(action_id, products_to_add)
-                        added = result.get("product_ids", []) or []
-                        rejected = result.get("rejected", []) or []
-                        if added:
-                            print(f"      ✅ Добавлено: {len(added)} товаров")
-                        if rejected:
-                            print(f"      ⚠️ Не добавлено: {len(rejected)} товаров")
+                        print(f"      Можно добавить: {len(products_to_add)} товаров")
+                        found_to_add += len(products_to_add)
                     else:
                         print(f"      Товары для добавления не найдены")
+
+                if found_to_add:
+                    print(f"\n💡 В акции можно выгодно добавить {found_to_add} позиций. Чтобы добавить их с одной ценой "
+                          "на товар во всех акциях, нажмите «Добавить выгодные» на вкладке «Акции» и подтвердите цены.")
 
                 save_workbook_atomic(wb, costs_path)
                 wb.close()

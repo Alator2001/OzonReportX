@@ -31,6 +31,12 @@ try:
     from scripts import auto_actions
 except Exception:  # модуль автоакций необязателен для запуска интерфейса
     auto_actions = None
+try:
+    from scripts import stock_overview
+    STOCK_IMPORT_ERROR = None
+except Exception as exc:  # раздел «Остатки» необязателен для запуска интерфейса
+    stock_overview = None
+    STOCK_IMPORT_ERROR = str(exc)
 from scripts.abc_view import load_abc_report as abc_load_report, matrix_counts as abc_matrix_counts, report_period_title as abc_period_title, xyz_group as abc_xyz_group
 from scripts.marketplace_settings import FIELDS, HELP, read_settings, save_settings, needs_setup
 
@@ -72,9 +78,7 @@ try:
         build_action_add_plan,
         build_action_removal_plan,
         build_discount_request_plan,
-        build_upcoming_actions_plan,
         execute_action_plan,
-        execute_upcoming_actions_plan,
         load_actions_calendar,
         process_discount_request_item,
         process_discount_request_plan,
@@ -86,9 +90,7 @@ except Exception as exc:
     build_action_add_plan = None
     build_action_removal_plan = None
     build_discount_request_plan = None
-    build_upcoming_actions_plan = None
     execute_action_plan = None
-    execute_upcoming_actions_plan = None
     load_actions_calendar = None
     process_discount_request_item = None
     process_discount_request_plan = None
@@ -457,7 +459,7 @@ def _build_costs_cell(column: str, cell_payload: dict[str, object] | None, dark:
     resolved_text_color = font_color or _excel_text_color(fill_color, dark)
     return ft.Container(
         expand=expand,
-        padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+        padding=ft.Padding.symmetric(horizontal=10, vertical=6),
         border_radius=10,
         bgcolor=fill_color,
         tooltip=payload.get("tooltip") if isinstance(payload.get("tooltip"), str) else None,
@@ -1483,15 +1485,11 @@ def main(page: ft.Page) -> None:
         ),
     )
     files_col = ft.Column(spacing=14)
-    pricing_costs_status = ft.Text("Читаю лист «Основной»...", size=11, color=MUTED, weight=ft.FontWeight.W_600)
-    pricing_costs_status_shell = ft.Container(
-        padding=ft.Padding.symmetric(horizontal=12, vertical=8),
-        border_radius=999,
-        bgcolor=semantic_surface("neutral_alt", dark=False),
-        border=ft.Border.all(1, "#E5E5EA"),
-        content=pricing_costs_status,
-    )
-    pricing_costs_list = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO)
+    pricing_costs_status = ft.Text("Читаю лист «Основной»...", size=13, color=MUTED, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+    pricing_costs_status_shell = ft.Container(content=pricing_costs_status)
+    pricing_stats_area = ft.Container()
+    # Без своей прокрутки: таблица растёт по высоте, прокручивается только страница.
+    pricing_costs_list = ft.Column(spacing=0)
     pricing_costs_save_button = ft.Button("Сохранить изменения", bgcolor=PRIMARY, color="white", disabled=True)
     pricing_costs_editors: dict[int, dict[str, ft.TextField]] = {}
     pricing_costs_dirty = {"value": False, "revision": 0}
@@ -1592,9 +1590,12 @@ def main(page: ft.Page) -> None:
 
     def toast(msg: str, error: bool = False) -> None:
         set_status("Ошибка" if error else "Готово", msg, DANGER if error else PRIMARY, busy=False)
-        snack = ft.SnackBar(ft.Text(msg), bgcolor=DANGER if error else PRIMARY, open=True)
-        page.overlay.append(snack)
-        page.update()
+        # Уведомление показывается через show_dialog: сразу и без перерисовки всего приложения. Раньше каждое
+        # оставалось в overlay навсегда, а page.update() перерисовывал всё. О скрытии по таймеру Flet не сообщает,
+        # поэтому прежние уведомления убираем из списка окон сами — иначе новое не покажется, а список будет расти.
+        for old in [dialog for dialog in page._dialogs.controls if isinstance(dialog, ft.SnackBar)]:
+            page._dialogs.controls.remove(old)
+        page.show_dialog(ft.SnackBar(ft.Text(msg), bgcolor=DANGER if error else PRIMARY))
 
     def _log_line_control(line: str) -> ft.Text:
         return ft.Text(
@@ -3533,7 +3534,7 @@ def main(page: ft.Page) -> None:
             border_color="transparent" if fill_color else ("#D6D0C4" if not dark else "#465056"),
             focused_border_color=PRIMARY,
             border_radius=10,
-            content_padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+            content_padding=ft.Padding.symmetric(horizontal=10, vertical=6),
             on_change=mark_pricing_costs_dirty,
         )
         pricing_costs_editors.setdefault(row_number, {})[column] = field
@@ -3545,6 +3546,46 @@ def main(page: ft.Page) -> None:
             data="preserve_excel_fill" if fill_color else None,
             content=field,
         )
+
+    def pricing_stats_panel(rows: list[dict[str, object]], min_margin_pct: float, desired_margin_pct: float) -> ft.Control:
+        """Ключевые показатели таблицы цен — в той же строке показателей, что и бизнес-сводка."""
+        pal = dash_pal()
+
+        def number(row: dict[str, object], column: str) -> float | None:
+            payload = row.get(column)
+            return as_float(payload.get("value")) if isinstance(payload, dict) else None
+
+        below_min = 0
+        margins: list[float] = []
+        profits: list[float] = []
+        no_cost = 0
+        for row in rows:
+            price, floor = number(row, "Текущая цена на Ozon"), number(row, "Минимальная цена продажи")
+            if price and floor and price < floor:
+                below_min += 1
+            margin = number(row, "Текущая ожидаемая рентабельность")
+            if margin is not None:
+                margins.append(margin * 100 if abs(margin) <= 1 else margin)
+            profit = number(row, "Ожидаемая чистая прибыль")
+            if profit is not None:
+                profits.append(profit)
+            if not number(row, "Себестоимость"):
+                no_cost += 1
+        avg_margin = sum(margins) / len(margins) if margins else None
+        margin_color = None
+        if avg_margin is not None:
+            margin_color = pal["bad"] if avg_margin < min_margin_pct else pal["good"] if avg_margin <= desired_margin_pct else pal["accent"]
+        pct = lambda value: f"{value:.1f}%".replace(".", ",")
+        stats = [
+            dash_stat("Товаров", str(len(rows)), f"без себестоимости: {no_cost}" if no_cost else "все с себестоимостью"),
+            dash_stat("Ниже минимальной цены", str(below_min), "текущая цена Ozon < минимальной",
+                      pal["bad"] if below_min else pal["good"]),
+            dash_stat("Средняя рентабельность", pct(avg_margin) if avg_margin is not None else "—",
+                      f"цель {pct(min_margin_pct)} – {pct(desired_margin_pct)}", margin_color),
+            dash_stat("Прибыль с единицы", _format_currency(sum(profits) / len(profits)) if profits else "—",
+                      "в среднем по товарам", pal["bad"] if profits and sum(profits) < 0 else None),
+        ]
+        return dpanel(ft.ResponsiveRow(stats, spacing=24, run_spacing=12), padding=ft.Padding.symmetric(horizontal=24, vertical=16))
 
     def refresh_pricing_costs_preview(push_update: bool = False) -> str | None:
         if pricing_costs_dirty["value"]:
@@ -3577,16 +3618,13 @@ def main(page: ft.Page) -> None:
             return None
         pricing_costs_snapshot["signature"] = signature
         dark = current_dark["value"]
-        header_border = "#D8DEE8" if not dark else "#3E474E"
-        row_border = "#E5E7EF" if not dark else "#384046"
         pricing_costs_editors.clear()
         set_pricing_costs_dirty(False)
 
         if error:
             pricing_costs_status.value = error
             pricing_costs_status.color = "#E6BBB5" if dark else DANGER
-            pricing_costs_status_shell.bgcolor = semantic_surface("danger", dark=dark)
-            pricing_costs_status_shell.border = ft.Border.all(1, "#D9A49D" if not dark else "#6E464C")
+            pricing_stats_area.content = None
             pricing_costs_list.controls = [
                 ft.Container(
                     padding=18,
@@ -3597,102 +3635,29 @@ def main(page: ft.Page) -> None:
                 )
             ]
         else:
-            refreshed_at = datetime.fromtimestamp((ROOT / "costs.xlsx").stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            pricing_costs_status.value = f"Строк: {len(rows)} • лист «Основной» • обновлено {refreshed_at}"
+            refreshed_at = datetime.fromtimestamp((ROOT / "costs.xlsx").stat().st_mtime)
+            pricing_costs_status.value = f"{len(rows)} товаров · лист «Основной» · обновлено {refreshed_at:%d.%m в %H:%M}"
             pricing_costs_status.color = "#B6C0BC" if dark else MUTED
-            pricing_costs_status_shell.bgcolor = semantic_surface("neutral_alt", dark=dark)
-            pricing_costs_status_shell.border = ft.Border.all(1, header_border)
+            pricing_stats_area.content = pricing_stats_panel(rows, min_margin_pct, desired_margin_pct)
 
-            lead_expand = COSTS_MAIN_COLUMN_EXPANDS["Артикул"] + COSTS_MAIN_COLUMN_EXPANDS["Себестоимость"]
-            calculated_expand = sum(COSTS_MAIN_COLUMN_EXPANDS[column] for column in PRICING_CALCULATED_COLUMNS)
-            sync_expand = sum(COSTS_MAIN_COLUMN_EXPANDS[column] for column in PRICING_SYNC_COLUMNS)
+            pal = dash_pal()
             header = ft.Container(
-                padding=ft.Padding.symmetric(horizontal=12, vertical=10),
-                bgcolor=semantic_surface("neutral_alt", dark=dark),
-                border_radius=14,
-                border=ft.Border.all(1, header_border),
-                content=ft.Column(
-                    [
-                        ft.Row(
-                            [
-                                ft.Container(expand=lead_expand),
-                                ft.Container(
-                                    expand=calculated_expand,
-                                    padding=ft.Padding.symmetric(horizontal=10, vertical=8),
-                                    border_radius=12,
-                                    bgcolor=semantic_surface("warning", dark=dark),
-                                    border=ft.Border.all(1, "#CFBE8A" if not dark else "#655C43"),
-                                    content=ft.Column(
-                                        [
-                                            ft.Button(
-                                                "Рассчитать цены",
-                                                bgcolor=ACCENT,
-                                                color="white",
-                                                height=34,
-                                                on_click=lambda _e: launch_recommended_prices(),
-                                            ),
-                                            ft.Text(
-                                                "Обновит минимальную и желательную цену продажи",
-                                                size=10,
-                                                color="#7A5A20" if not dark else "#F6E3B0",
-                                                text_align=ft.TextAlign.CENTER,
-                                            ),
-                                        ],
-                                        spacing=4,
-                                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                        tight=True,
-                                    ),
-                                ),
-                                ft.Container(
-                                    expand=sync_expand,
-                                    padding=ft.Padding.symmetric(horizontal=10, vertical=8),
-                                    border_radius=12,
-                                    bgcolor=semantic_surface("info", dark=dark),
-                                    border=ft.Border.all(1, "#C7D7EF" if not dark else "#425264"),
-                                    content=ft.Column(
-                                        [
-                                            ft.Button(
-                                                "Синхронизировать",
-                                                bgcolor=PRIMARY,
-                                                color="white",
-                                                height=34,
-                                                on_click=lambda _e: job(PRICING_SYNC_TITLE, [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "refresh-pricing"]),
-                                            ),
-                                            ft.Text(
-                                                "Обновит цены, рентабельность, прибыль и бустинг. Запускается сама при входе во вкладку",
-                                                size=10,
-                                                color="#3C5D85" if not dark else "#B9D4FF",
-                                                text_align=ft.TextAlign.CENTER,
-                                            ),
-                                        ],
-                                        spacing=4,
-                                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                        tight=True,
-                                    ),
-                                ),
-                            ],
-                            spacing=12,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                        ft.Row(
-                            [ft.Text(column, expand=COSTS_MAIN_COLUMN_EXPANDS[column], size=11, weight=ft.FontWeight.W_800, color="#A1A1A6" if dark else MUTED) for column in COSTS_TABLE_COLUMNS],
-                            spacing=12,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                    ],
-                    spacing=10,
+                padding=ft.Padding.only(left=8, right=8, bottom=8),
+                content=ft.Row(
+                    [ft.Text(column, expand=COSTS_MAIN_COLUMN_EXPANDS[column], size=11, weight=ft.FontWeight.W_600, color=pal["muted"],
+                             max_lines=2, overflow=ft.TextOverflow.ELLIPSIS) for column in COSTS_TABLE_COLUMNS],
+                    spacing=12,
+                    vertical_alignment=ft.CrossAxisAlignment.END,
                 ),
             )
-
             row_controls: list[ft.Control] = [header]
-            for idx, row in enumerate(rows):
+            for row in rows:
                 row_number = int(row.get("__row_number") or 0)
                 row_controls.append(
                     ft.Container(
-                        padding=ft.Padding.symmetric(horizontal=12, vertical=10),
-                        bgcolor=semantic_surface("neutral", dark=dark) if idx % 2 == 0 else semantic_surface("neutral_soft", dark=dark),
-                        border_radius=14,
-                        border=ft.Border.all(1, row_border),
+                        padding=ft.Padding.symmetric(horizontal=8, vertical=6),
+                        border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])),
+                        data="preserve_excel_fill",
                         content=ft.Row(
                             [
                                 build_costs_edit_field(row_number, column, row.get(column), dark, COSTS_MAIN_COLUMN_EXPANDS[column])
@@ -3708,7 +3673,7 @@ def main(page: ft.Page) -> None:
             pricing_costs_list.controls = row_controls
 
         if push_update and page.controls:
-            page.update(pricing_costs_status, pricing_costs_status_shell, pricing_costs_list, pricing_costs_save_button)
+            page.update(pricing_costs_status, pricing_stats_area, pricing_costs_list, pricing_costs_save_button)
         return error
 
     def _save_pricing_costs(_e=None) -> None:
@@ -3841,7 +3806,7 @@ def main(page: ft.Page) -> None:
         if title == ABC_JOB_TITLE:
             abc_after_job(code)
         if page.controls:
-            page.update(state, spin, cancel_row, files_col, abc_body, abc_report_pick, pricing_costs_list, pricing_costs_status, pricing_costs_status_shell, pricing_costs_save_button, log)
+            page.update(state, spin, cancel_row, files_col, abc_body, abc_report_pick, pricing_costs_list, pricing_costs_status, pricing_stats_area, pricing_costs_save_button, log)
 
     def job(title: str, cmd: list[str], prompt_for_costs: bool = False) -> None:
         if not job_lock.acquire(blocking=False):
@@ -3980,7 +3945,6 @@ def main(page: ft.Page) -> None:
     discount_dialog_list = ft.Column(
         controls=[ft.Text("Нажмите «Обновить заявки», чтобы загрузить список.", size=12, color=MUTED)],
         spacing=8,
-        scroll=ft.ScrollMode.AUTO,
     )
     discount_dialog_state: dict[str, object] = {"plan": None, "busy": False, "processing_ids": set()}
     discount_dialog: ft.AlertDialog | None = None
@@ -3992,68 +3956,13 @@ def main(page: ft.Page) -> None:
     )
     discount_requests_auto_button = ft.Button("Обработать автоматически", bgcolor=ACCENT, color="white", disabled=True)
 
-    def pricing_state_panel(
-        title: str,
-        detail: str,
-        *,
-        icon: str = ft.Icons.INFO_OUTLINE,
-        kind: str = "neutral_soft",
-        loading: bool = False,
-    ) -> ft.Control:
-        dark = current_dark["value"]
-        border_map = {
-            "neutral": "#D8DEE8" if not dark else "#3E474E",
-            "neutral_soft": "#E5E7EF" if not dark else "#384046",
-            "neutral_alt": "#E0E5EF" if not dark else "#3D454B",
-            "positive": "#9DC9BA" if not dark else "#2E5A50",
-            "warning": "#CFBE8A" if not dark else "#655C43",
-            "danger": "#D9A49D" if not dark else "#6E464C",
-            "info": "#C7D7EF" if not dark else "#425264",
-        }
-        icon_color_map = {
-            "positive": PRIMARY if not dark else "#70D4BC",
-            "warning": ACCENT if not dark else "#E0A15F",
-            "danger": DANGER if not dark else "#FFD2CB",
-            "info": "#5B84C4" if not dark else "#9FC1F7",
-        }
-        leading: ft.Control = (
-            ft.ProgressRing(width=22, height=22, stroke_width=2.4, color=PRIMARY)
-            if loading
-            else ft.Container(
-                width=40,
-                height=40,
-                border_radius=999,
-                bgcolor=semantic_surface("neutral_alt", dark=dark),
-                alignment=ft.Alignment(0, 0),
-                content=ft.Icon(icon, size=20, color=icon_color_map.get(kind, "#6E6E73" if not dark else "#A1A1A6")),
-            )
-        )
-        return ft.Container(
-            expand=True,
-            alignment=ft.Alignment(0, 0),
-            padding=ft.Padding.symmetric(horizontal=20, vertical=26),
-            border_radius=18,
-            bgcolor=semantic_surface(kind, dark=dark),
-            border=ft.Border.all(1, border_map.get(kind, border_map["neutral_soft"])),
-            content=ft.Column(
-                [
-                    leading,
-                    ft.Text(title, size=15, weight=ft.FontWeight.W_700, color="#F3F4F6" if dark else TEXT, text_align=ft.TextAlign.CENTER),
-                    ft.Text(detail, size=11, color="#B6C0BC" if dark else MUTED, text_align=ft.TextAlign.CENTER),
-                ],
-                spacing=10,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                tight=True,
-            ),
-        )
-
     def close_discount_dialog(_e=None) -> None:
         discount_dialog_state["plan"] = None
         discount_dialog_state["busy"] = False
         discount_dialog_state["processing_ids"] = set()
         render_discount_dialog()
         if page.controls:
-            page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+            page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
 
     def current_discount_items() -> list[dict[str, object]]:
         plan = discount_dialog_state.get("plan")
@@ -4172,17 +4081,8 @@ def main(page: ft.Page) -> None:
                 1,
                 ("#C7D7EF" if not dark else "#425264") if busy else neutral_border,
             )
-            discount_dialog_list.controls = [
-                pricing_state_panel(
-                    "Собираю рекомендации" if busy else "Список пока не загружен",
-                    "Запрашиваю заявки у Ozon и сопоставляю их с минимальной ценой."
-                    if busy
-                    else "Нажмите «Обновить заявки», и система покажет решения для каждой заявки.",
-                    icon=ft.Icons.SYNC if busy else ft.Icons.LOCAL_OFFER_OUTLINED,
-                    kind="info" if busy else "neutral_soft",
-                    loading=busy,
-                )
-            ]
+            discount_dialog_list.controls = []
+            discount_requests_surface.visible = False
             discount_requests_auto_button.disabled = True
             return
         total = len(items)
@@ -4211,17 +4111,11 @@ def main(page: ft.Page) -> None:
             ),
         ]
         if not items:
-            discount_dialog_status.value = "Все заявки обработаны или новых заявок нет."
+            discount_dialog_status.value = "Новых заявок нет — когда появятся, здесь будет рекомендация по каждой."
             discount_dialog_badge_shell.bgcolor = semantic_surface("neutral_alt", dark=dark)
             discount_dialog_badge_shell.border = ft.Border.all(1, neutral_border)
-            discount_dialog_list.controls = [
-                pricing_state_panel(
-                    "Новых заявок нет",
-                    "Когда появятся новые запросы на скидку, они появятся здесь с рекомендацией по решению.",
-                    icon=ft.Icons.TASK_ALT,
-                    kind="neutral_soft",
-                ),
-            ]
+            discount_dialog_list.controls = []
+            discount_requests_surface.visible = False
             discount_requests_auto_button.disabled = True
             return
 
@@ -4353,6 +4247,7 @@ def main(page: ft.Page) -> None:
                 )
         )
         discount_dialog_list.controls = rows
+        discount_requests_surface.visible = True
         discount_requests_auto_button.disabled = busy or requires_refresh
 
     def submit_discount_decision(item: dict[str, object], action: str) -> None:
@@ -4370,7 +4265,7 @@ def main(page: ft.Page) -> None:
         remove_discount_item(item.get("id"))
         render_discount_dialog()
         if page.controls:
-            page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+            page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
 
         def worker() -> None:
             result = process_discount_request_item(item, action)
@@ -4383,13 +4278,13 @@ def main(page: ft.Page) -> None:
                 else:
                     render_discount_dialog()
                     if page.controls:
-                        page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+                        page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
             else:
                 restore_discount_item(item)
                 render_discount_dialog()
                 toast(str(result.get("message") or "Не удалось обработать заявку."), True)
                 if page.controls:
-                    page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+                    page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
 
         page.run_thread(worker)
 
@@ -4406,7 +4301,7 @@ def main(page: ft.Page) -> None:
         discount_dialog_state["busy"] = True
         render_discount_dialog()
         if page.controls:
-            page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+            page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
 
         def worker() -> None:
             try:
@@ -4419,7 +4314,7 @@ def main(page: ft.Page) -> None:
                 discount_dialog_state["plan"] = {"items": [], "ok": True, "message": str(result.get("message") or "")}
                 render_discount_dialog()
                 if page.controls:
-                    page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+                    page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
             else:
                 discount_dialog_state["requires_refresh"] = True
                 render_discount_dialog()
@@ -4427,7 +4322,7 @@ def main(page: ft.Page) -> None:
                 # Aggregate API counts do not identify successful items reliably.
                 # Reload before allowing a retry to avoid sending successful items twice.
                 if page.controls:
-                    page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+                    page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
 
         page.run_thread(worker)
 
@@ -4443,7 +4338,7 @@ def main(page: ft.Page) -> None:
         discount_dialog_state["processing_ids"] = set()
         render_discount_dialog()
         if page.controls:
-            page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+            page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
 
         def worker() -> None:
             try:
@@ -4465,7 +4360,7 @@ def main(page: ft.Page) -> None:
                 discount_dialog_state["processing_ids"] = set()
                 render_discount_dialog()
                 if page.controls:
-                    page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+                    page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
                 toast(str(plan.get("message") or "Не удалось подготовить заявки."), True)
                 return
             discount_dialog_state["plan"] = plan
@@ -4475,7 +4370,7 @@ def main(page: ft.Page) -> None:
             render_discount_dialog()
             apply_discount_dialog_theme()
             if page.controls:
-                page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_auto_button)
+                page.update(discount_dialog_badge, discount_dialog_badge_shell, discount_dialog_status, discount_overview_row, discount_dialog_list, discount_requests_surface, discount_requests_auto_button)
             if not plan.get("items") and not quiet:
                 toast(str(plan.get("message") or "Новых заявок нет."))
 
@@ -4873,262 +4768,136 @@ def main(page: ft.Page) -> None:
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
-    def pricing_round_action(icon: str, tooltip: str, on_click, *, tone: str = "neutral_alt") -> ft.Control:
-        return ft.Container(
-            width=42,
-            height=42,
-            border_radius=999,
-            bgcolor=semantic_surface(tone, dark=False),
-            border=ft.Border.all(1, "#E5E5EA"),
-            alignment=ft.Alignment(0, 0),
-            content=ft.IconButton(
-                icon=icon,
-                tooltip=tooltip,
-                on_click=on_click,
-                icon_size=18,
-                style=ft.ButtonStyle(shape=ft.CircleBorder(), padding=ft.Padding.all(10)),
+    def pricing_panel(content: ft.Control, padding=20, **kwargs) -> ft.Container:
+        """Панель в стиле бизнес-сводки: светлая поверхность, тонкая рамка, скругление 18."""
+        return ft.Container(content=content, padding=padding, border_radius=18, bgcolor=semantic_surface("neutral", dark=False),
+                            border=ft.Border.all(1, BORDER), **kwargs)
+
+    def save_margin(_e=None) -> None:
+        error = valid_margin(margin_min.value or "", margin_des.value or "")
+        if error:
+            toast(error, True)
+            return
+        job("Сохранение маржи", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "save-margin",
+                                 "--min-margin", (margin_min.value or "").replace(",", "."),
+                                 "--desired-margin", (margin_des.value or "").replace(",", ".")])
+
+    for field, label in ((margin_min, "Мин. маржа"), (margin_des, "Желаемая")):
+        field.label = label
+        field.width = 120
+        field.dense = True
+        field.tooltip = "Доля, например 0.25 = 25%. Минимальная маржа — порог «ниже нельзя», желаемая — цель расчёта."
+        field.on_submit = save_margin
+
+    pricing_more = ft.PopupMenuButton(
+        icon=ft.Icons.MORE_HORIZ,
+        tooltip="Ещё",
+        items=[
+            ft.PopupMenuItem(content=ft.Text("Обновить минимальные цены в Ozon"),
+                             on_click=lambda _e: job("Обновление минимальных цен", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "update-min-prices"])),
+            ft.PopupMenuItem(content=ft.Text("Перечитать таблицу из costs.xlsx"), on_click=handle_pricing_costs_refresh),
+            ft.PopupMenuItem(content=ft.Text("Открыть costs.xlsx"), on_click=lambda _e: reveal_path(ROOT / "costs.xlsx", "costs.xlsx")),
+            ft.PopupMenuItem(content=ft.Text("Открыть папку проекта"), on_click=lambda _e: reveal_path(ROOT, "корень проекта")),
+        ],
+    )
+    pricing_header = ft.ResponsiveRow(
+        [
+            ft.Container(
+                col={"xs": 12, "lg": 4},
+                content=ft.Column([ft.Text("Цены и скидки", size=26, weight=ft.FontWeight.W_800, color=TEXT), pricing_costs_status_shell], spacing=2),
             ),
-        )
+            ft.Container(
+                col={"xs": 12, "lg": 8},
+                alignment=ft.Alignment(1, 0),
+                content=ft.Row(
+                    [
+                        margin_min,
+                        margin_des,
+                        ft.IconButton(icon=ft.Icons.SAVE_OUTLINED, tooltip="Сохранить маржу", on_click=save_margin),
+                        ft.Button("Рассчитать цены", icon=ft.Icons.CALCULATE_OUTLINED, bgcolor=ACCENT, color="white",
+                                  tooltip="Пересчитает минимальную и желательную цену продажи по марже и расходам прошлого месяца",
+                                  on_click=lambda _e: launch_recommended_prices()),
+                        ft.Button("Синхронизировать", icon=ft.Icons.SYNC, bgcolor=PRIMARY, color="white",
+                                  tooltip="Обновит текущие цены, рентабельность, прибыль и бустинг из Ozon. Запускается сама при входе в раздел",
+                                  on_click=lambda _e: job(PRICING_SYNC_TITLE, [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "refresh-pricing"])),
+                        pricing_more,
+                    ],
+                    spacing=10,
+                    wrap=True,
+                    run_spacing=8,
+                    alignment=ft.MainAxisAlignment.END,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            ),
+        ],
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        run_spacing=12,
+    )
 
     discount_requests_surface = ft.Container(
-        height=540,
-        padding=4,
-        border_radius=22,
-        bgcolor=semantic_surface("neutral_soft", dark=False),
-        border=ft.Border.all(1, BORDER),
-        content=discount_dialog_list,
+        visible=False,
+        content=ft.Column([discount_overview_row, discount_dialog_list], spacing=10),
     )
+    discount_panel = pricing_panel(
+        ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Заявки на скидку", size=15, weight=ft.FontWeight.W_700, color=TEXT),
+                        discount_dialog_badge_shell,
+                        ft.Container(expand=True, content=discount_dialog_status),
+                        discount_requests_auto_button,
+                        discount_requests_refresh_button,
+                    ],
+                    spacing=10,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                discount_requests_surface,
+            ],
+            spacing=10,
+        ),
+        padding=ft.Padding.only(left=20, right=12, top=10, bottom=10),
+    )
+
     pricing_sync_label = ft.Text("Синхронизация с Ozon: обновляю цены, рентабельность, прибыль и бустинг…",
                                  size=13, weight=ft.FontWeight.W_600, text_align=ft.TextAlign.CENTER)
     pricing_sync_overlay = ft.Container(
         left=0, top=0, right=0, bottom=0,
         visible=False,
         border_radius=18,
-        alignment=ft.Alignment(0, 0),
+        # Таблица длинная: подпись загрузки — у её верхнего края, а не в середине за экраном.
+        alignment=ft.Alignment(0, -1),
+        padding=ft.Padding.only(top=120),
         data="preserve_excel_fill",
         content=ft.Column(
             [ft.ProgressRing(width=36, height=36, stroke_width=3), pricing_sync_label],
             spacing=14, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
         ),
     )
-    pricing_costs_surface = ft.Container(
-        height=760,
-        padding=4,
-        border_radius=22,
-        bgcolor=semantic_surface("neutral_soft", dark=False),
-        border=ft.Border.all(1, BORDER),
-        content=ft.Stack([pricing_costs_list, pricing_sync_overlay], expand=True),
+    pricing_costs_surface = ft.Container(content=ft.Stack([pricing_costs_list, pricing_sync_overlay]))
+    pricing_table_panel = pricing_panel(
+        ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Товары", size=15, weight=ft.FontWeight.W_700, color=TEXT),
+                        ft.Text("Артикул и себестоимость можно править прямо в таблице. Наведите на бустинг, чтобы увидеть акции.",
+                                size=12, color=MUTED, expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                        pricing_costs_save_button,
+                    ],
+                    spacing=10,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                pricing_costs_surface,
+            ],
+            spacing=8,
+        ),
+        padding=ft.Padding.only(left=20, right=20, top=12, bottom=8),
     )
 
     pricing = ft.Column(
-        [
-            ft.Text("Цены и скидки", size=26, weight=ft.FontWeight.W_800, color=TEXT),
-            card(
-                "",
-                "",
-                [
-                    ft.ResponsiveRow(
-                        run_spacing=12,
-                        spacing=12,
-                        controls=[
-                            ft.Container(
-                                col=8,
-                                content=ft.Column(
-                                    [
-                                        ft.Text("Диапазон рентабельности", size=15, weight=ft.FontWeight.W_700, color=TEXT),
-                                        ft.Text("Маржа задаёт базовый контур расчёта. Пересчёт цен выполняется прямо над целевыми столбцами таблицы.", size=11, color=MUTED),
-                                        ft.Row(
-                                            [
-                                                ft.Container(content=margin_min, width=190),
-                                                ft.Container(content=margin_des, width=190),
-                                                ft.Button(
-                                                    "Сохранить маржу",
-                                                    bgcolor=PRIMARY,
-                                                    color="white",
-                                                    height=42,
-                                                    on_click=lambda _e: toast(valid_margin(margin_min.value or "", margin_des.value or ""), True)
-                                                    if valid_margin(margin_min.value or "", margin_des.value or "")
-                                                    else job(
-                                                        "Сохранение маржи",
-                                                        [
-                                                            str(PYTHON),
-                                                            str(SCRIPTS / "ui_actions.py"),
-                                                            "save-margin",
-                                                            "--min-margin",
-                                                            (margin_min.value or "").replace(",", "."),
-                                                            "--desired-margin",
-                                                            (margin_des.value or "").replace(",", "."),
-                                                        ],
-                                                    ),
-                                                ),
-                                            ],
-                                            spacing=12,
-                                            wrap=True,
-                                            vertical_alignment=ft.CrossAxisAlignment.END,
-                                        ),
-                                    ],
-                                    spacing=6,
-                                    tight=True,
-                                ),
-                            ),
-                            ft.Container(
-                                col=4,
-                                content=ft.Column(
-                                    [
-                                        ft.Text("Сервисы", size=15, weight=ft.FontWeight.W_700, color=TEXT),
-                                        ft.Text("Файл, корень проекта и обновление минимальных цен в кабинете.", size=11, color=MUTED),
-                                        ft.Row(
-                                            [
-                                                pricing_round_action(
-                                                    ft.Icons.OPEN_IN_NEW,
-                                                    "Открыть costs.xlsx",
-                                                    lambda _e: reveal_path(ROOT / "costs.xlsx", "costs.xlsx"),
-                                                ),
-                                                pricing_round_action(
-                                                    ft.Icons.FOLDER_OPEN,
-                                                    "Открыть корень проекта",
-                                                    lambda _e: reveal_path(ROOT, "корень проекта"),
-                                                ),
-                                                pricing_round_action(
-                                                    ft.Icons.SYNC,
-                                                    "Обновить минимальные цены в Ozon",
-                                                    lambda _e: job("Обновление минимальных цен", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "update-min-prices"]),
-                                                    tone="warning",
-                                                ),
-                                            ],
-                                            spacing=8,
-                                        ),
-                                        ft.Text(
-                                            "Кнопки, которые меняют значения в столбцах, находятся прямо над этими столбцами в рабочей таблице.",
-                                            size=10,
-                                            color=MUTED,
-                                        ),
-                                    ],
-                                    spacing=6,
-                                    tight=True,
-                                ),
-                            ),
-                        ],
-                    ),
-                ],
-                tone=semantic_surface("neutral_soft", dark=False),
-                col=12,
-            ),
-            ft.ResponsiveRow(
-                run_spacing=14,
-                spacing=14,
-                controls=[
-                    card(
-                        "",
-                        "",
-                        [
-                            ft.ResponsiveRow(
-                                run_spacing=10,
-                                spacing=10,
-                                controls=[
-                                    ft.Container(
-                                        col=7,
-                                        content=ft.Column(
-                                            [
-                                                ft.Text("Заявки на скидку", size=20, weight=ft.FontWeight.W_700, color=TEXT),
-                                                ft.Text("Рабочая очередь решений по скидочным заявкам.", size=11, color=MUTED),
-                                            ],
-                                            spacing=4,
-                                            tight=True,
-                                        ),
-                                    ),
-                                    ft.Container(
-                                        col=5,
-                                        alignment=ft.Alignment(1, 0),
-                                        content=ft.Row(
-                                            [
-                                                discount_dialog_badge_shell,
-                                                ft.Container(
-                                                    width=42,
-                                                    height=42,
-                                                    border_radius=999,
-                                                    bgcolor=semantic_surface("neutral_alt", dark=False),
-                                                    border=ft.Border.all(1, "#E5E5EA"),
-                                                    alignment=ft.Alignment(0, 0),
-                                                    content=discount_requests_refresh_button,
-                                                ),
-                                            ],
-                                            spacing=8,
-                                            wrap=True,
-                                            alignment=ft.MainAxisAlignment.END,
-                                        ),
-                                    ),
-                                ],
-                            ),
-                            ft.Row([discount_requests_auto_button], spacing=8, wrap=True),
-                            discount_dialog_status,
-                            discount_overview_row,
-                            discount_requests_surface,
-                        ],
-                        tone=semantic_surface("neutral", dark=False),
-                        col={"md": 12, "lg": 3, "xl": 3},
-                    ),
-                    card(
-                        "",
-                        "",
-                        [
-                            ft.ResponsiveRow(
-                                run_spacing=10,
-                                spacing=10,
-                                controls=[
-                                    ft.Container(
-                                        col=6,
-                                        content=ft.Column(
-                                            [
-                                                ft.Text("Рабочая таблица", size=20, weight=ft.FontWeight.W_700, color=TEXT),
-                                                ft.Text("Правка себестоимости и контроль цены в одном рабочем поле.", size=11, color=MUTED),
-                                            ],
-                                            spacing=4,
-                                            tight=True,
-                                        ),
-                                    ),
-                                    ft.Container(
-                                        col=6,
-                                        alignment=ft.Alignment(1, 0),
-                                        content=ft.Row(
-                                            [
-                                                pricing_costs_status_shell,
-                                                pricing_round_action(
-                                                    ft.Icons.SYNC,
-                                                    "Обновить таблицу",
-                                                    handle_pricing_costs_refresh,
-                                                ),
-                                                pricing_round_action(
-                                                    ft.Icons.OPEN_IN_NEW,
-                                                    "Открыть costs.xlsx",
-                                                    lambda _e: reveal_path(ROOT / "costs.xlsx", "costs.xlsx"),
-                                                ),
-                                            ],
-                                            spacing=8,
-                                            wrap=True,
-                                            alignment=ft.MainAxisAlignment.END,
-                                        ),
-                                    ),
-                                ],
-                            ),
-                            ft.Row(
-                                [
-                                    pricing_costs_save_button,
-                                    ft.Text("Кнопки над колонками влияют только на соответствующие столбцы.", size=11, color=MUTED),
-                                ],
-                                spacing=8,
-                                wrap=True,
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
-                            pricing_costs_surface,
-                        ],
-                        tone=semantic_surface("neutral", dark=False),
-                        col={"md": 12, "lg": 9, "xl": 9},
-                    ),
-                ],
-            ),
-        ],
-        spacing=18,
+        [pricing_header, pricing_stats_area, discount_panel, pricing_table_panel],
+        spacing=14,
     )
 
     promo_dialog_title = ft.Text("", size=18, weight=ft.FontWeight.W_800)
@@ -5153,13 +4922,12 @@ def main(page: ft.Page) -> None:
     promo_titles = {
         "remove": "Удаление невыгодных товаров из акций",
         "add": "Добавление в акции и подъём цен",
-        "tidy": "Порядок в предстоящих акциях",
     }
     promo_groups = (
         ("add", "Добавить в акцию"),
         ("raise", "Поднять цену в акции"),
         ("remove", "Удалить из акции"),
-        ("watch", "Ozon может добавить сам по цене ниже минимальной"),
+        ("watch", "Внимание: Ozon может добавить сам по цене ниже минимальной"),
     )
 
     def promo_spinner() -> ft.Control:
@@ -5189,12 +4957,24 @@ def main(page: ft.Page) -> None:
             return [
                 (f"Максимум акции {_format_currency(item['max_action_price'])} · минимальная {_format_currency(item['min_price'])}", None),
                 (item.get("note") or "", warn),
-                ("Отметьте, чтобы отключить автодобавление этому товару (во всех акциях, а не только в этой).", None),
+                (f"Минимальная цена в Ozon — {_format_currency(item['ozon_min_price'])}, поэтому Ozon считает эту цену допустимой."
+                 if item.get("ozon_min_price") else "Минимальная цена в Ozon не задана — Ozon может добавить товар по любой цене.", None),
+                ("Чтобы Ozon не добавлял товар дешевле вашей минимальной, отправьте минимальные цены в Ozon "
+                 "(«Цены и скидки» → «Обновить минимальные цены в Ozon»). Здесь ничего не отправляется.", None),
             ]
         if kind == "remove":
-            price_line = f"Цена в акции {_format_currency(item['action_price'])} ниже минимальной {_format_currency(item['min_price'])}"
-            if item.get("exit_price"):
-                price_line += (f" · для выхода из акции цена станет {_format_currency(item['exit_price'])}"
+            if item.get("action_start"):
+                day, month = item["action_start"][8:10], item["action_start"][5:7]
+                price_line = (f"С {day}.{month} цена в акции станет {_format_currency(item['action_price'])}"
+                              f" — ниже минимальной {_format_currency(item['min_price'])}")
+            else:
+                price_line = f"Цена в акции {_format_currency(item['action_price'])} ниже минимальной {_format_currency(item['min_price'])}"
+            exit_price, product_price = item.get("exit_price"), item.get("product_price")
+            if exit_price and product_price and exit_price <= product_price:
+                price_line += (f" · для выхода цена товара останется {_format_currency(product_price)}"
+                               f" (лимит акции {_format_currency(item.get('max_action_price'))})")
+            elif exit_price:
+                price_line += (f" · для выхода из акции цена станет {_format_currency(exit_price)}"
                                f" (лимит акции {_format_currency(item.get('max_action_price'))})")
             else:
                 price_line += " · Ozon не сообщил лимит акции — вывести нельзя"
@@ -5276,7 +5056,8 @@ def main(page: ft.Page) -> None:
                     target["selected"] = bool(e.control.value)
                     refresh_promo_confirm()
 
-                checkbox = ft.Checkbox(value=item.get("selected", True), on_change=on_toggle)
+                # Предупреждения только для сведения: отправлять нечего.
+                checkbox = None if kind == "watch" else ft.Checkbox(value=item.get("selected", True), on_change=on_toggle)
                 rows.append(promo_row(f"{item['offer_id']} — {item['action_name']}", promo_item_lines(item), checkbox=checkbox))
         return rows
 
@@ -5284,16 +5065,16 @@ def main(page: ft.Page) -> None:
         items = plan.get("items") or []
         parts = [str(plan.get("message") or "")]
         if mode == "remove":
+            if any(item["kind"] == "raise" for item in items):
+                parts.append("Где акция позволяет цену не ниже минимальной, товар остаётся в ней с поднятой ценой и сохраняет бустинг.")
             parts.append("При единой цене Ozon товар выходит из акции, только когда его цена выше лимита акции: "
-                         "отмеченным товарам будет установлена указанная цена продавца (ваша минимальная, но не ниже лимита + 1 ₽). "
-                         "Цену для покупателя Ozon посчитает сам со своими скидками.")
-        elif mode == "tidy":
-            parts.append("Отмеченные товары будут добавлены по вашей цене, получат приемлемую цену или будут удалены.")
-            if any(item["kind"] == "watch" for item in items):
-                parts.append("Товары «под присмотром» Ozon может добавить сам по невыгодной цене, а отключить это через API нельзя: "
-                             "выключите автодобавление в кабинете Ozon или нажмите эту кнопку после указанной даты — программа их удалит.")
+                         "отмеченным товарам будет установлена указанная цена продавца (не ниже минимальной, лимита + 1 ₽ "
+                         "и текущей цены товара). Цену для покупателя Ozon посчитает сам со своими скидками.")
         else:
             parts.append("Отмеченные товары будут добавлены в акции или получат новую цену в Ozon.")
+            if any(item["kind"] == "watch" for item in items):
+                parts.append("Предупреждения об автодобавлении — только для сведения: Ozon может сам добавить эти товары "
+                             "по цене ниже вашей минимальной.")
             if any(item["kind"] == "raise" and not item.get("selected", True) for item in items):
                 parts.append("Подъёмы цены, которые снижают бустинг, по умолчанию не отмечены — решите сами, что важнее: маржа или показы.")
         if not plan.get("visibility_available"):
@@ -5337,7 +5118,7 @@ def main(page: ft.Page) -> None:
 
         def worker() -> None:
             try:
-                builder = {"remove": build_action_removal_plan, "add": build_action_add_plan, "tidy": build_upcoming_actions_plan}[mode]
+                builder = {"remove": build_action_removal_plan, "add": build_action_add_plan}[mode]
                 plan = builder(ROOT)
             except Exception as exc:
                 plan = {"ok": False, "message": f"Не удалось собрать список: {exc}", "items": []}
@@ -5369,19 +5150,7 @@ def main(page: ft.Page) -> None:
 
         def worker() -> None:
             try:
-                result = execute_upcoming_actions_plan(plan) if mode == "tidy" else execute_action_plan(plan, mode)
-                watched = {} if mode != "tidy" else {
-                    item["product_id"]: {"product_id": item["product_id"], "offer_id": item["offer_id"]}
-                    for item in plan.get("items") or [] if item["kind"] == "watch" and item.get("selected")
-                }
-                if watched and auto_actions is not None:
-                    auto = auto_actions.apply_change(ROOT, "auto_add_off", list(watched.values()))
-                    result["message"] = f"{result.get('message', '')} {auto['message']}".strip()
-                    result["done"] = int(result.get("done") or 0) + auto["done"]
-                    result["ok"] = bool(result.get("ok", True)) and auto["ok"]
-                    result.setdefault("rejected", [])
-                    result["rejected"] += [{"offer_id": f["offer_id"], "action_name": "автодобавление", "reason": f["reason"]}
-                                           for f in auto["failed"]]
+                result = execute_action_plan(plan, mode)
             except Exception as exc:
                 result = {"ok": False, "done": 0, "message": f"Ошибка отправки в Ozon: {exc}", "rejected": [], "unconfirmed": [], "errors": []}
             finally:
@@ -5425,14 +5194,13 @@ def main(page: ft.Page) -> None:
                 controls=[
                     card(
                         "Акции Ozon",
-                        "Удалить невыгодные, добавить выгодные товары или поднять цену участвующим. Перед отправкой покажем список с бустингом.\n"
-                        "«Порядок в предстоящих» проверяет акции, которые ещё не начались или куда Ozon скоро добавит товары сам.",
+                        "Удалить невыгодные (или поднять им цену, если акция позволяет), добавить выгодные товары или поднять цену участвующим. "
+                        "Проверяются и акции, которые ещё не начались. Перед отправкой покажем список с бустингом.",
                         [
                             ft.Column(
                                 [
                                     ft.Button("Удалить невыгодные", bgcolor=DANGER, color="white", on_click=lambda _e: open_promo_plan("remove")),
                                     ft.Button("Добавить и поднять цены", bgcolor=PRIMARY, color="white", on_click=lambda _e: open_promo_plan("add")),
-                                    ft.Button("Порядок в предстоящих", icon=ft.Icons.EVENT_AVAILABLE, bgcolor=ACCENT, color="white", on_click=lambda _e: open_promo_plan("tidy")),
                                 ],
                                 spacing=8,
                             )
@@ -7006,8 +6774,7 @@ def main(page: ft.Page) -> None:
         ], spacing=10, tight=True)
 
         def run(_e=None) -> None:
-            dialog.open = False
-            page.update(dialog)
+            page.pop_dialog()
             if not job_lock.acquire(blocking=False):
                 toast("Дождитесь завершения текущей операции.", True)
                 return
@@ -7040,13 +6807,14 @@ def main(page: ft.Page) -> None:
             title=ft.Text(f"{title}?", size=18, weight=ft.FontWeight.W_800, color="#F3F4F6" if dark else TEXT),
             bgcolor="#232A2F" if dark else "#FFFDF8",
             content=ft.Container(width=620, content=body),
-            actions=[ft.TextButton("Отмена", on_click=lambda _e: (setattr(dialog, "open", False), page.update(dialog))),
+            actions=[ft.TextButton("Отмена", on_click=lambda _e: page.pop_dialog()),
                      ft.Button(f"Отправить в Ozon ({len(chosen)})", bgcolor=PRIMARY, color="white", on_click=run)],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        page.overlay.append(dialog)
-        dialog.open = True
-        page.update(dialog)
+        # show_dialog сразу отправляет окно на экран и убирает его из страницы после закрытия.
+        # Раньше окно добавлялось в overlay и обновлялось только само: клиент его не знал, и оно
+        # появлялось лишь при следующем полном обновлении страницы (иногда через много секунд).
+        page.show_dialog(dialog)
 
     def render_auto_panel(push_update: bool = True) -> None:
         pal = dash_pal()
@@ -7781,10 +7549,155 @@ def main(page: ft.Page) -> None:
         spacing=18,
     )
 
-    views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, supply, finance, settings, file_view]
+    # ---------------------------------------------------------------- Остатки (общая таблица Ozon + WB)
+    stock_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False}
+    stock_subtitle = ft.Text("", size=13, color=MUTED)
+    stock_refresh_button = ft.Button("Обновить", icon=ft.Icons.REFRESH, bgcolor=PRIMARY, color="white")
+    stock_body = ft.Column(spacing=14)
+
+    def stock_load(_e=None) -> None:
+        if stock_state["busy"] or stock_overview is None:
+            return
+        stock_state.update(busy=True, error=None, started=True)
+        render_stock_view()
+
+        def worker() -> None:
+            try:
+                stock_state["data"] = stock_overview.load(ROOT)
+            except Exception as exc:
+                stock_state["error"] = str(exc)
+            finally:
+                stock_state["busy"] = False
+            ui_queue.put(("call", render_stock_view))
+
+        page.run_thread(worker)
+
+    stock_refresh_button.on_click = stock_load
+
+    def render_stock_view(push_update: bool = True) -> None:
+        pal = dash_pal()
+        data = stock_state.get("data") or {}
+        rows = list(data.get("rows") or [])
+        loaded = str(data.get("loaded") or "")
+        parts = ["Ozon и Wildberries", "сколько держать на ближайшие 30 дней"]
+        if loaded:
+            parts.append(f"обновлено {loaded[8:10]}.{loaded[5:7]} в {loaded[11:16]}")
+        if data:
+            parts.append(f"уровень сервиса {float(data.get('level') or 0):.0%}")
+        stock_subtitle.value = " · ".join(parts)
+        stock_refresh_button.disabled = bool(stock_state["busy"])
+
+        controls: list[ft.Control] = []
+        if stock_overview is None:
+            controls.append(dpanel(dtext(f"Модуль остатков не загрузился: {STOCK_IMPORT_ERROR}", 13, pal["bad"])))
+        if stock_state["busy"]:
+            controls.append(dpanel(ft.Row([
+                ft.ProgressRing(width=20, height=20, stroke_width=2.4),
+                dtext("Загружаю остатки и историю продаж Ozon и Wildberries… В первый раз это может занять несколько минут: "
+                      "история сохраняется и дальше грузится быстро.", 13, pal["muted"], expand=True),
+            ], spacing=12)))
+        if stock_state.get("error"):
+            controls.append(dpanel(dtext(f"Не удалось загрузить остатки: {stock_state['error']}", 13, pal["bad"])))
+        for store, message in (data.get("errors") or {}).items():
+            controls.append(dpanel(dtext(f"{store} не загрузился — его колонки пустые. {message}", 13, pal["bad"])))
+        if rows:
+            def total(key: str) -> int:
+                return sum(int(row.get(key) or 0) for row in rows)
+
+            def need_stat(label: str, need_key: str, stock_keys: tuple[str, ...], short_key: str) -> ft.Control:
+                short = total(short_key)
+                have = sum(total(key) for key in stock_keys)
+                return dash_stat(label, _format_number(total(need_key)), f"есть {_format_number(have)}, не хватает {_format_number(short)}",
+                                 pal["bad"] if short else pal["good"])
+
+            controls.append(dpanel(ft.ResponsiveRow([
+                dash_stat("Артикулов", str(len(rows)), "с остатком или продажами"),
+                need_stat("Нужно держать FBO", "need_fbo", ("fbo", "fbo_transit"), "short_fbo"),
+                need_stat("Нужно держать FBW", "need_fbw", ("fbw", "fbw_transit"), "short_fbw"),
+                need_stat("Нужно держать FBS", "need_fbs", ("fbs",), "short_fbs"),
+            ], spacing=24, run_spacing=12), padding=ft.Padding.symmetric(horizontal=24, vertical=16)))
+
+            columns = [("Артикул", 3), ("FBS", 2), ("FBO", 2), ("FBW", 2), ("Нужно держать FBO", 3), ("Нужно держать FBW", 3), ("Нужно держать FBS", 3)]
+
+            def cell(content: ft.Control, weight: int, right: bool = True, tooltip: str | None = None) -> ft.Control:
+                return ft.Container(expand=weight, alignment=ft.Alignment(1 if right else -1, 0), tooltip=tooltip, content=content)
+
+            def stock_text(value, transit: int = 0, need=None) -> ft.Control:
+                if value is None:
+                    return dtext("—", 13, pal["muted"])
+                text = _format_number(value) + (f" +{transit}" if transit else "")
+                if value or transit:
+                    return dtext(text, 13)
+                # Пусто на складе, где товар нужен, — красным; где он и не нужен — просто серым.
+                return dtext(text, 13, pal["bad"], ft.FontWeight.W_700) if need else dtext(text, 13, pal["muted"])
+
+            def need_text(need, short: int) -> ft.Control:
+                if need is None:
+                    return dtext("—", 13, pal["muted"])
+                return dtext(str(need) + (f"  (−{short})" if short else ""), 13, pal["bad"] if short else (None if need else pal["muted"]),
+                             ft.FontWeight.W_700 if short else None)
+
+            table: list[ft.Control] = [ft.Container(
+                padding=ft.Padding.only(bottom=8),
+                content=ft.Row([cell(dtext(name, 12, pal["muted"], ft.FontWeight.W_600, text_align=ft.TextAlign.RIGHT if index else None), w, bool(index))
+                                for index, (name, w) in enumerate(columns)], spacing=14, vertical_alignment=ft.CrossAxisAlignment.END),
+            )]
+            for row in rows:
+                fbs_tip = " · ".join(f"{store}: {value}" for store, value in row["fbs_by_store"].items()) or None
+                if fbs_tip and len(row["fbs_by_store"]) > 1:
+                    fbs_tip = "Свой склад, как его показывают магазины: " + fbs_tip + ". Берём наибольшее — это один и тот же товар."
+                table.append(ft.Container(
+                    padding=ft.Padding.symmetric(vertical=9), data="preserve_excel_fill",
+                    border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])),
+                    content=ft.Row([
+                        cell(dtext(row["article"], 13, weight=ft.FontWeight.W_700), 3, right=False),
+                        cell(stock_text(row["fbs"], need=row["need_fbs"]), 2, tooltip=fbs_tip),
+                        cell(stock_text(row["fbo"], row["fbo_transit"], row["need_fbo"]), 2,
+                             tooltip=f"В пути и в заявках на склады Ozon: {row['fbo_transit']} шт." if row["fbo_transit"] else None),
+                        cell(stock_text(row["fbw"], row["fbw_transit"], row["need_fbw"]), 2,
+                             tooltip=f"Возвраты в пути на склады WB: {row['fbw_transit']} шт." if row["fbw_transit"] else None),
+                        cell(need_text(row["need_fbo"], row["short_fbo"]), 3),
+                        cell(need_text(row["need_fbw"], row["short_fbw"]), 3),
+                        cell(need_text(row["need_fbs"], row["short_fbs"]), 3,
+                             tooltip=f"Спрос на своём складе за 30 дней: {row['fbs_demand']:g} шт. (Ozon и WB вместе)" if row["fbs_demand"] else None),
+                    ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ))
+            notes = [dtext("«Нужно держать» считается так же, как в «Поставках», только на ближайшие 30 дней без срока поставки. "
+                           "FBO и FBW — склады маркетплейсов, FBS — ваш склад: туда идёт спрос, который не покроют FBO и FBW. "
+                           "Красным — не хватает с учётом товара в пути.", 12, pal["muted"])]
+            notes += [dtext(note, 12, pal["muted"]) for note in data.get("notes") or []]
+            controls.append(dpanel(ft.Column([
+                dtext("Товары", 15, weight=ft.FontWeight.W_700),
+                *notes,
+                ft.Container(height=4),
+                ft.Column(table, spacing=0),
+            ], spacing=4), padding=ft.Padding.only(left=20, right=20, top=14, bottom=10)))
+        elif not stock_state["busy"] and not stock_state.get("error") and stock_state["started"] and not data.get("errors"):
+            controls.append(dpanel(dtext("Нет артикулов с остатками или продажами.", 13, pal["muted"])))
+        stock_body.controls = controls
+        if push_update and page.controls and host.controls and host.controls[0] is stock_view:
+            page.update(stock_view)
+
+    stock_view = ft.Column(
+        [
+            ft.ResponsiveRow(
+                [
+                    ft.Container(col={"xs": 12, "lg": 8},
+                                 content=ft.Column([ft.Text("Остатки", size=26, weight=ft.FontWeight.W_800, color=TEXT), stock_subtitle], spacing=2)),
+                    ft.Container(col={"xs": 12, "lg": 4}, alignment=ft.Alignment(1, 0), content=stock_refresh_button),
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                run_spacing=12,
+            ),
+            stock_body,
+        ],
+        spacing=14,
+    )
+
+    views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, supply, stock_view, finance, settings, file_view]
     active_store = {"value": "ozon"}
     store_sections = {"ozon": 0, "wb": 0}
-    section_names = ["Бизнес-сводка", "AI-ассистент", "ABC/XYZ-анализ", "Цены и скидки", "Акции", "Реклама", "Анализ", "Поставки", "Финансы", "Настройки", "Файлы"]
+    section_names = ["Бизнес-сводка", "AI-ассистент", "ABC/XYZ-анализ", "Цены и скидки", "Акции", "Реклама", "Анализ", "Поставки", "Остатки", "Финансы", "Настройки", "Файлы"]
 
     wb_dashboard = build_wb_dashboard(
         months=MONTHS, metric=metric, hero_metric=hero_metric, card=card,
@@ -7803,6 +7716,9 @@ def main(page: ft.Page) -> None:
         if views[index] is supply:
             render_wb_supply_results(push_update=False)
             return wb_supply
+        if views[index] is stock_view:
+            render_stock_view(push_update=False)
+            return stock_view
         return ft.Column(
             [
                 ft.Text("Wildberries", size=13, weight=ft.FontWeight.W_600, color=MUTED),
@@ -7848,6 +7764,8 @@ def main(page: ft.Page) -> None:
         if is_ozon and views[selected_index] is actions:
             render_actions_calendar(push_update=False)
             render_auto_panel(push_update=False)
+        if is_ozon and views[selected_index] is stock_view:
+            render_stock_view(push_update=False)
         is_ai_view = is_ozon and selected_index == 1
         host.scroll = ft.ScrollMode.HIDDEN if is_ai_view else ft.ScrollMode.AUTO
         host_shell.padding = 0 if is_ai_view else ft.Padding.only(left=8, right=10, top=20, bottom=20)
@@ -7872,6 +7790,8 @@ def main(page: ft.Page) -> None:
             calendar_load()
         if is_ozon and views[selected_index] is actions and not auto_state["started"]:
             auto_load()
+        if views[selected_index] is stock_view and not stock_state["started"]:
+            stock_load()
 
     def open_section(view) -> None:
         index = views.index(view)
@@ -7962,6 +7882,7 @@ def main(page: ft.Page) -> None:
             ft.NavigationRailDestination(icon=ft.Icons.CAMPAIGN_OUTLINED, selected_icon=ft.Icons.CAMPAIGN, label="Реклама"),
             ft.NavigationRailDestination(icon=ft.Icons.INSIGHTS_OUTLINED, selected_icon=ft.Icons.INSIGHTS, label="Анализ"),
             ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2_OUTLINED, selected_icon=ft.Icons.INVENTORY_2, label="Поставки"),
+            ft.NavigationRailDestination(icon=ft.Icons.WAREHOUSE_OUTLINED, selected_icon=ft.Icons.WAREHOUSE, label="Остатки"),
             ft.NavigationRailDestination(icon=ft.Icons.ACCOUNT_BALANCE_WALLET_OUTLINED, selected_icon=ft.Icons.ACCOUNT_BALANCE_WALLET, label="Finance"),
             ft.NavigationRailDestination(icon=ft.Icons.SETTINGS_OUTLINED, selected_icon=ft.Icons.SETTINGS, label="Settings"),
             ft.NavigationRailDestination(icon=ft.Icons.FOLDER_OPEN_OUTLINED, selected_icon=ft.Icons.FOLDER_OPEN, label="Files"),
@@ -8095,6 +8016,7 @@ def main(page: ft.Page) -> None:
         render_abc_view(push_update=False)
         render_wb_supply_results(push_update=False)
         render_auto_panel(push_update=False)
+        render_stock_view(push_update=False)
         style_store_tabs()
         set_status(state.value, status_detail.value, status_tone["value"], busy=spin.visible, cancellable=cancel_button.visible)
         page.update()
