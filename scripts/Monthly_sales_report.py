@@ -172,79 +172,25 @@ except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent))
     from balance_report import get_star_products_for_month, get_product_placement_in_ozon_warehouses_for_month, get_monthly_balance_reports, summarize_month as summarize_balance_month  # type: ignore
 
-# 📥 Получаем список заказов FBS (Fulfillment by Seller)
-def _fetch_fbs_page(session: requests.Session, date_from: str, date_to: str, status: str, limit: int, offset: int) -> List[Dict[str, Any]]:
-    url = 'https://api-seller.ozon.ru/v3/posting/fbs/list'
-    payload = {
-        "filter": {
-            "since": date_from,
-            "to": date_to,
-            "status": status
-        },
-        "limit": limit,
-        "offset": offset,
-        "with": {
-            "analytics_data": True,
-            "financial_data": True
-        }
-    }
-    resp = session.post(url, headers=HEADERS, json=payload, timeout=(10, 60))
-    resp.raise_for_status()
-    data = resp.json()
-    postings = data.get("result", {}).get("postings", [])
-    for p in postings:
-        p["__schema"] = "FBS"
-    return postings
+POSTING_STATUSES = ['awaiting_packaging', 'awaiting_deliver', 'delivering', 'delivered', 'cancelled']
+FBS_LIST_URL = 'https://api-seller.ozon.ru/v4/posting/fbs/list'
+FBO_LIST_URL = 'https://api-seller.ozon.ru/v3/posting/fbo/list'
 
-# 📥 Получаем список заказов FBS (Fulfillment by Seller)
-def get_orders(date_from, date_to, session: Optional[requests.Session] = None):
-    if session is None:
-        with create_session() as owned_session:
-            return get_orders(date_from, date_to, session=owned_session)
-    result = []
-    limit = 100
-    for status in ['awaiting_packaging', 'awaiting_deliver', 'delivering', 'delivered', 'cancelled']:
-        offset = 0
-        while True:
-            try:
-                postings = _fetch_fbs_page(session, date_from, date_to, status, limit, offset)
-            except Exception as exc:
-                raise RuntimeError(f"Не удалось загрузить FBS: статус {status}, offset {offset}. {exc}") from exc
-            if not postings:
-                break
-            result.extend(postings)
-            offset += limit
-    return result
 
-# 📥 Получаем список заказов FBO (Fulfillment by Ozon)
-def _fetch_fbo_page(session: requests.Session, date_from: str, date_to: str, limit: int, cursor: str) -> Dict[str, Any]:
-    url = 'https://api-seller.ozon.ru/v3/posting/fbo/list'
-    payload = {
-        "sort_dir": "ASC",
-        "filter": {
-            "since": date_from,
-            "to": date_to,
-            "statuses": ['awaiting_packaging', 'awaiting_deliver', 'delivering', 'delivered', 'cancelled']
-        },
-        "limit": limit,
-        "cursor": cursor,
-        "with": {
-            "analytics_data": True,
-            "financial_data": True
-        }
-    }
+def _fetch_posting_page(session: requests.Session, url: str, schema: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """One cursor page of FBS v4 / FBO v3: both return {postings, has_next, cursor} and money as {amount, currency}."""
     resp = session.post(url, headers=HEADERS, json=payload, timeout=(10, 60))
     resp.raise_for_status()
     data = resp.json()
     if (not isinstance(data, dict) or not isinstance(data.get("postings"), list)
             or not isinstance(data.get("has_next"), bool)):
-        raise ValueError("Некорректный ответ /v3/posting/fbo/list: ожидаются postings и has_next.")
+        raise ValueError(f"Некорректный ответ {url.split('ozon.ru')[-1]}: ожидаются postings и has_next.")
     postings = data["postings"]
     for p in postings:
         if not isinstance(p, dict):
-            raise ValueError("Некорректное отправление в ответе FBO.")
-        p["__schema"] = "FBO"
-        # Keep the common report representation shared with FBS.
+            raise ValueError(f"Некорректное отправление в ответе {schema}.")
+        p["__schema"] = schema
+        # Keep the flat report representation (price as a number, commission_* fields).
         for product in p.get("products", []) or []:
             price = product.get("price")
             if isinstance(price, dict):
@@ -258,17 +204,15 @@ def _fetch_fbo_page(session: requests.Session, date_from: str, date_to: str, lim
                 product["currency_code"] = commission.get("currency", "")
     return data
 
-def get_fbo_orders(date_from, date_to, session: Optional[requests.Session] = None):
-    if session is None:
-        with create_session() as owned_session:
-            return get_fbo_orders(date_from, date_to, session=owned_session)
+
+def _get_postings(fetch_page, label: str) -> List[Dict[str, Any]]:
+    """Walk cursor pages; any failure raises so a partial order list never reaches the report."""
     result = []
-    limit = 100
     cursor = ""
     seen_cursors = {cursor}
     while True:
         try:
-            page = _fetch_fbo_page(session, date_from, date_to, limit, cursor)
+            page = fetch_page(cursor)
             result.extend(page["postings"])
             if not page["has_next"]:
                 break
@@ -278,8 +222,46 @@ def get_fbo_orders(date_from, date_to, session: Optional[requests.Session] = Non
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         except Exception as exc:
-            raise RuntimeError(f"Не удалось загрузить FBO (v3), страница {len(seen_cursors)}. {exc}") from exc
+            raise RuntimeError(f"Не удалось загрузить {label}, страница {len(seen_cursors)}. {exc}") from exc
     return result
+
+
+# 📥 Получаем список заказов FBS (Fulfillment by Seller)
+def _fetch_fbs_page(session: requests.Session, date_from: str, date_to: str, limit: int, cursor: str) -> Dict[str, Any]:
+    # v3/posting/fbs/list Ozon выводит из работы: он отвечает 429 с нулевым лимитом на любой запрос.
+    payload = {
+        "filter": {"since": date_from, "to": date_to, "statuses": POSTING_STATUSES},
+        "limit": limit,
+        "cursor": cursor,
+        "with": {"analytics_data": True, "financial_data": True},
+    }
+    return _fetch_posting_page(session, FBS_LIST_URL, "FBS", payload)
+
+
+def get_orders(date_from, date_to, session: Optional[requests.Session] = None):
+    if session is None:
+        with create_session() as owned_session:
+            return get_orders(date_from, date_to, session=owned_session)
+    return _get_postings(lambda cursor: _fetch_fbs_page(session, date_from, date_to, 100, cursor), "FBS (v4)")
+
+
+# 📥 Получаем список заказов FBO (Fulfillment by Ozon)
+def _fetch_fbo_page(session: requests.Session, date_from: str, date_to: str, limit: int, cursor: str) -> Dict[str, Any]:
+    payload = {
+        "sort_dir": "ASC",
+        "filter": {"since": date_from, "to": date_to, "statuses": POSTING_STATUSES},
+        "limit": limit,
+        "cursor": cursor,
+        "with": {"analytics_data": True, "financial_data": True},
+    }
+    return _fetch_posting_page(session, FBO_LIST_URL, "FBO", payload)
+
+
+def get_fbo_orders(date_from, date_to, session: Optional[requests.Session] = None):
+    if session is None:
+        with create_session() as owned_session:
+            return get_fbo_orders(date_from, date_to, session=owned_session)
+    return _get_postings(lambda cursor: _fetch_fbo_page(session, date_from, date_to, 100, cursor), "FBO (v3)")
 
 def _accrual_money(value):
     """Read signed money without silently turning malformed amounts into zero."""

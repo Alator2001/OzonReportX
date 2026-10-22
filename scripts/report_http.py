@@ -47,9 +47,18 @@ class ReportSession(requests.Session):
                 if response.status_code != 429:
                     return response
                 delay = max(5.0 * (2 ** attempt), retry_after_seconds(response.headers.get("Retry-After")) or 0.0)
+                try:
+                    detail = str(response.json().get("message") or "")
+                except (ValueError, AttributeError):
+                    detail = ""
                 response.close()
                 if attempt == self.max_rate_retries or waited + delay > self.max_rate_wait:
-                    raise RuntimeError("Ozon продолжает ограничивать запросы (HTTP 429). Повторите формирование отчёта позже; неполный отчёт не сохранён.")
+                    method_path = urlsplit(url).path
+                    detail = f" Ответ Ozon: «{detail}»." if detail else ""
+                    raise RuntimeError(
+                        f"Ozon продолжает ограничивать запросы к {method_path} (HTTP 429).{detail} "
+                        "Если ошибка повторяется, лимит этого метода, скорее всего, расходует другая программа "
+                        "или сервис с тем же Client-Id. Повторите формирование отчёта позже; неполный отчёт не сохранён.")
                 print(f"⏳ Ozon ограничил частоту запросов (429). Пауза {delay:.0f} с, повтор {attempt + 1}/{self.max_rate_retries}.", flush=True)
                 time.sleep(delay)
                 waited += delay

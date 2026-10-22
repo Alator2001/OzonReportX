@@ -123,10 +123,10 @@ def get_product_prices_from_ozon(offer_ids: list[str]) -> tuple[Dict[str, Option
     """
     if not OZON_CLIENT_ID or not OZON_API_KEY:
         print("⚠️ OZON_CLIENT_ID или OZON_API_KEY не настроены. Пропускаем получение цен с Ozon.")
-        return {}
+        return {}, {}
     
     if not offer_ids:
-        return {}
+        return {}, {}
     
     # Нормализуем артикулы: убираем .0 и преобразуем в строки
     normalized_offer_ids = []
@@ -136,7 +136,7 @@ def get_product_prices_from_ozon(offer_ids: list[str]) -> tuple[Dict[str, Option
             normalized_offer_ids.append(normalized)
     
     if not normalized_offer_ids:
-        return {}
+        return {}, {}
     
     # API Ozon v5/product/info/prices
     url = "https://api-seller.ozon.ru/v5/product/info/prices"
@@ -318,64 +318,26 @@ def get_actions_list() -> List[Dict[str, Any]]:
 
 def get_product_info_by_id(product_id: int, debug: bool = False) -> Optional[str]:
     """
-    Получает offer_id товара по его product_id через API /v2/product/info.
-    Возвращает offer_id или None.
+    Получает offer_id товара по его product_id через /v3/product/info/list
+    (прежний /v2/product/info Ozon удалил — отвечает 404). Возвращает offer_id или None.
     """
     if not OZON_CLIENT_ID or not OZON_API_KEY:
         return None
-    
-    url = "https://api-seller.ozon.ru/v2/product/info"
-    payload = {
-        "product_id": product_id
-    }
-    
     try:
-        response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
+        response = requests.post(
+            "https://api-seller.ozon.ru/v3/product/info/list",
+            headers=OZON_HEADERS, json={"product_id": [str(product_id)]}, timeout=30,
+        )
         response.raise_for_status()
-        data = response.json()
-        
-        # Структура ответа может быть разной, проверяем разные варианты
-        if isinstance(data, dict):
-            # Вариант 1: {"result": {"offer_id": "...", ...}}
-            if "result" in data:
-                result_data = data["result"]
-                # Проверяем разные возможные поля
-                offer_id = result_data.get("offer_id") or result_data.get("offerId") or result_data.get("sku")
-                if offer_id:
-                    if debug:
-                        print(f"      DEBUG: product_id {product_id} -> offer_id {offer_id} (найден в result)")
-                    return str(offer_id)
-                elif debug:
-                    print(f"      DEBUG: product_id {product_id} - ключи в result: {list(result_data.keys())[:10]}")
-            
-            # Вариант 2: {"offer_id": "...", ...} на верхнем уровне
-            offer_id = data.get("offer_id") or data.get("offerId") or data.get("sku")
-            if offer_id:
-                if debug:
-                    print(f"      DEBUG: product_id {product_id} -> offer_id {offer_id} (найден на верхнем уровне)")
-                return str(offer_id)
-    except requests.exceptions.RequestException as e:
-        if debug:
-            if hasattr(e, 'response') and e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    print(f"      DEBUG: Ошибка API для product_id {product_id}: {error_data}")
-                except:
-                    print(f"      DEBUG: Ошибка для product_id {product_id}: {e.response.status_code} - {e.response.text[:200]}")
-            else:
-                print(f"      DEBUG: Ошибка при получении offer_id для product_id {product_id}: {e}")
-        # Для первых запросов всегда показываем ошибки
-        if product_id and len(str(product_id)) < 10:  # Простая проверка для первых запросов
-            if hasattr(e, 'response') and e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    print(f"      ⚠️ Ошибка API для SKU {product_id}: {error_data}")
-                except:
-                    print(f"      ⚠️ Ошибка для SKU {product_id}: {e.response.status_code}")
-    except Exception as e:
-        if debug:
-            print(f"      DEBUG: Неожиданная ошибка для product_id {product_id}: {e}")
-    
+        items = response.json().get("items") or []
+    except (requests.exceptions.RequestException, ValueError) as e:
+        log_verbose(f"      Не удалось получить offer_id для product_id {product_id}: {e}")
+        return None
+    for item in items:
+        if str(item.get("id")) == str(product_id) and item.get("offer_id"):
+            if debug:
+                print(f"      DEBUG: product_id {product_id} -> offer_id {item['offer_id']}")
+            return str(item["offer_id"])
     return None
 
 
@@ -441,7 +403,7 @@ def get_offer_ids_by_skus(skus: List[int]) -> Dict[int, str]:
 
 def get_products_in_action(action_id: int, action_name: str, offer_ids_set: set[str], product_id_to_offer_id: Dict[int, str]) -> Dict[str, float]:
     """
-    Получает товары в акции через API /v1/actions/products с использованием last_id вместо offset.
+    Получает товары в акции через API /v2/actions/products с использованием last_id вместо offset.
     Возвращает словарь {offer_id: цена_в_акции}.
     
     Args:
@@ -456,94 +418,25 @@ def get_products_in_action(action_id: int, action_name: str, offer_ids_set: set[
     if not OZON_CLIENT_ID or not OZON_API_KEY:
         return {}
     
-    url = "https://api-seller.ozon.ru/v1/actions/products"
     result = {}
-    last_id = None
-    limit = 100
-    
-    while True:
-        payload = {
-            "action_id": action_id,
-            "limit": limit
-        }
-        
-        if last_id:
-            payload["last_id"] = last_id
-        
-        try:
-            response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Структура ответа: {"result": {"products": [...], "total": ..., "last_id": ...}}
-            if isinstance(data, dict) and "result" in data:
-                result_data = data["result"]
-                products = result_data.get("products", [])
-                
-                if not products:
-                    break
-                
-                # Обрабатываем товары
-                found_count = 0
-                total_products = len(products)
-                no_offer_id_count = 0
-                not_in_list_count = 0
-                
-                for idx, product in enumerate(products):
-                    # В ответе есть только id (product_id), нужно получить offer_id
-                    product_id = product.get("id")
-                    if not product_id:
-                        continue
-                    
-                    # Пробуем найти offer_id в кэше маппинга
-                    offer_id = product_id_to_offer_id.get(product_id)
-                    
-                    # Если нет в кэше, получаем через API
-                    # Для первых 3 товаров включаем отладку
-                    if not offer_id:
-                        offer_id = get_product_info_by_id(product_id, debug=VERBOSE)
-                        if offer_id:
-                            product_id_to_offer_id[product_id] = offer_id
-                        else:
-                            no_offer_id_count += 1
-                            continue
-                    
-                    if offer_id:
-                        offer_id_normalized = _normalize_offer_id(offer_id)
-                        # Проверяем, есть ли этот артикул в нашем списке
-                        if offer_id_normalized in offer_ids_set or offer_id in offer_ids_set:
-                            # Получаем цену в акции (action_price)
-                            action_price = product.get("action_price")
-                            if action_price is not None:
-                                try:
-                                    action_price_val = float(action_price)
-                                    # Сохраняем цену в акции для этого артикула
-                                    result[offer_id_normalized] = action_price_val
-                                    found_count += 1
-                                except (TypeError, ValueError):
-                                    pass
-                        else:
-                            not_in_list_count += 1
-                
-                if total_products > 0:
-                    log_verbose(f"Акция {action_id}: обработано {total_products}, совпадений {found_count}")
-                    if no_offer_id_count > 0 or not_in_list_count > 0:
-                        log_verbose(f"  без offer_id: {no_offer_id_count}, не в списке: {not_in_list_count}")
-                
-                # Получаем last_id для следующей страницы
-                last_id = result_data.get("last_id")
-                if not last_id:
-                    break
-            else:
-                break
-                
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ Ошибка при получении товаров акции {action_id}: {e}")
-            break
-        except Exception as e:
-            print(f"⚠️ Неожиданная ошибка при получении товаров акции {action_id}: {e}")
-            break
-    
+    for product in fetch_action_products(action_id, "products"):
+        # В ответе есть только id (product_id), нужно получить offer_id
+        product_id = product.get("id")
+        if not product_id:
+            continue
+        offer_id = product_id_to_offer_id.get(product_id)
+        if not offer_id:
+            offer_id = get_product_info_by_id(product_id, debug=VERBOSE)
+            if not offer_id:
+                continue
+            product_id_to_offer_id[product_id] = offer_id
+        offer_id_normalized = _normalize_offer_id(offer_id)
+        if offer_id_normalized not in offer_ids_set and offer_id not in offer_ids_set:
+            continue
+        # Цена в акции (action_price) уже приведена к числу в normalize_action_product.
+        if product.get("action_price") is not None:
+            result[offer_id_normalized] = float(product["action_price"])
+    log_verbose(f"Акция {action_id}: совпадений с вашими артикулами {len(result)}")
     return result
 
 
@@ -628,28 +521,48 @@ def boost_at_price(action_info: Dict[str, Any], product: Dict[str, Any], price: 
     return action_info.get("fixed_boost")
 
 
+def normalize_action_product(product: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Товар из /v2/actions/products и /v2/actions/candidates: деньги приходят объектами
+    {"amount": "960", "currency": "RUB"}. Приводим их к числам, как было в v1, и запоминаем валюту.
+    """
+    for key, value in list(product.items()):
+        if isinstance(value, dict) and "amount" in value:
+            try:
+                product[key] = float(value.get("amount") or 0)
+            except (TypeError, ValueError):
+                product[key] = None
+            if value.get("currency") and not product.get("currency"):
+                product["currency"] = value["currency"]
+    return product
+
+
+def fetch_action_page(action_id: Any, endpoint: str, last_id: Optional[str], timeout: float = 30) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Одна страница /v2/actions/{products|candidates}: (товары с числовыми ценами, last_id следующей страницы)."""
+    payload: Dict[str, Any] = {"action_id": action_id, "limit": 100}
+    if last_id:
+        payload["last_id"] = last_id
+    response = requests.post(f"https://api-seller.ozon.ru/v2/actions/{endpoint}", headers=OZON_HEADERS, json=payload, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    page = data["result"] if isinstance(data.get("result"), dict) else data
+    return [normalize_action_product(p) for p in page.get("products") or []], page.get("last_id")
+
+
 def fetch_action_products(action_id: int, endpoint: str = "products") -> List[Dict[str, Any]]:
     """
-    Все товары акции (/v1/actions/products) или кандидаты (/v1/actions/candidates)
+    Все товары акции (/v2/actions/products) или кандидаты (/v2/actions/candidates)
     с полной информацией: цены, остатки, бустинг.
     """
-    url = f"https://api-seller.ozon.ru/v1/actions/{endpoint}"
     products: List[Dict[str, Any]] = []
     last_id = None
     while True:
-        payload: Dict[str, Any] = {"action_id": action_id, "limit": 100}
-        if last_id:
-            payload["last_id"] = last_id
         try:
-            response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
-            response.raise_for_status()
-            result = response.json().get("result") or {}
+            batch, last_id = fetch_action_page(action_id, endpoint, last_id)
         except Exception as e:
             print(f"⚠️ Ошибка при получении товаров акции {action_id}: {e}")
             break
-        batch = result.get("products") or []
         products.extend(batch)
-        last_id = result.get("last_id")
         if not batch or not last_id or last_id == "0":
             break
     return products
@@ -684,8 +597,9 @@ def get_search_visibility(skus: List[int], days: int = 14) -> Dict[int, Dict[str
     result: Dict[int, Dict[str, Any]] = {}
     if not skus:
         return result
-    # Без Premium Ozon отдаёт аналитику только по вчерашний день включительно.
-    period_end = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None) - timedelta(days=1)
+    # Без Premium Ozon принимает конец периода не позже полуночи вчерашнего дня (UTC):
+    # «вчера в текущее время» он отклоняет с 403 «available starting from the premium subscription».
+    period_end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None) - timedelta(days=1)
     date_from = (period_end - timedelta(days=days)).isoformat() + "Z"
     date_to = period_end.isoformat() + "Z"
     url = "https://api-seller.ozon.ru/v1/analytics/product-queries"
@@ -798,7 +712,9 @@ def get_actions_for_products(
 
 def deactivate_products_in_action(action_id: int, product_ids: List[int]) -> Dict[str, Any]:
     """
-    Удаляет товары из акции через API /v1/actions/products/deactivate.
+    Удаляет товары из акции через API /v2/actions/products/deactivate.
+    По документации Ozon метод работает только для акций «Промокоды»; для «Эластичного» и
+    «Максимального бустинга» при единой цене Ozon отвечает code 9 (метод заблокирован).
     Возвращает агрегированный результат по всем батчам.
     """
     if not OZON_CLIENT_ID or not OZON_API_KEY:
@@ -808,7 +724,7 @@ def deactivate_products_in_action(action_id: int, product_ids: List[int]) -> Dic
     if not product_ids:
         return {"product_ids": [], "rejected": [], "errors": []}
 
-    url = "https://api-seller.ozon.ru/v1/actions/products/deactivate"
+    url = "https://api-seller.ozon.ru/v2/actions/products/deactivate"
     batch_size = 100
     removed_ids: List[int] = []
     rejected: List[Dict[str, Any]] = []
@@ -816,26 +732,21 @@ def deactivate_products_in_action(action_id: int, product_ids: List[int]) -> Dic
 
     for i in range(0, len(product_ids), batch_size):
         batch = product_ids[i:i + batch_size]
-        payload = {
-            "action_id": action_id,
-            "product_ids": batch,
-        }
+        payload = {"action_id": action_id, "product_ids": [str(pid) for pid in batch]}
         try:
             response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
+            if response.status_code == 400 and _ozon_error_code(response) == 9:
+                errors.append(f"{len(batch)} товаров не удалено. Ozon перевёл акции на «единую цену»: отдельной команды удаления для «Эластичного» и «Максимального бустинга» больше нет — товар выходит из акции, когда его цена в акции не ниже лимита акции.")
+                continue
             response.raise_for_status()
             data = response.json()
-            result = data.get("result", {})
-            removed_ids.extend(result.get("product_ids", []) or [])
-            rejected.extend(result.get("rejected", []) or [])
+            result = data["result"] if isinstance(data.get("result"), dict) else data
+            removed_ids.extend(int(pid) for pid in result.get("product_ids") or [])
+            rejected.extend(result.get("rejected") or [])
         except requests.exceptions.RequestException as e:
             print(f"⚠️ Ошибка при удалении товаров из акции {action_id}: {e}")
             errors.append(f"{len(batch)} товаров не отправлено: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    print(f"   Детали ошибки: {error_data}")
-                except Exception:
-                    print(f"   Ответ сервера: {e.response.text[:200]}")
+            _print_error_details(e)
         except Exception as e:
             print(f"⚠️ Неожиданная ошибка при удалении из акции {action_id}: {e}")
             errors.append(f"{len(batch)} товаров не отправлено: {e}")
@@ -843,77 +754,50 @@ def deactivate_products_in_action(action_id: int, product_ids: List[int]) -> Dic
     return {"product_ids": removed_ids, "rejected": rejected, "errors": errors}
 
 
+def _ozon_error_code(response) -> Optional[int]:
+    try:
+        return int(response.json().get("code"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _print_error_details(error: Exception) -> None:
+    response = getattr(error, "response", None)
+    if response is None:
+        return
+    try:
+        print(f"   Детали ошибки: {response.json()}")
+    except Exception:
+        print(f"   Ответ сервера: {response.text[:200]}")
+
+
 def get_action_candidates(action_id: int, product_id_to_offer_id: Dict[int, str], offer_ids_set: set[str]) -> Dict[int, Dict[str, Any]]:
     """
-    Получает список товаров, которые могут участвовать в акции через API /v1/actions/candidates.
-    Использует last_id вместо offset.
+    Получает список товаров, которые могут участвовать в акции, через API /v2/actions/candidates.
     Возвращает словарь {product_id: информация_о_товаре} для товаров из нашего списка.
     """
     if not OZON_CLIENT_ID or not OZON_API_KEY:
         return {}
-    
-    url = "https://api-seller.ozon.ru/v1/actions/candidates"
     result = {}
-    last_id = None
-    limit = 100
-    
-    while True:
-        payload = {
-            "action_id": action_id,
-            "limit": limit
-        }
-        
-        if last_id:
-            payload["last_id"] = last_id
-        
-        try:
-            response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Структура ответа: {"result": {"products": [...], "total": ..., "last_id": ...}}
-            if isinstance(data, dict) and "result" in data:
-                result_data = data["result"]
-                products = result_data.get("products", [])
-                
-                if not products:
-                    break
-                
-                # Обрабатываем товары
-                for product in products:
-                    product_id = product.get("id")
-                    if not product_id:
-                        continue
-                    
-                    # Проверяем, есть ли этот товар в нашем списке
-                    offer_id = product_id_to_offer_id.get(product_id)
-                    if offer_id:
-                        offer_id_normalized = _normalize_offer_id(offer_id)
-                        if offer_id_normalized in offer_ids_set or offer_id in offer_ids_set:
-                            # Сохраняем информацию о товаре
-                            result[product_id] = product
-                
-                # Получаем last_id для следующей страницы
-                last_id = result_data.get("last_id")
-                if not last_id:
-                    break
-            else:
-                break
-                
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ Ошибка при получении кандидатов акции {action_id}: {e}")
-            break
-        except Exception as e:
-            print(f"⚠️ Неожиданная ошибка при получении кандидатов акции {action_id}: {e}")
-            break
-    
+    for product in fetch_action_products(action_id, "candidates"):
+        product_id = product.get("id")
+        offer_id = product_id_to_offer_id.get(product_id) if product_id else None
+        if offer_id and (_normalize_offer_id(offer_id) in offer_ids_set or offer_id in offer_ids_set):
+            result[product_id] = product
     return result
+
+
+def _action_money(value: Any, currency: str = "RUB") -> Dict[str, str]:
+    return {"amount": f"{float(value):.2f}", "currency": currency or "RUB"}
 
 
 def activate_products_in_action(action_id: int, products: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Добавляет товары в акцию через API /v1/actions/products/activate.
-    products - список словарей вида [{"product_id": int, "action_price": float, "stock": int}, ...]
+    Добавляет товары в акцию или меняет их цену в акции через API /v1/actions/products/update
+    (замена заблокированного /v1/actions/products/activate при единой цене Ozon).
+    products - список словарей вида [{"product_id": int, "action_price": float, "stock": int}, ...];
+    stock передаётся только если он больше нуля: для «Эластичного» и «Максимального бустинга»
+    Ozon просит его не указывать.
     """
     if not OZON_CLIENT_ID or not OZON_API_KEY:
         print("⚠️ OZON_CLIENT_ID или OZON_API_KEY не настроены. Пропускаем добавление в акции.")
@@ -922,40 +806,59 @@ def activate_products_in_action(action_id: int, products: List[Dict[str, Any]]) 
     if not products:
         return {"product_ids": [], "rejected": [], "errors": []}
 
-    url = "https://api-seller.ozon.ru/v1/actions/products/activate"
+    url = "https://api-seller.ozon.ru/v1/actions/products/update"
     batch_size = 1000  # Максимум 1000 товаров за запрос
     added_ids: List[int] = []
+    deactivated_ids: List[int] = []
     rejected: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
     errors: List[str] = []
 
     for i in range(0, len(products), batch_size):
-        batch = products[i:i + batch_size]
-        payload = {
-            "action_id": action_id,
-            "products": batch
-        }
-        
+        batch = []
+        for item in products[i:i + batch_size]:
+            entry: Dict[str, Any] = {
+                "product_id": item["product_id"],
+                "action_price": _action_money(item["action_price"], item.get("currency") or "RUB"),
+            }
+            if int(item.get("stock") or 0) > 0:
+                entry["stock"] = int(item["stock"])
+            batch.append(entry)
+        payload = {"action_id": action_id, "products": batch}
+
         try:
             response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
             response.raise_for_status()
             data = response.json()
-            result = data.get("result", {})
-            added_ids.extend(result.get("product_ids", []) or [])
-            rejected.extend(result.get("rejected", []) or [])
+            result = data["result"] if isinstance(data.get("result"), dict) else data
+            added_ids.extend(int(pid) for pid in result.get("active_product_ids") or result.get("product_ids") or [])
+            deactivated_ids.extend(int(pid) for pid in result.get("deactivated_product_ids") or [])
+            rejected.extend(result.get("rejected") or [])
+            warnings.extend(result.get("warnings") or [])
         except requests.exceptions.RequestException as e:
             print(f"⚠️ Ошибка при добавлении товаров в акцию {action_id}: {e}")
             errors.append(f"{len(batch)} товаров не отправлено: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    print(f"   Детали ошибки: {error_data}")
-                except Exception:
-                    print(f"   Ответ сервера: {e.response.text[:200]}")
+            _print_error_details(e)
         except Exception as e:
             print(f"⚠️ Неожиданная ошибка при добавлении в акцию {action_id}: {e}")
             errors.append(f"{len(batch)} товаров не отправлено: {e}")
 
-    return {"product_ids": added_ids, "rejected": rejected, "errors": errors}
+    for warning in warnings:
+        print(f"⚠️ Акция {action_id}, товар {warning.get('product_id')}: {warning.get('reason') or 'Ozon убрал товар из акции'}")
+    return {"product_ids": added_ids, "deactivated_product_ids": deactivated_ids, "rejected": rejected, "warnings": warnings, "errors": errors}
+
+
+def action_exit_price(max_action_price: Optional[float], min_price: Optional[float]) -> Optional[int]:
+    """
+    Цена продавца, с которой товар выходит из «Эластичного» или «Максимального бустинга» при единой цене Ozon:
+    отдельного удаления нет, товар покидает акцию, когда его цена выше лимита акции (max_action_price —
+    с ценой, равной лимиту, товар в акции остаётся). Берём наименьшую цену, которая и выводит из акции,
+    и не ниже минимальной: max(минимальная, лимит + 1 ₽). Желательную не берём — при единой цене это
+    станет ценой товара, а она обычно намного выше. None, если лимит неизвестен.
+    """
+    if not max_action_price or max_action_price <= 0:
+        return None
+    return max(math.floor(max_action_price) + 1, math.ceil(min_price or 0))
 
 
 def pick_action_price(min_price: float, desired_price: float, max_action_price: float) -> Optional[int]:
@@ -1669,35 +1572,6 @@ def run(
                         ws_actions.conditional_formatting.add(data_range, red_rule)
                         ws_actions.conditional_formatting.add(data_range, green_rule)
             
-                # Удаляем товары из акций, где цена ниже минимальной
-                action_name_to_id = {a["name"]: a["id"] for a in actions_info_list}
-                if offer_id_to_product_id and action_name_to_id:
-                    candidates = collect_deactivation_candidates_from_sheet(
-                        ws_actions,
-                        key_col,
-                        COL_MIN_PRICE,
-                        action_name_to_id,
-                        offer_id_to_product_id,
-                    )
-                    if candidates:
-                        print("\n🧹 Удаление товаров из акций с ценой ниже минимальной...")
-                        for action_id, product_ids in candidates.items():
-                            print(f"   Акция {action_id}: удаляем {len(product_ids)} товаров")
-                            result = deactivate_products_in_action(action_id, product_ids)
-                            removed = result.get("product_ids", []) or []
-                            rejected = result.get("rejected", []) or []
-                            if removed:
-                                print(f"      ✅ Удалено: {len(removed)}")
-                            if rejected:
-                                print(f"      ⚠️ Не удалено: {len(rejected)}")
-                    else:
-                        print("✅ Товары с ценой ниже минимальной не найдены.")
-                else:
-                    print("⚠️ Недостаточно данных для удаления из акций.")
-            
-                # Добавляем товары в акции, если можно установить цену в диапазоне [min_price, desired_price]
-                print("\n➕ Проверка кандидатов для добавления в акции...")
-            
                 # Создаём маппинг product_id -> (min_price, desired_price, offer_id)
                 product_id_to_prices: Dict[int, tuple[float, float, str]] = {}
                 for _, row in df.iterrows():
@@ -1719,6 +1593,31 @@ def run(
                                     product_id_to_prices[product_id] = (min_price_val, des_price_val, art_normalized)
                             except (TypeError, ValueError):
                                 pass
+            
+                # Товары в акциях с ценой ниже минимальной — только сообщаем (см. ниже)
+                action_name_to_id = {a["name"]: a["id"] for a in actions_info_list}
+                if offer_id_to_product_id and action_name_to_id:
+                    candidates = collect_deactivation_candidates_from_sheet(
+                        ws_actions,
+                        key_col,
+                        COL_MIN_PRICE,
+                        action_name_to_id,
+                        offer_id_to_product_id,
+                    )
+                    if candidates:
+                        # При единой цене Ozon вывести товар из акции = поднять его цену. Без подтверждения цены не меняем:
+                        # только сообщаем; выводит кнопка «Удалить невыгодные» на вкладке «Акции», где видна каждая новая цена.
+                        total = sum(len(product_ids) for product_ids in candidates.values())
+                        print(f"\n⚠️ В акциях с ценой ниже минимальной: {total} позиций в {len(candidates)} акциях. "
+                              "Чтобы вывести их (Ozon при единой цене выводит товар, только подняв цену выше лимита акции), "
+                              "нажмите «Удалить невыгодные» на вкладке «Акции» и подтвердите цены.")
+                    else:
+                        print("✅ Товары с ценой ниже минимальной не найдены.")
+                else:
+                    print("⚠️ Недостаточно данных для удаления из акций.")
+            
+                # Добавляем товары в акции, если можно установить цену в диапазоне [min_price, desired_price]
+                print("\n➕ Проверка кандидатов для добавления в акции...")
             
                 # Для каждой акции проверяем кандидатов
                 for action_info in actions_info_list:
@@ -1976,7 +1875,7 @@ def get_sku_to_offer_id_mapping(skus: List[int]) -> Dict[int, str]:
     """
     Создаёт маппинг SKU (идентификатор товара в системе Ozon) -> offer_id.
     Сначала использует /v3/product/info/list с параметром sku (как в заявках на скидку),
-    затем при необходимости — /v2/product/info по product_id и v5/product/info/prices.
+    затем при необходимости — /v3/product/info/list по product_id (get_product_info_by_id) и v5/product/info/prices.
     
     Args:
         skus: Список SKU из API (например, из discounts-task/list).
@@ -1997,9 +1896,9 @@ def get_sku_to_offer_id_mapping(skus: List[int]) -> Dict[int, str]:
     if len(mapping) == len(skus):
         return mapping
     
-    # 2) Для недостающих пробуем v2/product/info (sku как product_id)
+    # 2) Для недостающих пробуем get_product_info_by_id (sku как product_id)
     missing = [s for s in skus if s not in mapping]
-    log_verbose(f"Обработка {len(missing)} SKU через v2/product/info...")
+    log_verbose(f"Обработка {len(missing)} SKU через get_product_info_by_id...")
     for sku in missing:
         offer_id = get_product_info_by_id(sku, debug=VERBOSE)
         if offer_id:

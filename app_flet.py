@@ -5140,6 +5140,11 @@ def main(page: ft.Page) -> None:
             ]
         if kind == "remove":
             price_line = f"Цена в акции {_format_currency(item['action_price'])} ниже минимальной {_format_currency(item['min_price'])}"
+            if item.get("exit_price"):
+                price_line += (f" · для выхода из акции цена станет {_format_currency(item['exit_price'])}"
+                               f" (лимит акции {_format_currency(item.get('max_action_price'))})")
+            else:
+                price_line += " · Ozon не сообщил лимит акции — вывести нельзя"
         elif kind == "raise":
             price_line = (
                 f"Цена {_format_currency(item['current_price'])} → {_format_currency(item['action_price'])}"
@@ -5226,7 +5231,9 @@ def main(page: ft.Page) -> None:
         items = plan.get("items") or []
         parts = [str(plan.get("message") or "")]
         if mode == "remove":
-            parts.append("Отмеченные товары будут удалены из акций в Ozon.")
+            parts.append("При единой цене Ozon товар выходит из акции, только когда его цена выше лимита акции: "
+                         "отмеченным товарам будет установлена указанная цена продавца (ваша минимальная, но не ниже лимита + 1 ₽). "
+                         "Цену для покупателя Ozon посчитает сам со своими скидками.")
         elif mode == "tidy":
             parts.append("Отмеченные товары будут добавлены по вашей цене, получат приемлемую цену или будут удалены.")
             if any(item["kind"] == "watch" for item in items):
@@ -6364,6 +6371,10 @@ def main(page: ft.Page) -> None:
             return
         if analysis_state["busy"]:
             return
+        # Анализ грузит заказы за 24 месяца — в общей очереди, чтобы не делить лимит Ozon с другой задачей.
+        if not job_lock.acquire(blocking=False):
+            toast("Дождитесь завершения текущей операции.", True)
+            return
         analysis_state.update(busy=True, error=None, progress="Готовлю анализ…", started=True)
         set_status("Анализ", "Собираю данные по продажам, рекламе, ценам и карточкам…", ACCENT, busy=True, cancellable=False)
         render_analysis_view()
@@ -6384,15 +6395,22 @@ def main(page: ft.Page) -> None:
                 set_status("Анализ", f"Не удалось выполнить анализ: {exc}", DANGER, busy=False)
             finally:
                 analysis_state["busy"] = False
+                job_lock.release()
             ui_queue.put(("call", render_analysis_view))
 
-        page.run_thread(worker)
+        try:
+            page.run_thread(worker)
+        except Exception as exc:
+            analysis_state.update(busy=False, error=f"Не удалось запустить анализ: {exc}")
+            job_lock.release()
+            render_analysis_view()
 
     def analysis_set_days(days: int) -> None:
+        # Только выбор периода: запрос в Ozon уходит по кнопке «Начать анализ».
         if analysis_state["busy"] or analysis_state["days"] == days:
             return
         analysis_state["days"] = days
-        analysis_run()
+        render_analysis_view()
 
     def analysis_delta(current: float, previous: float) -> str:
         if not previous:
@@ -6536,7 +6554,7 @@ def main(page: ft.Page) -> None:
             ))
         controls.append(ads_box(ft.Row([
             ads_text("Период:", 12, pal["muted"], ft.FontWeight.W_700), *chips,
-            ft.Button("Обновить анализ", bgcolor=PRIMARY, color="white", on_click=analysis_run, disabled=bool(analysis_state["busy"])),
+            ft.Button("Начать анализ", bgcolor=PRIMARY, color="white", on_click=analysis_run, disabled=bool(analysis_state["busy"])),
             ads_text("Сравниваем с таким же предыдущим периодом. 28 дней = 4 полные недели — так сравнивают аналитики маркетплейсов.", 11, pal["muted"]),
         ], wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER), padding=12))
 
@@ -6549,12 +6567,17 @@ def main(page: ft.Page) -> None:
         result = analysis_state["result"]
         if not isinstance(result, dict):
             if not analysis_state["busy"]:
-                controls.append(ads_box(ads_text("Нажмите «Обновить анализ» — займёт 1–3 минуты.", 13, pal["muted"])))
+                controls.append(ads_box(ads_text("Нажмите «Начать анализ» — займёт 1–3 минуты.", 13, pal["muted"])))
             analysis_view.controls = controls
             apply_control_theme(analysis_view, current_dark["value"])
             if push_update and page.controls and host.controls and host.controls[0] is analysis_view:
                 page.update(analysis_view)
             return
+
+        if not analysis_state["busy"] and result.get("days") not in (None, analysis_state["days"]):
+            controls.append(ads_box(ads_text(
+                f"Показан анализ за {result.get('days')} дней. Нажмите «Начать анализ», чтобы посчитать за {analysis_state['days']} дней.",
+                13, pal["muted"])))
 
         periods = result["periods"]
         fmt = lambda value: datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m")
@@ -7035,7 +7058,7 @@ def main(page: ft.Page) -> None:
                 return ft.Row([ft.Container(width=8, height=8, border_radius=4, bgcolor=color, data="preserve_excel_fill"),
                                dtext(yes if on else (no if on is not None else "—"), 12, None if on else pal["muted"])], spacing=6, tight=True)
 
-            columns = [("", 1), ("Артикул", 2), ("Цена", 2), ("Мин. цена в Ozon", 2), ("Автодобавление", 3), ("Автоприменение", 3),
+            columns = [("", 1), ("Артикул", 2), ("Цена", 2), ("Мин. цена в Ozon", 2), ("Автодобавление", 3),
                        ("Учёт мин. цены", 5), ("Заметка", 5)]
 
             def cell(content: ft.Control, weight: int) -> ft.Control:
@@ -7073,7 +7096,6 @@ def main(page: ft.Page) -> None:
                         cell(dtext(_format_currency(row["price"]) if row["price"] else "—", 13), 2),
                         cell(dtext(_format_currency(row["min_price"]) if row["min_price"] else "—", 13, None if row["min_price"] else pal["muted"]), 2),
                         cell(badge(row["auto_add"]), 3),
-                        cell(badge(row["auto_action"]), 3),
                         cell(timer, 5),
                         cell(ft.Column([dtext(text, 12, color) for text, color in notes], spacing=0, tight=True) if notes else dtext("", 12), 5),
                     ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
@@ -7680,8 +7702,15 @@ def main(page: ft.Page) -> None:
                     ),
                     card(
                         "Проверка обновлений",
-                        "Запускает встроенный модуль автообновления.",
-                        [ft.Button("Проверить обновления", bgcolor=ACCENT, color="white", on_click=lambda _e: job("Проверка обновлений", [str(PYTHON), str(SCRIPTS / "_auto_update.py")]))],
+                        "«Проверить» показывает новую версию и что в ней изменилось. «Установить» делает резервную копию, "
+                        "ставит новую версию из GitHub и сохраняет ваши данные; после установки перезапустите приложение.",
+                        [
+                            ft.Button("Проверить обновления", bgcolor=ACCENT, color="white",
+                                      on_click=lambda _e: job("Проверка обновлений", [str(PYTHON), str(SCRIPTS / "_auto_update.py")])),
+                            ft.TextButton("Установить обновление",
+                                          on_click=lambda _e: job("Установка обновления",
+                                                                  [str(PYTHON), str(SCRIPTS / "_auto_update.py"), "--yes", "--no-restart"])),
+                        ],
                         width=320,
                     ),
                 ],
@@ -7790,9 +7819,6 @@ def main(page: ft.Page) -> None:
             calendar_load()
         if is_ozon and views[selected_index] is actions and not auto_state["started"]:
             auto_load()
-        if is_ozon and views[selected_index] is analysis_view and not analysis_state["started"]:
-            # Первый заход в сессии: показываем прошлый результат и сразу считаем свежий.
-            analysis_run()
 
     def open_section(view) -> None:
         index = views.index(view)

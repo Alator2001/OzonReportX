@@ -2,8 +2,7 @@
 Автодобавление в акции Ozon и учёт минимальной цены — чтение состояния по товарам и изменения с проверкой.
 
 Ozon (Seller API):
-- /v5/product/info/prices — price.auto_add_to_ozon_actions_list_enabled (автодобавление в акции),
-  price.auto_action_enabled (автоприменение акций), price.min_price;
+- /v5/product/info/prices — price.auto_add_to_ozon_actions_list_enabled (автодобавление в акции), price.min_price;
 - /v1/product/action/timer/status — min_price_for_auto_actions_enabled (учитывает ли Ozon минимальную цену
   при добавлении в акции) и expired_at — когда учёт сбросится;
 - /v1/product/action/timer/update — продлить учёт минимальной цены (цены не меняются);
@@ -136,7 +135,7 @@ def load_timers(product_ids: List[int]) -> Dict[int, Dict[str, Any]]:
 
 def build_rows(prices: List[Dict[str, Any]], timers: Dict[int, Dict[str, Any]], log: List[Dict[str, Any]],
                now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    """Строки для таблицы: по товару — автодобавление, автоприменение, минимальная цена, таймер, предупреждения."""
+    """Строки для таблицы: по товару — автодобавление, минимальная цена, таймер, предупреждения."""
     now = now or datetime.now(timezone.utc)
     changes = last_auto_add_change(log)
     rows = []
@@ -157,7 +156,6 @@ def build_rows(prices: List[Dict[str, Any]], timers: Dict[int, Dict[str, Any]], 
             "old_price": _number(price.get("old_price")),
             "min_price": _number(price.get("min_price")),
             "auto_add": auto_add,
-            "auto_action": _flag(price.get("auto_action_enabled")),
             "min_price_on": min_price_on,
             "expires_at": expires_at.isoformat() if expires_at else None,
             "hours_left": round((expires_at - now).total_seconds() / 3600, 1) if expires_at and min_price_on else None,

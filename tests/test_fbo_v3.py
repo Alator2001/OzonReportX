@@ -62,6 +62,33 @@ class FboV3Tests(unittest.TestCase):
 
     def test_malformed_response_is_not_an_empty_report(self):
         for page in ({"result": []}, {}, {"postings": [], "has_next": "false"}):
-            with self.subTest(page=page):
-                with self.assertRaisesRegex(RuntimeError, "Некорректный ответ"):
-                    monthly.get_fbo_orders("start", "end", session=self.session(page))
+            for function in (monthly.get_fbo_orders, monthly.get_orders):
+                with self.subTest(page=page, function=function.__name__):
+                    with self.assertRaisesRegex(RuntimeError, "Некорректный ответ"):
+                        function("start", "end", session=self.session(page))
+
+    def test_fbs_uses_v4_cursor_with_all_statuses_in_one_pass(self):
+        posting = {
+            "posting_number": "1", "status": "delivered", "shipment_date": "2026-09-20T10:00:00Z",
+            "products": [{"offer_id": "7012", "quantity": 1, "price": {"amount": "960", "currency": "RUB"}}],
+            "financial_data": {"products": [{"commission": {"amount": -460.8, "percent": 48, "currency": "RUB"}}]},
+        }
+        session = self.session(
+            {"postings": [posting], "has_next": True, "cursor": "opaque-next"},
+            {"postings": [{"posting_number": "2"}], "has_next": False, "cursor": ""},
+        )
+        result = monthly.get_orders("start", "end", session=session)
+        self.assertEqual([p["posting_number"] for p in result], ["1", "2"])
+        self.assertEqual(result[0]["products"][0]["price"], "960")
+        self.assertEqual(result[0]["financial_data"]["products"][0]["commission_amount"], -460.8)
+        self.assertTrue(all(p["__schema"] == "FBS" for p in result))
+        calls = session.post.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args[0], "https://api-seller.ozon.ru/v4/posting/fbs/list")
+        self.assertEqual(calls[0].kwargs["json"], {
+            "cursor": "", "limit": 100,
+            "filter": {"since": "start", "to": "end", "statuses": [
+                "awaiting_packaging", "awaiting_deliver", "delivering", "delivered", "cancelled"]},
+            "with": {"analytics_data": True, "financial_data": True},
+        })
+        self.assertEqual(calls[1].kwargs["json"]["cursor"], "opaque-next")

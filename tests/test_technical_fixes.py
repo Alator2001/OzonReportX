@@ -64,23 +64,21 @@ class OfflineTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
 
     def test_page_failure_does_not_return_partial_orders(self):
-        for function, fetch_name in [(monthly.get_orders, "_fetch_fbs_page")]:
+        for function, fetch_name in [(monthly.get_orders, "_fetch_fbs_page"), (monthly.get_fbo_orders, "_fetch_fbo_page")]:
             with self.subTest(function=function.__name__):
-                def fetch(_session, _start, _end, status, limit, offset):
-                    if offset == 100:
+                def fetch(_session, _start, _end, limit, cursor):
+                    if cursor == "second":
                         raise requests.ConnectionError("offline")
-                    return [{"posting_number": str(offset)}] if offset <= 200 else []
+                    return {"postings": [{"posting_number": "0"}], "has_next": True, "cursor": "second"}
                 with patch.object(monthly, fetch_name, side_effect=fetch):
                     with self.assertRaises(RuntimeError):
                         function("start", "end", session=Mock())
 
     def test_successful_pages_preserve_order(self):
-        def fetch(_session, _start, _end, status, limit, offset):
-            if status == "delivered" and offset < 200:
-                return [{"posting_number": str(offset)}]
-            return []
-        for function, fetch_name in [(monthly.get_orders, "_fetch_fbs_page")]:
-            with patch.object(monthly, fetch_name, side_effect=fetch):
+        pages = {"": {"postings": [{"posting_number": "0"}], "has_next": True, "cursor": "next"},
+                 "next": {"postings": [{"posting_number": "100"}], "has_next": False, "cursor": ""}}
+        for function, fetch_name in [(monthly.get_orders, "_fetch_fbs_page"), (monthly.get_fbo_orders, "_fetch_fbo_page")]:
+            with patch.object(monthly, fetch_name, side_effect=lambda _s, _a, _b, _l, cursor: pages[cursor]):
                 self.assertEqual(function("start", "end", session=Mock()), [
                     {"posting_number": "0"}, {"posting_number": "100"},
                 ])
@@ -100,10 +98,9 @@ class OfflineTests(unittest.TestCase):
 
     def test_posting_requests_have_timeouts(self):
         session = Mock()
-        session.post.return_value.json.return_value = {"result": {"postings": []}}
-        monthly._fetch_fbs_page(session, "start", "end", "delivered", 100, 0)
-        self.assertEqual(session.post.call_args.kwargs["timeout"], (10, 60))
         session.post.return_value.json.return_value = {"postings": [], "has_next": False, "cursor": ""}
+        monthly._fetch_fbs_page(session, "start", "end", 100, "")
+        self.assertEqual(session.post.call_args.kwargs["timeout"], (10, 60))
         monthly._fetch_fbo_page(session, "start", "end", 100, "")
         self.assertEqual(session.post.call_args.kwargs["timeout"], (10, 60))
 

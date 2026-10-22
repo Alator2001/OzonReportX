@@ -19,20 +19,20 @@ except ModuleNotFoundError:
     from file_io import excel_writer, atomic_output_path
 
 load_dotenv()
-CLIENT_ID = os.getenv("OZON_CLIENT_ID")
-API_KEY = os.getenv("OZON_API_KEY")
-
-if not CLIENT_ID or not API_KEY:
-    print("❌ Укажите OZON_CLIENT_ID и OZON_API_KEY в файле .env")
-    sys.exit(1)
-
-HEADERS = {
-    "Client-Id": CLIENT_ID,
-    "Api-Key": API_KEY,
-    "Content-Type": "application/json",
-}
 
 BALANCE_REPORTS_DIR = "balance reports"
+
+
+def _headers() -> dict:
+    """
+    Ключи читаются при каждом запросе, а не при импорте: модуль импортирует приложение,
+    которое должно запускаться и без ключей Ozon, и подхватывать ключи, сохранённые в «Настройках».
+    """
+    client_id = os.getenv("OZON_CLIENT_ID")
+    api_key = os.getenv("OZON_API_KEY")
+    if not client_id or not api_key:
+        raise RuntimeError("Не заданы OZON_CLIENT_ID и OZON_API_KEY — укажите их в «Настройках» или в файле .env.")
+    return {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
 MAX_DAYS = 30
 
 
@@ -165,7 +165,7 @@ def get_balance_report(date_from: str, date_to: str) -> dict:
         "date_from": date_from,
         "date_to": date_to,
     }
-    resp = requests.post(url, headers=HEADERS, json=payload, timeout=60)
+    resp = requests.post(url, headers=_headers(), json=payload, timeout=60)
     if resp.status_code != 200:
         try:
             err = resp.json()

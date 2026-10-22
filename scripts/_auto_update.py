@@ -185,8 +185,14 @@ def update_version_file(new_version):
     VERSION_FILE.write_text(new_version, encoding='utf-8')
 
 
-def check_and_update():
-    """Основная функция проверки и обновления"""
+def check_and_update(assume_yes=False, restart=True):
+    """
+    Основная функция проверки и обновления.
+    assume_yes — установить без вопроса (кнопка «Установить обновление» в приложении).
+    Без терминала и без assume_yes только сообщаем о новой версии: вопрос через input()
+    в приложении ждал бы ответа вечно. restart=False — не перезапускать процесс после установки
+    (в приложении перезапускать нужно само приложение, а не этот скрипт).
+    """
     print("Проверка обновлений...")
     
     current = get_current_version()
@@ -215,11 +221,14 @@ def check_and_update():
     print(f"\n🎉 Доступно обновление: {latest_info['name']}")
     print(f"\nЧто нового:\n{latest_info['notes']}\n")
     
-    # Спрашиваем пользователя
-    answer = input("Установить обновление сейчас? [Y/n]: ").strip().lower()
-    if answer and answer not in ('y', 'yes', 'д', 'да'):
-        print("Обновление пропущено")
-        return False
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print("Чтобы установить, нажмите «Установить обновление» в разделе «Настройки».")
+            return False
+        answer = input("Установить обновление сейчас? [Y/n]: ").strip().lower()
+        if answer and answer not in ('y', 'yes', 'д', 'да'):
+            print("Обновление пропущено")
+            return False
     
     # Процесс обновления
     repo_root = Path(__file__).resolve().parent.parent
@@ -248,8 +257,11 @@ def check_and_update():
         
         print(f"\n✓ Обновление до версии {latest} завершено успешно!")
         print(f"Резервная копия: {backup_dir}")
+        if not restart:
+            print("\nЗакройте и снова откройте OzonReportX, чтобы начать работу в новой версии.")
+            return True
         print("\nПрограмма будет перезапущена...\n")
-        
+
         # Перезапускаем программу
         os.execv(sys.executable, [sys.executable] + sys.argv)
         
@@ -262,8 +274,13 @@ def check_and_update():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Проверка и установка обновлений OzonReportX.")
+    parser.add_argument("--yes", action="store_true", help="Установить найденное обновление без вопроса")
+    parser.add_argument("--no-restart", action="store_true", help="Не перезапускать процесс после установки")
+    args = parser.parse_args()
     try:
-        check_and_update()
+        check_and_update(assume_yes=args.yes, restart=not args.no_restart)
     except KeyboardInterrupt:
         print("\n\nОбновление отменено пользователем")
         sys.exit(0)

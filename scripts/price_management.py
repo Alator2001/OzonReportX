@@ -36,7 +36,7 @@ from recommended_prices import (
     load_cost_structure,
     generate_monthly_report,
     MONTHS_RU,
-    deactivate_products_in_action,
+    action_exit_price,
     activate_products_in_action,
     pick_action_price,
     get_actions_list,
@@ -708,27 +708,21 @@ def _fetch_action_participants(action_id: Any) -> List[Dict[str, Any]]:
     """Все товары-участники акции с повторами: Ozon иногда отвечает дольше 30 секунд."""
     import time
     import requests
-    from recommended_prices import OZON_HEADERS
+    from recommended_prices import fetch_action_page
 
     products: List[Dict[str, Any]] = []
     last_id = None
     while True:
-        payload: Dict[str, Any] = {"action_id": action_id, "limit": 100}
-        if last_id:
-            payload["last_id"] = last_id
         for attempt in range(2):
             try:
-                response = requests.post("https://api-seller.ozon.ru/v1/actions/products", headers=OZON_HEADERS, json=payload, timeout=45)
-                response.raise_for_status()
+                batch, next_last_id = fetch_action_page(action_id, "products", last_id, timeout=45)
                 break
             except requests.RequestException:
                 if attempt == 1:
                     raise
                 time.sleep(3)
-        result = response.json().get("result") or {}
-        batch = result.get("products") or []
         products.extend(batch)
-        last_id = result.get("last_id")
+        last_id = next_last_id
         # Неполная страница — последняя: лишний запрос по last_id Ozon иногда держит очень долго.
         if len(batch) < 100 or not last_id or last_id == "0":
             return products
@@ -805,6 +799,17 @@ def _attach_visibility(items: List[Dict[str, Any]]) -> bool:
     return available
 
 
+def _unify_exit_prices(items: List[Dict[str, Any]]) -> None:
+    """У товара одна цена на все акции: каждой позиции удаления — наибольшая цена выхода этого товара."""
+    best: Dict[Any, int] = {}
+    for item in items:
+        if item.get("kind") == "remove" and item.get("exit_price"):
+            best[item["product_id"]] = max(item["exit_price"], best.get(item["product_id"], 0))
+    for item in items:
+        if item.get("kind") == "remove" and item.get("exit_price"):
+            item["exit_price"] = best[item["product_id"]]
+
+
 def _plan_message(items: List[Dict[str, Any]]) -> str:
     labels = {"add": "добавить", "raise": "поднять цену", "remove": "удалить"}
     counts = {kind: sum(1 for item in items if item["kind"] == kind) for kind in labels}
@@ -827,11 +832,13 @@ def build_action_removal_plan(repo_root: Path) -> Dict[str, Any]:
     for action_info in context["actions"]:
         for product in fetch_action_products(action_info["id"], "products"):
             offer_id = pid_to_offer.get(product.get("id"))
-            min_price = limits.get(offer_id or "", (None, None))[0]
+            min_price, desired_price = limits.get(offer_id or "", (None, None))
             action_price = float(product.get("action_price") or 0)
             if min_price is None or action_price <= 0 or action_price >= min_price:
                 continue
             boost = _current_boost(action_info, product, action_price)
+            max_action_price = float(product.get("max_action_price") or 0) or None
+            exit_price = action_exit_price(max_action_price, min_price)
             items.append({
                 "kind": "remove",
                 "action_id": action_info["id"],
@@ -842,14 +849,18 @@ def build_action_removal_plan(repo_root: Path) -> Dict[str, Any]:
                 "action_price": action_price,
                 "current_price": action_price,
                 "min_price": min_price,
+                "desired_price": desired_price,
+                "max_action_price": max_action_price,
+                "exit_price": exit_price,
                 "boost_now": boost,
                 "boost_new": None,
                 **_boost_fields(action_info, product),
-                "selected": True,
+                "selected": exit_price is not None,
             })
 
     if not items:
         return _empty_plan(True, "Товаров с ценой в акции ниже минимальной не найдено.")
+    _unify_exit_prices(items)
     visibility_available = _attach_visibility(items)
     return {"ok": True, "message": _plan_message(items), "items": items, "visibility_available": visibility_available}
 
@@ -927,6 +938,8 @@ def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
     после отправки показывает новое состояние товара в акции.
     """
     items = [item for item in plan.get("items") or [] if item.get("selected", True)]
+    if mode == "remove":
+        _unify_exit_prices(items)
     by_action: Dict[Any, List[Dict[str, Any]]] = {}
     for item in items:
         by_action.setdefault(item["action_id"], []).append(item)
@@ -939,7 +952,14 @@ def execute_action_plan(plan: Dict[str, Any], mode: str) -> Dict[str, Any]:
         action_name = action_items[0]["action_name"]
         by_product = {item["product_id"]: item for item in action_items}
         if mode == "remove":
-            result = deactivate_products_in_action(action_id, list(by_product))
+            # Единая цена Ozon: товар выходит из бустинга, когда его цена выше лимита акции.
+            without_price = [item for item in action_items if not item.get("exit_price")]
+            for item in without_price:
+                errors.append(f"{action_name}: {item['offer_id']} — Ozon не сообщил лимит акции, цену выхода посчитать нельзя.")
+            result = activate_products_in_action(
+                action_id,
+                [{"product_id": item["product_id"], "action_price": item["exit_price"]} for item in action_items if item.get("exit_price")],
+            )
         else:
             result = activate_products_in_action(
                 action_id,
@@ -1064,8 +1084,9 @@ def plan_upcoming_action_items(
             item.update(kind="raise", action_price=target, boost_new=boost_at_price(action_info, product, target),
                         note=f"{who} по цене ниже минимальной — поднимаем до приемлемой.")
         else:
-            item.update(kind="remove", action_price=current, boost_new=None,
-                        note=f"{who}, а максимальная цена акции ниже вашей минимальной — удаляем.")
+            exit_price = action_exit_price(max_price, min_price)
+            item.update(kind="remove", action_price=current, boost_new=None, exit_price=exit_price, selected=exit_price is not None,
+                        note=f"{who}, а максимальная цена акции ниже вашей минимальной — выводим из акции.")
         items.append(item)
 
     for product in candidates:
@@ -1133,6 +1154,7 @@ def build_upcoming_actions_plan(repo_root: Path, today: Optional[str] = None) ->
     for (action_info, scope), (participants, candidates) in zip(targets, loaded):
         items.extend(plan_upcoming_action_items(action_info, scope, participants, candidates, limits, pid_to_offer))
 
+    _unify_exit_prices(items)
     names = ", ".join(f"«{info['name']}»" for info, _ in targets)
     if not items:
         return _empty_plan(True, f"Проверены предстоящие акции ({names}): всё в порядке, менять нечего.")
