@@ -21,13 +21,13 @@ OzonReportX — локальное настольное приложение п�
 | Анализ органических продаж | «Анализ» | `scripts/organic_analysis.py` |
 | План поставки FBO | «Поставки» | `scripts/fbo_supply_plan.py` |
 | ABC/XYZ-анализ | «ABC/XYZ-анализ» | `scripts/ABC_XYZ_analytics_report.py`, `scripts/abc_view.py` |
-| Баланс Ozon | «Финансы» | `scripts/balance_report.py` |
+| Баланс Ozon | «Настройки» → «Проверить баланс Ozon»; месячный отчёт | `scripts/balance_report.py` |
 | Wildberries: сводка, поставки | переключатель магазина → WB | `scripts/wb_*.py` |
 | AI-ассистент (локальный, Ollama) | «AI-ассистент» | `scripts/ai_chat.py` и др. |
 
 Разделы интерфейса заданы списком `section_names` в `app_flet.py:7734`:
 «Бизнес-сводка», «AI-ассистент», «ABC/XYZ-анализ», «Цены и скидки», «Акции», «Реклама»,
-«Анализ», «Поставки», «Финансы», «Настройки», «Файлы».
+«Анализ», «Поставки», «Остатки», «Настройки», «Файлы». Раздел «Финансы» (выгрузка баланса за период) убран после 3.2.0.
 
 ## Структура репозитория
 
@@ -184,7 +184,7 @@ Python — **3.14** (`.python-version`). Ключевые библиотеки: 
 | `reports/<Месяц> <Год>.xlsx` | месячный отчёт | Лист «Заказы» + блок показателей P/Q, «Расходы вне заказов», «Кампании» |
 | `ABC&XYZ reports/` | ABC/XYZ | `<Месяц Год>-<Месяц Год>.xlsx` |
 | `stocks reports/` | планы поставок | Отчёты FBO/WB, кэш заказов `.orders_cache/`, кэш продаж WB `.wb_sales_cache/` |
-| `balance reports/` | «Финансы» | JSON и Excel баланса за период |
+| `balance reports/` | консольное меню (`balance_report.py`) | JSON и Excel баланса за период |
 | `fbo_supply_settings.json`, `wb_supply_settings.json` | «Поставки» | Параметры и зоны складов |
 | `ads_settings.json`, `ads reports/` | «Реклама» | Настройки подбора ставок; журнал отправленных изменений ставок (JSONL) |
 | `analytics history/` | «Анализ» | `organic_last.json` — последний результат; `snapshots/` — по одному снимку в день (цена, остаток, индекс цен, контент-рейтинг, число акций) |

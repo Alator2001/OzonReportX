@@ -948,19 +948,6 @@ def valid_abc(a_m: str, a_y: str, b_m: str, b_y: str) -> str | None:
     return None
 
 
-def valid_balance(a: str, b: str) -> str | None:
-    try:
-        da = datetime.strptime(a, "%Y-%m-%d").date()
-        db = datetime.strptime(b, "%Y-%m-%d").date()
-    except ValueError:
-        return "Даты должны быть в формате YYYY-MM-DD."
-    if da > db:
-        return "Дата начала не может быть позже даты окончания."
-    if (db - da).days + 1 > 30:
-        return "Период отчёта по балансу не может быть больше 30 дней."
-    return None
-
-
 def valid_margin(a: str, b: str) -> str | None:
     try:
         ma, mb = float(a.replace(",", ".")), float(b.replace(",", "."))
@@ -1389,8 +1376,6 @@ def main(page: ft.Page) -> None:
     abc_fy = ft.Dropdown(label="Год от", options=[ft.dropdown.Option(y) for y in years], value=str(prev.year), width=150)
     abc_tm = ft.Dropdown(label="Месяц до", options=month_opts, value=str(today.month), width=190)
     abc_ty = ft.Dropdown(label="Год до", options=[ft.dropdown.Option(y) for y in years], value=str(today.year), width=150)
-    bal_from = ft.TextField(label="Дата от", value=today.replace(day=1).isoformat(), width=210)
-    bal_to = ft.TextField(label="Дата до", value=today.isoformat(), width=210)
     margin_min = ft.TextField(label="Минимальная маржа", value=m_min, width=210)
     supply_lead_default, supply_cover_default, supply_level_default = supply_defaults()
     supply_lead = ft.TextField(label="Срок поставки, дней", value=supply_lead_default, width=190,
@@ -7152,35 +7137,6 @@ def main(page: ft.Page) -> None:
         horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
     )
 
-    finance = ft.Column(
-        [
-            ft.Text("Финансы", size=26, weight=ft.FontWeight.W_800, color=TEXT),
-            ft.Text("Выгрузка баланса Ozon с ограничением до 30 дней.", size=13, color=MUTED),
-            card(
-                "Отчёт по балансу",
-                "Сохраняет JSON и Excel в balance reports.",
-                [
-                    ft.Row([bal_from, bal_to]),
-                    ft.Row(
-                        [
-                            ft.Button(
-                                "Скачать баланс",
-                                bgcolor=PRIMARY,
-                                color="white",
-                                on_click=lambda _e: toast(valid_balance(bal_from.value or "", bal_to.value or ""), True)
-                                if valid_balance(bal_from.value or "", bal_to.value or "")
-                                else job("Баланс", [str(PYTHON), str(SCRIPTS / "balance_report.py"), "--date_from", bal_from.value or "", "--date_to", bal_to.value or ""]),
-                            ),
-                            ft.TextButton("Открыть balance reports", on_click=lambda _e: reveal_path(ROOT / "balance reports", "balance reports")),
-                        ]
-                    ),
-                ],
-                tone="#EEF0F8",
-            ),
-        ],
-        spacing=18,
-    )
-
     def ai_quick_prompt(prompt_text: str):
         return lambda _e: ai_submit(prompt_text)
 
@@ -7694,10 +7650,10 @@ def main(page: ft.Page) -> None:
         spacing=14,
     )
 
-    views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, supply, stock_view, finance, settings, file_view]
+    views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, supply, stock_view, settings, file_view]
     active_store = {"value": "ozon"}
     store_sections = {"ozon": 0, "wb": 0}
-    section_names = ["Бизнес-сводка", "AI-ассистент", "ABC/XYZ-анализ", "Цены и скидки", "Акции", "Реклама", "Анализ", "Поставки", "Остатки", "Финансы", "Настройки", "Файлы"]
+    section_names = ["Бизнес-сводка", "AI-ассистент", "ABC/XYZ-анализ", "Цены и скидки", "Акции", "Реклама", "Анализ", "Поставки", "Остатки", "Настройки", "Файлы"]
 
     wb_dashboard = build_wb_dashboard(
         months=MONTHS, metric=metric, hero_metric=hero_metric, card=card,
@@ -7883,7 +7839,6 @@ def main(page: ft.Page) -> None:
             ft.NavigationRailDestination(icon=ft.Icons.INSIGHTS_OUTLINED, selected_icon=ft.Icons.INSIGHTS, label="Анализ"),
             ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2_OUTLINED, selected_icon=ft.Icons.INVENTORY_2, label="Поставки"),
             ft.NavigationRailDestination(icon=ft.Icons.WAREHOUSE_OUTLINED, selected_icon=ft.Icons.WAREHOUSE, label="Остатки"),
-            ft.NavigationRailDestination(icon=ft.Icons.ACCOUNT_BALANCE_WALLET_OUTLINED, selected_icon=ft.Icons.ACCOUNT_BALANCE_WALLET, label="Finance"),
             ft.NavigationRailDestination(icon=ft.Icons.SETTINGS_OUTLINED, selected_icon=ft.Icons.SETTINGS, label="Settings"),
             ft.NavigationRailDestination(icon=ft.Icons.FOLDER_OPEN_OUTLINED, selected_icon=ft.Icons.FOLDER_OPEN, label="Files"),
         ],
