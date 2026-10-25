@@ -7,3 +7,4 @@ packaging
 flet>=0.28.0
 matplotlib>=3.10.0
 plotly>=6.0.0
+pymorphy3>=2.0.6

@@ -20,8 +20,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Файлы и папки, которые нужны программе, но исключены из git.
-TRANSFER_FILES = [".env", "costs.xlsx", "wb_costs.xlsx", "margin_settings.json"]
-TRANSFER_DIRS = ["reports", "wb reports", "ABC&XYZ reports", "balance reports", "stocks reports"]
+TRANSFER_FILES = [".env", "costs.xlsx", "wb_costs.xlsx", "margin_settings.json", "search_settings.json"]
+TRANSFER_DIRS = ["reports", "wb reports", "ABC&XYZ reports", "balance reports", "stocks reports", "search data"]
 
 SKIP_PREFIXES = ("~$", "~tmp_", ".")
 # Служебные файлы Finder и архиватора macOS: в данные программы они не входят.

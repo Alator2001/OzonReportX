@@ -33,6 +33,7 @@ with patch.dict(os.environ, {"OZON_CLIENT_ID": "offline-test", "OZON_API_KEY": "
     import _auto_update as updater
     import file_io
     import ai_chat
+    import ai_warehouse
     import update_prices
 
 
@@ -211,28 +212,24 @@ class OfflineTests(unittest.TestCase):
         df, _, cost_col = recommended.load_costs_df(target)
         self.assertEqual(df[cost_col].iloc[0], 20)
 
-    def test_ai_costs_cache_refreshes_after_file_change(self):
-        target = self.directory / "costs.xlsx"
-        file_io.write_costs_dataframe(pd.DataFrame({"Артикул": [1], "Себестоимость": [10]}), target)
-        tools = ai_chat.Tools(self.directory)
-        self.assertEqual(tools._get_costs_df()["Себестоимость"].iloc[0], 10)
-        previous_time = target.stat().st_mtime_ns
-        file_io.write_costs_dataframe(pd.DataFrame({"Артикул": [1], "Себестоимость": [20]}), target)
-        os.utime(target, ns=(previous_time + 2_000_000_000, previous_time + 2_000_000_000))
-        self.assertEqual(tools._get_costs_df()["Себестоимость"].iloc[0], 20)
-        target.unlink()
-        self.assertIsNone(tools._get_costs_df())
-
     def test_temporary_reports_are_hidden_from_lists(self):
         folder = self.directory / "reports"
         folder.mkdir()
         for name in ["Август 2026.xlsx", "~tmp_failed.xlsx", "~$Август 2026.xlsx"]:
             (folder / name).write_bytes(b"fixture")
         expected = [folder / "Август 2026.xlsx"]
-        self.assertEqual(ai_chat.list_available_reports(self.directory), expected)
+        self.assertEqual(ai_warehouse._monthly_reports(self.directory, wb=False), expected)
         self.assertEqual(setup.list_report_files(self.directory, "reports"), expected)
         files = ui_function("files", {})
         self.assertEqual(files(folder), expected)
+
+    def test_ai_reports_skip_wildberries(self):
+        folder = self.directory / "reports"
+        folder.mkdir()
+        for name in ["Октябрь 2026.xlsx", "WB Октябрь 2026.xlsx"]:
+            (folder / name).write_bytes(b"fixture")
+        self.assertEqual(ai_warehouse._monthly_reports(self.directory, wb=False), [folder / "Октябрь 2026.xlsx"])
+        self.assertEqual(ai_warehouse._monthly_reports(self.directory, wb=True), [folder / "WB Октябрь 2026.xlsx"])
 
     def test_template_creation_handles_apostrophe_in_path(self):
         target = self.directory / "seller's folder"

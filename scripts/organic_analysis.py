@@ -434,10 +434,10 @@ def load_prices(offers: List[str]) -> Dict[str, Dict[str, Any]]:
     """Текущая цена, индекс цен и акции по артикулам (/v5/product/info/prices)."""
     from recommended_prices import _normalize_offer_id
     result: Dict[str, Dict[str, Any]] = {}
-    for i in range(0, len(offers), 1000):
+    for i in range(0, len(offers), 100):  # /v5/product/info/prices: не больше 100 товаров за запрос
         cursor = ""
         while True:
-            response = _post("/v5/product/info/prices", {"cursor": cursor, "filter": {"offer_id": offers[i:i + 1000], "visibility": "ALL"}, "limit": 1000})
+            response = _post("/v5/product/info/prices", {"cursor": cursor, "filter": {"offer_id": offers[i:i + 100], "visibility": "ALL"}, "limit": 100})
             response.raise_for_status()
             data = response.json()
             items = data.get("items") or []

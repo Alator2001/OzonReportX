@@ -440,19 +440,30 @@ def get_products_in_action(action_id: int, action_name: str, offer_ids_set: set[
     return result
 
 
+PRICES_BATCH = 100  # /v5/product/info/prices: не больше 100 товаров за запрос (Ozon, с 23.10.2026)
+
+
 def get_product_id_mapping(offer_ids: List[str]) -> Dict[int, str]:
     """
     Маппинг product_id -> нормализованный offer_id через /v5/product/info/prices.
     """
+    try:
+        from scripts.report_http import ReportSession
+    except ModuleNotFoundError:
+        from report_http import ReportSession
+
     product_id_to_offer_id: Dict[int, str] = {}
     url = "https://api-seller.ozon.ru/v5/product/info/prices"
-    for i in range(0, len(offer_ids), 1000):
-        chunk = offer_ids[i:i + 1000]
+    # С 23.10.2026 Ozon принимает не больше 100 товаров за запрос (ответ 429 «Уменьшите батч до 100»).
+    # ReportSession повторяет при настоящем ограничении частоты (не дольше минуты), а не возвращает пустой маппинг.
+    session = ReportSession(max_retries=3, max_wait=60)
+    for i in range(0, len(offer_ids), PRICES_BATCH):
+        chunk = offer_ids[i:i + PRICES_BATCH]
         cursor = ""
         while True:
-            payload = {"cursor": cursor, "filter": {"offer_id": chunk, "visibility": "ALL"}, "limit": 1000}
+            payload = {"cursor": cursor, "filter": {"offer_id": chunk, "visibility": "ALL"}, "limit": PRICES_BATCH}
             try:
-                response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
+                response = session.post(url, headers=OZON_HEADERS, json=payload, timeout=30)
                 response.raise_for_status()
                 data = response.json()
             except Exception as e:
@@ -467,6 +478,7 @@ def get_product_id_mapping(offer_ids: List[str]) -> Dict[int, str]:
             cursor = data.get("cursor", "")
             if not cursor or not items:
                 break
+    session.close()
     return product_id_to_offer_id
 
 
@@ -485,6 +497,17 @@ def parse_fixed_boost(description: str) -> Optional[float]:
     return float(match.group(1).replace(",", "."))
 
 
+def parse_points_percent(description: str) -> Optional[float]:
+    """
+    Баллы Ozon за скидку из описания акции («с дополнительными баллами за скидки 3%. После продажи начислим вам эту
+    сумму баллами, которыми оплачивается тариф за продажу и другие услуги Ozon»): процент от цены продажи. Отдельного
+    поля у Ozon нет.
+    """
+    text = re.sub(r"<[^>]+>", " ", description or "")
+    match = re.search(r"балл\w*\s+за\s+скидк\w*[^0-9%\n]{0,20}?(\d+(?:[.,]\d+)?)\s*%", text, flags=re.IGNORECASE)
+    return float(match.group(1).replace(",", ".")) if match else None
+
+
 def describe_action(action: Dict[str, Any]) -> Dict[str, Any]:
     """Краткая информация об акции: id, название, тип и фиксированный бустинг (если есть)."""
     action_id = action.get("id") or action.get("action_id")
@@ -493,6 +516,7 @@ def describe_action(action: Dict[str, Any]) -> Dict[str, Any]:
         "name": action.get("title") or action.get("name") or f"Акция {action_id}",
         "action_type": action.get("action_type") or "",
         "fixed_boost": parse_fixed_boost(action.get("description") or ""),
+        "points_percent": parse_points_percent(action.get("description") or ""),
         "date_start": action.get("date_start") or "",
         "auto_add_dates": action.get("auto_add_dates") or [],
         "date_end": action.get("date_end") or "",
@@ -523,6 +547,9 @@ def boost_at_price(action_info: Dict[str, Any], product: Dict[str, Any], price: 
     return action_info.get("fixed_boost")
 
 
+BOOST_FIELDS = ("current_boost", "min_boost", "max_boost")
+
+
 def normalize_action_product(product: Dict[str, Any]) -> Dict[str, Any]:
     """
     Товар из /v2/actions/products и /v2/actions/candidates: деньги приходят объектами
@@ -536,6 +563,12 @@ def normalize_action_product(product: Dict[str, Any]) -> Dict[str, Any]:
                 product[key] = None
             if value.get("currency") and not product.get("currency"):
                 product["currency"] = value["currency"]
+    # С 23.10.2026 Ozon присылает бустинг «Эластичного» в сотых долях процента (1400 = 14%), раньше — в процентах.
+    # Бустинг акции не бывает больше 100%, поэтому большее значение — сотые доли.
+    boost_keys = [key for key in BOOST_FIELDS if isinstance(product.get(key), (int, float))]
+    if any(product[key] > 100 for key in boost_keys):
+        for key in boost_keys:
+            product[key] = product[key] / 100
     return product
 
 
@@ -1948,7 +1981,7 @@ def get_sku_to_offer_id_mapping(skus: List[int]) -> Dict[int, str]:
                     "filter": {
                         "visibility": "ALL"
                     },
-                    "limit": 1000
+                    "limit": PRICES_BATCH
                 }
                 
                 response = requests.post(url, headers=OZON_HEADERS, json=payload, timeout=30)

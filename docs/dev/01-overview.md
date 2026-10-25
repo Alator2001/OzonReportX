@@ -19,15 +19,16 @@ OzonReportX — локальное настольное приложение п�
 | Заявки покупателей на скидку | «Цены и скидки» | `scripts/price_management.py` |
 | Реклама с оплатой за клик (ставки) | «Реклама» | `scripts/ads_cpc.py`, `scripts/performance_api.py` |
 | Анализ органических продаж | «Анализ» | `scripts/organic_analysis.py` |
+| Поиск и ключевые слова: спрос, семантика, покрытие карточек, позиции | «Поиск» | `scripts/search_*.py`, `scripts/serp_*.py`, [17](17-search.md) |
 | План поставки FBO | «Поставки» | `scripts/fbo_supply_plan.py` |
 | ABC/XYZ-анализ | «ABC/XYZ-анализ» | `scripts/ABC_XYZ_analytics_report.py`, `scripts/abc_view.py` |
 | Баланс Ozon | «Настройки» → «Проверить баланс Ozon»; месячный отчёт | `scripts/balance_report.py` |
 | Wildberries: сводка, поставки | переключатель магазина → WB | `scripts/wb_*.py` |
-| AI-ассистент (локальный, Ollama) | «AI-ассистент» | `scripts/ai_chat.py` и др. |
+| AI-ассистент (локальный, Ollama) | «AI-ассистент» | `scripts/ai_agent.py`, `ai_tools.py`, `ai_warehouse.py`, `ai_chat.py`, [14](14-ai-assistant.md) |
 
 Разделы интерфейса заданы списком `section_names` в `app_flet.py:7734`:
 «Бизнес-сводка», «AI-ассистент», «ABC/XYZ-анализ», «Цены и скидки», «Акции», «Реклама»,
-«Анализ», «Поставки», «Остатки», «Настройки», «Файлы». Раздел «Финансы» (выгрузка баланса за период) убран после 3.2.0.
+«Анализ», «Поиск», «Поставки», «Остатки», «Настройки», «Файлы». Раздел «Финансы» (выгрузка баланса за период) убран после 3.2.0.
 
 ## Структура репозитория
 
@@ -56,7 +57,7 @@ OzonReportX/
 | Модуль | Назначение |
 |---|---|
 | `Monthly_sales_report.py` | Месячный отчёт: заказы FBS/FBO, начисления, баланс, реклама → `reports/<Месяц> <Год>.xlsx` |
-| `report_http.py` | `ReportSession`: темп запросов и повторы при 429 для Seller API |
+| `report_http.py` | `ReportSession` и `create_session()`: темп запросов и повторы при 429 для Seller API |
 | `balance_report.py` | `/v1/finance/balance`: звёздные товары, хранение FBO, выплаты; выгрузка в `balance reports/` |
 | `performance_api.py` | Performance API (реклама): токен, кампании, статистика — для месячного отчёта |
 | `recommended_prices.py` | Расчёт цен по марже, работа с акциями (чтение, добавление, вывод), остатки, видимость в поиске; ~2,3 тыс. строк |
@@ -65,6 +66,7 @@ OzonReportX/
 | `auto_actions.py` | Автодобавление в акции и учёт минимальной цены: чтение, изменение, журнал |
 | `ads_cpc.py` | Реклама «оплата за клик»: план ставок по экономике товара и отправка |
 | `organic_analysis.py` | Диагностика органических продаж по товарам |
+| `search_db.py`, `search_api.py`, `search_collect.py`, `search_semantics.py`, `serp_*.py` | Поиск и ключевые слова: база SQLite с миграциями, сбор поисковой аналитики и карточек, леммы, кластеры, покрытие карточки, приоритет запросов; парсер выдачи по регионам ([17](17-search.md)) |
 | `fbo_supply_plan.py` | План поставки FBO по кластерам → `stocks reports/Поставка FBO <дата>.xlsx` |
 | `fbo_supply_report.py` | **Устаревший** расчёт поставок по ABC/XYZ; нигде не вызывается (см. [99](99-known-issues.md)) |
 | `ABC_XYZ_analytics_report.py` | ABC/XYZ по месячным отчётам → `ABC&XYZ reports/` |
@@ -77,7 +79,10 @@ OzonReportX/
 | `file_io.py`, `file_lock.py` | Атомарная запись файлов и блокировки (см. ниже) |
 | `ui_log.py` | Журнал сессии приложения |
 | `utils.py` | `log_verbose`, `prompt_yes_no`, `print_step` |
-| `ai_chat.py`, `ai_interpreter.py`, `agent_workflows.py`, `analytics_models.py`, `analytics_reducers.py`, `payload_policy.py` | AI-ассистент на Ollama |
+| `ai_chat.py`, `ai_agent.py` | AI-ассистент на Ollama: клиент и агентный цикл ([14](14-ai-assistant.md)) |
+| `ai_eval.py` | Контрольные вопросы AI-ассистента на живой модели ([14](14-ai-assistant.md#контрольные-вопросы--ai_evalpy)) |
+| `ai_warehouse.py` | Аналитическая база AI-ассистента: все данные программы в одном SQLite и словарь данных ([14](14-ai-assistant.md#аналитическая-база)) |
+| `ai_tools.py` | Инструменты AI-ассистента поверх базы и живого Ozon (только чтение) ([14](14-ai-assistant.md#инструменты--ai_toolspy)) |
 | `wb_*.py` | Wildberries: финансы, заказы, воронка, возвраты, приёмка, хранение, сводка, план запасов |
 
 ## Запуск
@@ -124,7 +129,7 @@ OzonReportX/
 (на macOS — `.venv/bin/python -m pip freeze`). Lock-файл не должен содержать пакетов только для одной ОС.
 
 Python — **3.14** (`.python-version`). Ключевые библиотеки: `flet 0.84`, `pandas 2.3`,
-`openpyxl 3.1`, `requests 2.32`, `matplotlib`, `plotly`, `python-dotenv`.
+`openpyxl 3.1`, `requests 2.32`, `matplotlib`, `plotly`, `python-dotenv`, `pymorphy3` (леммы запросов).
 
 ### Запуск модулей по отдельности
 
@@ -155,6 +160,9 @@ Python — **3.14** (`.python-version`). Ключевые библиотеки: 
 | `WB_API_TOKEN` | для WB | Токен Wildberries |
 | `MARKETPLACE_SETUP_VERSION` | служебная | Пишется мастером настройки. Пока значение ≠ `"1"`, приложение при запуске открывает мастер |
 | `OLLAMA_HOST`, `OLLAMA_MODEL` | нет | AI-ассистент, по умолчанию `http://localhost:11434` и `qwen3:4b` |
+| `OLLAMA_NUM_CTX`, `OLLAMA_KEEP_ALIVE`, `OLLAMA_THINK`, `OLLAMA_READ_TIMEOUT` | нет | Окно контекста (32768), время удержания модели в памяти (`30m`), режим размышлений, таймаут ответа — см. [14](14-ai-assistant.md#подключение-к-ollama) |
+| `SERP_PARSER_ENABLED` | нет | `1` — включить замер позиций в выдаче Ozon ([17](17-search.md#парсер-выдачи)) |
+| `SERP_PROXY_*` | нет | Адрес прокси региона для парсера выдачи; имя переменной задаётся при создании профиля |
 | `OZON_VERBOSE` | нет | `1` — подробный вывод (`utils.log_verbose`) |
 | `OZONREPORTX_UI_PROMPTS` | служебная | Ставит приложение для месячного отчёта: разрешает вопросы о маркетинге при не-TTY stdin (см. [04](04-monthly-report.md#ручной-ввод-маркетинга)) |
 
@@ -188,9 +196,11 @@ Python — **3.14** (`.python-version`). Ключевые библиотеки: 
 | `fbo_supply_settings.json`, `wb_supply_settings.json` | «Поставки» | Параметры и зоны складов |
 | `ads_settings.json`, `ads reports/` | «Реклама» | Настройки подбора ставок; журнал отправленных изменений ставок (JSONL) |
 | `analytics history/` | «Анализ» | `organic_last.json` — последний результат; `snapshots/` — по одному снимку в день (цена, остаток, индекс цен, контент-рейтинг, число акций) |
+| `search data/search.db` | сборщик поисковой аналитики | SQLite: товары, запросы и кластеры, статистика запросов и продажи по дням, снимки карточек, регионы и позиции, журнал сбора; `serp_profiles/` — профили регионов (cookies анонимной сессии Ozon), `serp_raw/` — сырые ответы выдачи за 7 дней ([17](17-search.md)) |
+| `search_settings.json` | пользователь (необязателен) | Порог кластеров, кривая CTR, зона роста — поверх значений по умолчанию ([17](17-search.md#настройки)) |
 | `actions history/auto_actions_log.jsonl` | «Акции» → автоакции | Журнал изменений автодобавления |
 | `wb reports/`, `wb_costs.xlsx` | Wildberries | Финансовые отчёты по месяцам и себестоимость WB |
-| `.cache/` | приложение | Журналы сессий `.cache/logs/ui-*.log`, картинки графиков, временные файлы тестов |
+| `.cache/` | приложение | Журналы сессий `.cache/logs/ui-*.log`, картинки графиков, временные файлы тестов; `.cache/ai/warehouse.db` — аналитическая база AI-ассистента (производная, можно удалить) |
 | `.<имя>.ozon-lock` | `file_lock.py` | Файлы-замки рядом с защищаемыми файлами |
 | `~tmp_*` | `file_io.py` | Временные файлы атомарной записи; при сбое удаляются |
 

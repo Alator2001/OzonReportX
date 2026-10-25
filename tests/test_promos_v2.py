@@ -42,6 +42,13 @@ class PromosV2Tests(unittest.TestCase):
         self.assertEqual(post.call_args_list[0].args[0], "https://api-seller.ozon.ru/v2/actions/candidates")
         self.assertEqual(post.call_args_list[1].kwargs["json"], {"action_id": 7, "limit": 100, "last_id": "next"})
 
+    def test_boost_in_hundredths_of_percent_is_converted(self):
+        # С 23.10.2026 Ozon присылает бустинг «Эластичного» в сотых долях процента.
+        product = rp.normalize_action_product({"current_boost": 1400, "min_boost": 1400, "max_boost": 4900})
+        self.assertEqual((product["current_boost"], product["min_boost"], product["max_boost"]), (14, 14, 49))
+        product = rp.normalize_action_product({"current_boost": 55, "min_boost": 15, "max_boost": 55})
+        self.assertEqual((product["current_boost"], product["max_boost"]), (55, 55))
+
     def test_activation_uses_update_with_money_objects_and_no_stock_for_boosting(self):
         body = {"active_product_ids": ["11"], "rejected": [{"product_id": 12, "reason": "price too high"}], "warnings": []}
         with patch.object(rp.requests, "post", return_value=response(body=body)) as post:

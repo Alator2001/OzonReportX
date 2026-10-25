@@ -113,14 +113,15 @@ def last_auto_add_change(entries: List[Dict[str, Any]]) -> Dict[int, Dict[str, A
 def load_prices() -> List[Dict[str, Any]]:
     items, cursor = [], ""
     while True:
-        payload: Dict[str, Any] = {"filter": {"visibility": "ALL"}, "limit": 1000}
+        # Не больше 100 товаров за запрос: на большее Ozon отвечает 429 «Уменьшите батч до 100».
+        payload: Dict[str, Any] = {"filter": {"visibility": "ALL"}, "limit": 100}
         if cursor:
             payload["cursor"] = cursor
         body = _post("/v5/product/info/prices", payload)
         page = body.get("items") or []
         items += page
         cursor = body.get("cursor") or ""
-        if not page or not cursor or len(page) < 1000:
+        if not page or not cursor or len(page) < 100:
             return items
 
 

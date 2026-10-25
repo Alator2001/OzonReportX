@@ -12,13 +12,15 @@ from typing import List, Dict, Any, Optional
 import pandas as pd
 import requests
 from dateutil.parser import isoparse
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 try:
-    from scripts.report_http import ReportSession
+    from scripts.report_http import create_session
 except ModuleNotFoundError:
-    from report_http import ReportSession
+    from report_http import create_session
+try:
+    from scripts.payout_settlement import update_reports as update_payout_settlement, print_summary as print_payout_summary
+except ModuleNotFoundError:
+    from payout_settlement import update_reports as update_payout_settlement, print_summary as print_payout_summary
 try:
     from scripts.file_io import excel_writer, atomic_output_path, save_workbook_atomic, read_costs_dataframe
 except ModuleNotFoundError:
@@ -37,26 +39,6 @@ HEADERS = {
     'Api-Key': API_KEY,
     'Content-Type': 'application/json'
 }
-
-def create_session() -> requests.Session:
-    session = ReportSession()
-    retry = Retry(
-        total=5,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["POST", "GET"]),
-        respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    # 429 for Seller API is handled above the adapter, with one shared pacing gate.
-    seller_retry = Retry(total=5, backoff_factor=0.5,
-                         status_forcelist=(500, 502, 503, 504),
-                         allowed_methods=frozenset(["POST", "GET"]),
-                         respect_retry_after_header=False)
-    session.mount("https://api-seller.ozon.ru/", HTTPAdapter(max_retries=seller_retry))
-    return session
 
 def get_custom_date_range():
     while True:
@@ -437,7 +419,8 @@ def _safe_save_excel(df: pd.DataFrame, output_file: str, sheet_name: str = "Shee
     return output_file
 
 # 📊 Преобразуем данные в Excel
-def to_excel(postings, date_from, date_to, month, year, output_file=None, session: Optional[requests.Session] = None):
+def to_excel(postings, date_from, date_to, month, year, output_file=None, session: Optional[requests.Session] = None,
+             cost_overrides: Optional[Dict[str, float]] = None):
     from datetime import datetime
     import pandas as pd
     session = session or create_session()
@@ -462,6 +445,9 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
 
     # карта себестоимости: ключ может быть точным offer_id или префиксом
     cost_map = load_cost_map()
+    # Себестоимость на месяц отчёта (например, при пересборке старых месяцев) поверх costs.xlsx.
+    for articul, unit_cost in (cost_overrides or {}).items():
+        cost_map[_normalize_articul_key(str(articul))] = float(unit_cost)
     # Ozon's sale-with-commission accrual typically lands 2-19 days after shipment (median ~6,
     # verified against real August data) — not just for orders shipped at month-end. Postings stay
     # scoped to the calendar month (date_from/date_to below), but accruals are fetched with a lookahead
@@ -1091,7 +1077,16 @@ def main(argv=None):
         default=None,
         help="Ручные затраты на внешний маркетинг за месяц. Если не передано в неинтерактивном режиме, используется 0.",
     )
+    parser.add_argument(
+        "--cost-overrides",
+        default=None,
+        help="JSON-файл {артикул: себестоимость} — себестоимость на месяц отчёта поверх costs.xlsx.",
+    )
     args = parser.parse_args(argv)
+    cost_overrides = None
+    if args.cost_overrides:
+        with open(args.cost_overrides, encoding="utf-8") as overrides_file:
+            cost_overrides = json.load(overrides_file)
 
     if args.month is not None and args.year is not None:
         if not (1 <= args.month <= 12 and 2000 <= args.year <= 2100):
@@ -1117,7 +1112,8 @@ def main(argv=None):
         start_ts = time.time()
         # Publish only after orders, financial metrics and workbook writes succeed.
         with atomic_output_path(output_file) as temporary:
-            to_excel(all_orders, date_from, date_to, month, year, output_file=str(temporary), session=session)
+            to_excel(all_orders, date_from, date_to, month, year, output_file=str(temporary), session=session,
+                     cost_overrides=cost_overrides)
             calc_business_indicators(
                 str(temporary),
                 session=session,
@@ -1128,6 +1124,14 @@ def main(argv=None):
             )
         duration_s = time.time() - start_ts
         print(f"✅ Отчёт сохранён: {output_file}")
+
+    # Сверка выплат идёт по всем отчётам сразу: выплата закрывает старые месяцы раньше новых.
+    # Её сбой не должен отменять уже сохранённый отчёт.
+    print("💸 Сверяем выплаты Ozon с отчётами...")
+    try:
+        print_payout_summary(update_payout_settlement(reports_dir))
+    except Exception as exc:
+        print(f"⚠️ Не удалось сверить выплаты Ozon: {exc}")
     # Краткий итог
     print(f"⏱ Время формирования: {duration_s:.1f} с")
 

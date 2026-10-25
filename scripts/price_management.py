@@ -670,7 +670,12 @@ def _load_plan_context(repo_root: Path, need_desired: bool) -> Tuple[Optional[Di
     actions = [action for action in actions if action["id"]]
     if not actions:
         return None, _empty_plan(True, "Активные акции не найдены.")
-    return {"limits": limits, "actions": actions, "pid_to_offer": get_product_id_mapping(list(limits))}, None
+    pid_to_offer = get_product_id_mapping(list(limits))
+    if not pid_to_offer:
+        # Без сопоставления product_id → артикул ни один товар акции не узнать: это сбой загрузки, а не «нет товаров».
+        return None, _empty_plan(False, "Ozon не вернул список ваших товаров (часто — временное ограничение запросов, HTTP 429). "
+                                        "Обновите через минуту.")
+    return {"limits": limits, "actions": actions, "pid_to_offer": pid_to_offer}, None
 
 
 def _boost_fields(action_info: Dict[str, Any], product: Dict[str, Any]) -> Dict[str, Any]:

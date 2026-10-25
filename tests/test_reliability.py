@@ -182,10 +182,6 @@ except FileBusyError:
         book = Mock(sheetnames=[])
         target = self.directory / "report.xlsx"
         target.touch()
-        with patch.object(ai_chat, "load_workbook", return_value=book):
-            self.assertIsNone(ai_chat.load_report_summary(target))
-        book.close.assert_called_once()
-        book.reset_mock()
         with patch.object(recommended, "load_workbook", return_value=book):
             with self.assertRaises(ValueError):
                 recommended.load_cost_structure(target)

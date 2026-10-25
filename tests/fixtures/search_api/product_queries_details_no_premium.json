@@ -1,0 +1,13 @@
+{
+  "analytics_period": {"date_from": "2026-10-20 00:00:00 +0000 UTC", "date_to": "2026-10-21 00:00:00 +0000 UTC"},
+  "queries": [
+    {"sku": 1850332702, "currency": "RUB", "gmv": 0, "order_count": 0, "position": null, "query": "доска  разделочная",
+     "view_conversion": null, "query_index": 1, "unique_search_users": 3772, "unique_view_users": null},
+    {"sku": 1850332702, "currency": "RUB", "gmv": 0, "order_count": 0, "position": null, "query": "Доска из кедра",
+     "view_conversion": null, "query_index": 2, "unique_search_users": 410, "unique_view_users": null},
+    {"sku": 1850332702, "currency": "RUB", "gmv": 0, "order_count": 0, "position": null, "query": "   ",
+     "view_conversion": null, "query_index": 3, "unique_search_users": 5, "unique_view_users": null}
+  ],
+  "page_count": 1,
+  "total": 3
+}

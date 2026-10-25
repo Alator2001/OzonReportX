@@ -49,7 +49,7 @@
 
 ### `ReportSession` — темп и повторы для отчётов
 
-`scripts/report_http.py`. Используется месячным отчётом (и всем, что берёт `Monthly_sales_report.create_session()`,
+`scripts/report_http.py`. Используется месячным отчётом (и всем, что берёт `report_http.create_session()`,
 например загрузкой заказов для плана поставки и анализа).
 
 - Касается только хоста `api-seller.ozon.ru`; прочие хосты идут как обычная `requests.Session`.
@@ -62,7 +62,7 @@
 - После каждого 429 `min_interval` удваивается (от 1 до 5 с) — сессия замедляется до конца работы.
 - Повторяется **тот же запрос с тем же телом** (важно для пагинации: страница не теряется).
 
-`create_session()` (`scripts/Monthly_sales_report.py:41`) монтирует два адаптера:
+`create_session()` (`scripts/report_http.py`; `Monthly_sales_report` импортирует её оттуда) монтирует два адаптера:
 - для всех хостов — повторы при 429/500/502/503/504 (5 попыток, `backoff_factor=0.5`, учитывает `Retry-After`);
 - для `https://api-seller.ozon.ru/` — повторы **только при 5xx**: 429 обрабатывает `ReportSession`,
   иначе адаптер и сессия умножали бы ожидания друг друга (тест `test_adapter_does_not_hide_429_from_pacing_layer`).
@@ -90,7 +90,7 @@
 |---|---|---|---|
 | `POST /v3/product/list` | `recommended_prices.py` | Список товаров | ✅ |
 | `POST /v3/product/info/list` | `recommended_prices.py` (в т. ч. `get_product_info_by_id`) | Карточки: SKU, `offer_id` по `product_id`/`sku` | ✅ |
-| `POST /v5/product/info/prices` | `recommended_prices.py`, `auto_actions.py`, `organic_analysis.py`, `update_prices.py` | Цены, индекс цен, флаги автодобавления, `product_id → offer_id` | ✅ |
+| `POST /v5/product/info/prices` | `recommended_prices.py`, `auto_actions.py`, `organic_analysis.py`, `update_prices.py` | Цены, индекс цен, флаги автодобавления, `product_id → offer_id`. **С 23.10.2026 — не больше 100 товаров за запрос** (`limit` и фильтр `offer_id`): на большее Ozon отвечает HTTP 429 «Уменьшите батч до 100», похоже на ограничение частоты, но повтор не помогает (`PRICES_BATCH`) | ✅ |
 | `POST /v1/product/import/prices` | `update_prices.py`, `auto_actions.py` | Запись минимальных цен и флагов автодобавления / учёта минимальной цены | — (запись) |
 | `POST /v4/product/info/stocks` | `recommended_prices.py`, `fbo_supply_plan.py`, `ads_cpc.py` | Остатки по складам | ✅ |
 | `POST /v1/analytics/stocks` | `fbo_supply_plan.py`, `recommended_prices.py` | Остатки и продажи FBO по кластерам | ✅ |
@@ -118,8 +118,10 @@
 
 | Метод | Модуль | Назначение | Статус |
 |---|---|---|---|
-| `POST /v1/analytics/product-queries` | `recommended_prices.get_search_visibility`, `organic_analysis.load_search` | Видимость в поиске. Без Premium позиции и просмотры `null`, а период должен заканчиваться **не позже полуночи вчерашнего дня (UTC)** и быть не длиннее ~30 дней, иначе 403 «available starting from the premium subscription» | ✅ |
-| `POST /v1/analytics/product-queries/details` | `organic_analysis.py` | Запросы, по которым находят товар (только Premium) | — |
+| `POST /v1/analytics/product-queries` | `recommended_prices.get_search_visibility`, `organic_analysis.load_search`, `search_api.fetch_product_queries_day` | Видимость в поиске. Без Premium позиции и просмотры `null`, а период должен заканчиваться **не позже полуночи вчерашнего дня (UTC)** и быть не длиннее ~30 дней, иначе 403 «available starting from the premium subscription». Период — полуинтервал `[date_from, date_to)`: `date_from = date_to` даёт пустой ответ, один день — `D 00:00Z … D+1 00:00Z` | ✅ |
+| `POST /v1/analytics/product-queries/details` | `organic_analysis.py`, `search_api.fetch_product_queries_day` | Запросы, по которым находят товар, до 15 на SKU. Без подписки отвечает 200: текст запроса, `query_index`, `unique_search_users`; позиция и просмотры `null`, `order_count` и `gmv` — 0 | ✅ |
+| `POST /v1/analytics/data` | `search_api.fetch_sales_by_day` | Заказано штук и на сумму по SKU и дням. Не чаще 1 раза в минуту; без Premium Plus — 50 запросов в сутки, данные за 3 месяца, и метрики поиска (`hits_view_search`, `position_category` …) **молча выбрасываются** из ответа — значений меньше, чем запрошено | ✅ |
+| `POST /v1/search-queries/text`, `/v1/search-queries/top` | — | Частотность запросов по всему Ozon. Только Premium Pro, иначе 403 `code 7` | ❌ без подписки |
 | `POST /v1/analytics/local-sale/items-clusters/info` | `organic_analysis.load_locality` | Доля доставок из кластера покупателя, рекомендованная поставка | — |
 
 ### Performance API (реклама)
@@ -158,7 +160,7 @@
 
 ## Правила для нового кода
 
-1. Для чтения больших объёмов используйте `Monthly_sales_report.create_session()` — получите темп и
+1. Для чтения больших объёмов используйте `report_http.create_session()` — получите темп и
    разумные повторы при 429 бесплатно.
 2. Пагинация — с защитой от зацикливания: запоминайте увиденные курсоры/`last_id` и падайте при повторе
    (`_get_postings`, `get_transactions_by_posting`).

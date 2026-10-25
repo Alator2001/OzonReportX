@@ -1,0 +1,22 @@
+{
+  "result": [
+    {
+      "id": 1376477022, "sku": 1850332702, "offer_id": "1302",
+      "name": "Доска разделочная из кедра, круглая с гравировкой, 18см",
+      "primary_image": "https://ir.ozone.ru/s3/multimedia-1-2/main.jpg",
+      "images": ["https://ir.ozone.ru/s3/multimedia-1-p/a.jpg", "https://ir.ozone.ru/s3/multimedia-1-2/main.jpg"],
+      "attributes": [
+        {"id": 85, "complex_id": 0, "values": [{"dictionary_value_id": 126745801, "value": "Нет бренда"}]},
+        {"id": 6383, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": "Кедр"}]},
+        {"id": 23171, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": "#Подарок #разделочные_доски"}]},
+        {"id": 4191, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": "Круглая разделочная доска из массива кедра для подачи."}]},
+        {"id": 11254, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": "{\"content\": []}"}]},
+        {"id": 4180, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": "Доска разделочная из кедра, круглая с гравировкой, 18см"}]},
+        {"id": 9024, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": "1302"}]},
+        {"id": 4384, "complex_id": 0, "values": [{"dictionary_value_id": 0, "value": "  "}]}
+      ]
+    }
+  ],
+  "last_id": "",
+  "total": "1"
+}

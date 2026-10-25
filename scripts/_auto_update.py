@@ -132,9 +132,9 @@ def apply_update(source_dir, repo_root):
     # Список файлов и папок, которые НЕ нужно обновлять
     preserve = {'.venv', '.git', '__pycache__', 'reports', '.env',
                 'costs.xlsx', 'costs.csv', 'version.txt', 'updater.log',
-                'backup_*', '.cache', 'margin_settings.json',
+                'backup_*', '.cache', 'margin_settings.json', 'limit_price_settings.json',
                 'ABC&XYZ reports', 'stocks reports', 'balance reports',
-                'wb reports', 'wb_costs.xlsx'}
+                'wb reports', 'wb_costs.xlsx', 'search data', 'search_settings.json'}
     repo_root = Path(repo_root).resolve()
     items = [item for item in source_dir.iterdir()
              if not any(item.match(pattern) for pattern in preserve)]

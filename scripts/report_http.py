@@ -5,6 +5,8 @@ import threading
 import time
 from urllib.parse import urlsplit
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 def retry_after_seconds(value):
@@ -64,3 +66,24 @@ class ReportSession(requests.Session):
                 waited += delay
                 self.min_interval = min(max(self.min_interval * 2, 1.0), 5.0)
                 self._next_request = time.monotonic()
+
+
+def create_session() -> requests.Session:
+    session = ReportSession()
+    retry = Retry(
+        total=5,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["POST", "GET"]),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    # 429 for Seller API is handled above the adapter, with one shared pacing gate.
+    seller_retry = Retry(total=5, backoff_factor=0.5,
+                         status_forcelist=(500, 502, 503, 504),
+                         allowed_methods=frozenset(["POST", "GET"]),
+                         respect_retry_after_header=False)
+    session.mount("https://api-seller.ozon.ru/", HTTPAdapter(max_retries=seller_retry))
+    return session

@@ -3,6 +3,7 @@
 import os
 import asyncio
 import json
+import math
 import queue
 import signal
 import re
@@ -32,6 +33,18 @@ try:
 except Exception:  # модуль автоакций необязателен для запуска интерфейса
     auto_actions = None
 try:
+    from scripts import limit_price
+    LIMIT_IMPORT_ERROR = None
+except Exception as exc:  # ползунок предельной цены необязателен для запуска интерфейса
+    limit_price = None
+    LIMIT_IMPORT_ERROR = str(exc)
+try:
+    from scripts import search_db, search_view
+    SEARCH_IMPORT_ERROR = None
+except Exception as exc:  # раздел «Поиск» необязателен для запуска интерфейса
+    search_db = search_view = None
+    SEARCH_IMPORT_ERROR = str(exc)
+try:
     from scripts import stock_overview
     STOCK_IMPORT_ERROR = None
 except Exception as exc:  # раздел «Остатки» необязателен для запуска интерфейса
@@ -42,43 +55,22 @@ from scripts.marketplace_settings import FIELDS, HELP, read_settings, save_setti
 
 try:
     import scripts.ai_chat as ai_chat_module
-    from scripts.ai_chat import (
-        OLLAMA_HOST,
-        OLLAMA_MODEL,
-        Tools as AITools,
-        stream_chat_with_ai,
-        chat_with_ai,
-        check_ollama_model,
-        execute_tools,
-        format_tool_results,
-        parse_ai_response,
-        build_workflow_state,
-        get_workflow_followup_needs,
-        build_workflow_fallback_answer,
-    )
+    from scripts.ai_chat import OLLAMA_HOST, OLLAMA_MODEL, check_ollama_model
+    from scripts.ai_agent import Agent as AIAgent
+    from scripts.ai_tools import AnalyticsTools
     AI_IMPORT_ERROR = None
 except Exception as exc:
     ai_chat_module = None
     OLLAMA_HOST = "http://localhost:11434"
     OLLAMA_MODEL = "qwen3:4b"
-    AITools = None
-    stream_chat_with_ai = None
-    chat_with_ai = None
     check_ollama_model = None
-    execute_tools = None
-    format_tool_results = None
-    parse_ai_response = None
-    build_workflow_state = None
-    get_workflow_followup_needs = None
-    build_workflow_fallback_answer = None
+    AIAgent = None
+    AnalyticsTools = None
     AI_IMPORT_ERROR = str(exc)
 
 try:
     from scripts.price_management import (
-        build_action_add_plan,
-        build_action_removal_plan,
         build_discount_request_plan,
-        execute_action_plan,
         load_actions_calendar,
         process_discount_request_item,
         process_discount_request_plan,
@@ -87,10 +79,7 @@ try:
     PRICING_IMPORT_ERROR = None
 except Exception as exc:
     BOOST_COLUMN_SUFFIX = " — бустинг, %"
-    build_action_add_plan = None
-    build_action_removal_plan = None
     build_discount_request_plan = None
-    execute_action_plan = None
     load_actions_calendar = None
     process_discount_request_item = None
     process_discount_request_plan = None
@@ -1534,10 +1523,10 @@ def main(page: ft.Page) -> None:
     ai_new_chat_button = ft.TextButton("Новый диалог")
     ai_top_title = ft.Text("AI-ассистент", size=18, weight=ft.FontWeight.W_800, color=TEXT)
     ai_top_subtitle = ft.Text("Локальный анализ на Ollama", size=12, color=MUTED)
-    ai_quick_month_button = ft.TextButton("Разобрать месяц")
+    ai_quick_month_button = ft.TextButton("Как дела в магазине")
     ai_quick_pressure_button = ft.TextButton("Что давит на прибыль")
-    ai_quick_brief_button = ft.TextButton("Краткий разбор")
-    ai_quick_risk_button = ft.TextButton("Риски месяца")
+    ai_quick_brief_button = ft.TextButton("Что пополнить")
+    ai_quick_risk_button = ft.TextButton("Проблемные товары")
     ai_busy_label = ft.Text("Ассистент готов.", size=12, color=MUTED)
     ai_busy_ring = ft.ProgressRing(width=16, height=16, stroke_width=2.4, visible=False)
     ai_view: ft.Container | None = None
@@ -1546,11 +1535,6 @@ def main(page: ft.Page) -> None:
     ai_state = {
         "busy": False,
         "conversation_history": [],
-        "session_memory": {
-            "selected_period": None,
-            "selected_artikul": None,
-            "last_comparison_periods": [],
-        },
         "available": False,
         "status_message": "",
         "selected_model": OLLAMA_MODEL,
@@ -1564,7 +1548,8 @@ def main(page: ft.Page) -> None:
         "stream_controls": {},
         "request_started_at": {},
     }
-    ai_tools = AITools(ROOT) if AITools else None
+    # Один набор инструментов на сессию: живые данные Ozon кешируются между вопросами.
+    ai_tools = AnalyticsTools(ROOT) if AnalyticsTools else None
 
     folder_specs = [
         FolderSpec("Месячные отчёты", ROOT / "reports"),
@@ -1723,18 +1708,6 @@ def main(page: ft.Page) -> None:
                 ),
             )
         )
-
-    def ai_context_state() -> str | None:
-        lines: list[str] = []
-        memory = ai_state["session_memory"]
-        if memory["selected_period"]:
-            lines.append(f"selected_period={memory['selected_period']}")
-        if memory["selected_artikul"]:
-            lines.append(f"selected_artikul={memory['selected_artikul']}")
-        if memory["last_comparison_periods"]:
-            periods = ", ".join(memory["last_comparison_periods"])
-            lines.append(f"last_comparison_periods={periods}")
-        return "\n".join(lines) if lines else None
 
     def ai_append_message(role: str, text: str, note: str | None = None) -> None:
         if ai_messages.controls and ai_messages.controls[0] is ai_empty_state:
@@ -2110,11 +2083,6 @@ def main(page: ft.Page) -> None:
             ai_state["request_started_at"].pop(ai_state["active_request_id"], None)
         ai_state["active_request_id"] = None
         ai_state["conversation_history"] = []
-        ai_state["session_memory"] = {
-            "selected_period": None,
-            "selected_artikul": None,
-            "last_comparison_periods": [],
-        }
         ai_state["trace"] = []
         ai_trace.controls = []
         ai_messages.controls = [ai_empty_state]
@@ -2129,7 +2097,9 @@ def main(page: ft.Page) -> None:
         if not selected:
             return
         ai_apply_selected_model(selected)
-        ai_busy_label.value = f"Активная модель: {selected}"
+        # Заново проверяем модель: без поддержки инструментов ассистент работать не может.
+        ai_refresh_status()
+        ai_busy_label.value = f"Активная модель: {selected}" if ai_state["available"] else ai_state["status_message"]
         if status_ui_ready["value"] and page.controls:
             page.update(ai_runtime_model, ai_busy_label, ai_model_select)
 
@@ -2155,192 +2125,44 @@ def main(page: ft.Page) -> None:
             def is_cancelled() -> bool:
                 return request_id in ai_state["cancelled_request_ids"] or ai_state["active_request_id"] != request_id
 
-            def merge_tool_results(base: dict, incoming: dict) -> dict:
-                merged = dict(base)
-                for key, value in (incoming or {}).items():
-                    if key not in merged:
-                        merged[key] = value
-                    else:
-                        existing = merged[key]
-                        if isinstance(existing, list):
-                            existing.append(value)
-                        else:
-                            merged[key] = [existing, value]
-                return merged
-
-            if not ai_state["available"] or not ai_tools or not chat_with_ai or not parse_ai_response:
+            if not ai_state["available"] or not AIAgent or not ai_tools:
                 ai_debug_log("AI недоступен", ai_state["status_message"] or "AI недоступен.")
                 ui_queue.put(("ai_finish", request_id, prompt, None, ai_state["status_message"] or "AI недоступен."))
                 return
 
+            def on_event(kind: str, payload: object) -> None:
+                if is_cancelled():
+                    return
+                if kind == "status":
+                    ui_queue.put(("ai_stream_start", request_id, str(payload)))
+                elif kind == "thinking":
+                    ui_queue.put(("ai_thinking_chunk", request_id, payload))
+                elif kind == "answer_chunk":
+                    ui_queue.put(("ai_stream_chunk", request_id, payload))
+                elif kind == "answer_reset":
+                    ui_queue.put(("ai_stream_reset", request_id))
+                elif kind == "tool":
+                    ui_queue.put(("ai_step", f"Данные: {payload['name']}", f"{payload['seconds']} с", ("tools", "Ассистент получил данные из программы.")))
+                    ai_debug_log(f"Инструмент {payload['name']}", payload)
+                elif kind == "model":
+                    ai_debug_log(f"Ответ модели, шаг {payload['step']}", payload)
+                    if payload.get("context_overflow"):
+                        ai_debug_log("Окно контекста почти заполнено", "Ollama мог обрезать начало запроса.")
+
             try:
                 ai_apply_selected_model(ai_model_select.value or ai_state["selected_model"])
                 if is_cancelled():
-                    ai_debug_log("AI запрос отменён до старта", {"request_id": request_id})
                     return
-                context_state = ai_context_state()
-                ai_debug_log("Контекст сессии", context_state or "(пусто)")
-                final_answer = None
-                final_runtime = {}
-                accumulated_tool_results = {}
-                max_steps = 4
-
-                for step_idx in range(1, max_steps + 1):
-                    workflow_state = build_workflow_state(prompt, accumulated_tool_results) if build_workflow_state else None
-                    has_tool_data = bool(accumulated_tool_results)
-                    phase_label = f"Шаг {step_idx}"
-                    if workflow_state and workflow_state.name == "yearly_artikul_profit_report":
-                        if workflow_state.stage == "planning":
-                            phase_note = "Определяю годовой workflow..."
-                        elif workflow_state.stage == "periods_resolved":
-                            phase_note = "Собираю месячные отчёты по workflow..."
-                        elif workflow_state.stage == "aggregation_ready":
-                            phase_note = "Формирую итог по агрегированной сводке..."
-                        else:
-                            phase_note = "Обрабатываю workflow..."
-                    else:
-                        phase_note = "Планирую ответ..." if not has_tool_data else ("Собираю дополнительные данные..." if step_idx < max_steps else "Формирую ответ...")
-                    phase_temperature = 0.7 if not has_tool_data else 0.2
-                    current_data_block = format_tool_results(
-                        accumulated_tool_results,
-                        user_message=prompt,
-                        workflow_state=workflow_state,
-                    ) if has_tool_data else None
-                    deterministic_needs = get_workflow_followup_needs(prompt, accumulated_tool_results) if get_workflow_followup_needs else []
-                    if deterministic_needs:
-                        ai_debug_log(
-                            f"{phase_label}: workflow step",
-                            {
-                                "workflow": workflow_state.name if workflow_state else None,
-                                "workflow_stage": workflow_state.stage if workflow_state else None,
-                                "needs": deterministic_needs,
-                            },
-                        )
-                        if has_tool_data:
-                            ai_debug_log(f"{phase_label}: workflow data block", current_data_block)
-                        tool_results = execute_tools(ai_tools, deterministic_needs)
-                        if is_cancelled():
-                            ai_debug_log("AI запрос отменён после workflow tool-вызовов", {"request_id": request_id, "step": step_idx})
-                            return
-                        ai_debug_log("Результаты инструментов", tool_results)
-                        accumulated_tool_results = merge_tool_results(accumulated_tool_results, tool_results)
-
-                        periods_found = []
-                        for need in deterministic_needs:
-                            args = need.get("args", {})
-                            if "period" in args:
-                                periods_found.append(args["period"])
-                            if "artikul" in args:
-                                ai_state["session_memory"]["selected_artikul"] = args["artikul"]
-                        if periods_found:
-                            ai_state["session_memory"]["selected_period"] = periods_found[-1]
-                            if len(periods_found) > 1:
-                                ai_state["session_memory"]["last_comparison_periods"] = periods_found
-                        continue
-
-                    ai_debug_log(
-                        f"{phase_label}: model step",
-                        {
-                            "temperature": phase_temperature,
-                            "max_tokens": "unlimited",
-                            "streaming": True,
-                            "has_data_block": has_tool_data,
-                            "workflow": workflow_state.name if workflow_state else None,
-                            "workflow_stage": workflow_state.stage if workflow_state else None,
-                            "force_final_answer": workflow_state.force_final_answer if workflow_state else False,
-                        },
-                    )
-                    if has_tool_data:
-                        ai_debug_log(f"{phase_label}: model data block", current_data_block)
-
-                    if stream_chat_with_ai:
-                        ui_queue.put(("ai_stream_start", request_id, phase_note))
-                        ai_response, _, runtime_info = stream_chat_with_ai(
-                            prompt,
-                            ai_state["conversation_history"],
-                            data_block=current_data_block,
-                            context_state=context_state,
-                            temperature=phase_temperature,
-                            max_tokens=None,
-                            allow_followup_data_requests=not (workflow_state.force_final_answer if workflow_state else False),
-                            on_chunk=None,
-                            on_thinking=lambda chunk: ui_queue.put(("ai_thinking_chunk", request_id, chunk)),
-                            should_cancel=is_cancelled,
-                        )
-                    else:
-                        ai_response, _, runtime_info = chat_with_ai(
-                            prompt,
-                            ai_state["conversation_history"],
-                            data_block=current_data_block,
-                            context_state=context_state,
-                            temperature=phase_temperature,
-                            max_tokens=None,
-                            allow_followup_data_requests=not (workflow_state.force_final_answer if workflow_state else False),
-                        )
-
-                    final_runtime = runtime_info or final_runtime
-                    if is_cancelled():
-                        ai_debug_log("AI запрос отменён во время многошагового цикла", {"request_id": request_id, "step": step_idx})
-                        return
-                    if not ai_response:
-                        ai_debug_log("Пустой ответ от модели", runtime_info or {})
-                        ui_queue.put(("ai_finish", request_id, prompt, None, "Не удалось получить ответ от Ollama."))
-                        return
-
-                    ai_debug_log(f"Сырой ответ модели, {phase_label}", ai_response)
-                    ai_debug_log(f"Runtime, {phase_label}", runtime_info or {})
-                    parsed = parse_ai_response(ai_response)
-                    ai_debug_log(f"Распарсенный ответ, {phase_label}", parsed or "(не удалось распарсить JSON)")
-
-                    if parsed and parsed.get("type") == "FINAL_ANSWER":
-                        final_answer = parsed.get("answer", ai_response)
-                        break
-
-                    if parsed and parsed.get("type") == "DATA_REQUEST":
-                        needs = parsed.get("needs", [])
-                        ai_debug_log("DATA_REQUEST", {"step": step_idx, "reason": parsed.get("reason", ""), "needs": needs})
-                        tool_results = execute_tools(ai_tools, needs)
-                        if is_cancelled():
-                            ai_debug_log("AI запрос отменён после tool-вызовов", {"request_id": request_id, "step": step_idx})
-                            return
-                        ai_debug_log("Результаты инструментов", tool_results)
-                        accumulated_tool_results = merge_tool_results(accumulated_tool_results, tool_results)
-
-                        periods_found = []
-                        for need in needs:
-                            args = need.get("args", {})
-                            if "period" in args:
-                                periods_found.append(args["period"])
-                            if "artikul" in args:
-                                ai_state["session_memory"]["selected_artikul"] = args["artikul"]
-                        if periods_found:
-                            ai_state["session_memory"]["selected_period"] = periods_found[-1]
-                            if len(periods_found) > 1:
-                                ai_state["session_memory"]["last_comparison_periods"] = periods_found
-                        continue
-
-                    if workflow_state and workflow_state.force_final_answer and build_workflow_fallback_answer:
-                        fallback_answer = build_workflow_fallback_answer(prompt, accumulated_tool_results)
-                        final_answer = fallback_answer or ai_response
-                    else:
-                        final_answer = ai_response
-                    break
-
-                if final_answer is None and accumulated_tool_results:
-                    fallback_answer = build_workflow_fallback_answer(prompt, accumulated_tool_results) if build_workflow_fallback_answer else None
-                    if fallback_answer:
-                        final_answer = fallback_answer
-                    else:
-                        ui_queue.put(("ai_finish", request_id, prompt, None, "Модель не завершила анализ финальным ответом за допустимое число шагов."))
-                        return
-                if final_answer is None:
-                    final_answer = "Не удалось завершить AI-анализ."
-
-                if is_cancelled():
-                    ai_debug_log("AI запрос отменён перед публикацией результата", {"request_id": request_id})
+                ui_queue.put(("ai_stream_start", request_id, "Думаю над вопросом…"))
+                result = AIAgent(ROOT, tools=ai_tools).run(prompt, ai_state["conversation_history"], on_event=on_event, should_cancel=is_cancelled)
+                if result.cancelled or is_cancelled():
+                    ai_debug_log("AI запрос отменён", {"request_id": request_id})
                     return
-                ai_debug_log("Финальный ответ для UI", final_answer)
-                ui_queue.put(("ai_finish", request_id, prompt, final_answer, final_runtime.get("model", ai_state["selected_model"])))
+                ai_debug_log("Итог запроса", {"steps": result.steps, "tool_calls": result.tool_calls, "seconds": result.seconds, "model": result.model})
+                if result.answer:
+                    ui_queue.put(("ai_finish", request_id, prompt, result.answer, result.model or ai_state["selected_model"]))
+                else:
+                    ui_queue.put(("ai_finish", request_id, prompt, None, result.error or "Не удалось получить ответ от модели."))
             except Exception as exc:
                 ai_debug_log("Исключение AI-пайплайна", repr(exc))
                 ui_queue.put(("ai_finish", request_id, prompt, None, f"Ошибка AI-анализа: {exc}"))
@@ -3766,6 +3588,8 @@ def main(page: ft.Page) -> None:
                 render_supply_results()
             if title == WB_SUPPLY_TITLE:
                 render_wb_supply_results()
+            if title == SEARCH_COLLECT_TITLE:
+                search_load()
         except Exception as exc:
             append_log(f"\nНе удалось обновить интерфейс: {exc}")
         finally:
@@ -4480,6 +4304,13 @@ def main(page: ft.Page) -> None:
                         if thinking_toggle is not None:
                             thinking_toggle.visible = True
                         page.update(ai_messages, thinking_wrap, thinking_list)
+                elif kind == "ai_stream_reset":
+                    _, request_id = event
+                    stream_payload = ai_state["stream_controls"].get(request_id)
+                    text_control = stream_payload.get("text") if isinstance(stream_payload, dict) else None
+                    if text_control is not None and request_id not in ai_state["cancelled_request_ids"]:
+                        text_control.value = ""
+                        page.update(ai_messages)
                 elif kind == "ai_stream_chunk":
                     _, request_id, chunk = event
                     if request_id in ai_state["cancelled_request_ids"]:
@@ -4885,316 +4716,564 @@ def main(page: ft.Page) -> None:
         spacing=14,
     )
 
-    promo_dialog_title = ft.Text("", size=18, weight=ft.FontWeight.W_800)
-    promo_dialog_summary = ft.Text("", size=13)
-    promo_dialog_list = ft.ListView(spacing=6, expand=True)
-    promo_cancel_button = ft.TextButton("Отмена")
-    promo_confirm_button = ft.Button("Отправить в Ozon", color="white")
-    promo_dialog = ft.AlertDialog(
-        modal=True,
-        title=promo_dialog_title,
-        content=ft.Container(
-            width=880,
-            height=520,
-            content=ft.Column([promo_dialog_summary, promo_dialog_list], spacing=12),
-        ),
-        actions=[promo_cancel_button, promo_confirm_button],
-        actions_alignment=ft.MainAxisAlignment.END,
-        open=False,
-    )
-    page.overlay.append(promo_dialog)
-    promo_state: dict[str, object] = {"mode": None, "plan": None}
-    promo_titles = {
-        "remove": "Удаление невыгодных товаров из акций",
-        "add": "Добавление в акции и подъём цен",
-    }
-    promo_groups = (
-        ("add", "Добавить в акцию"),
-        ("raise", "Поднять цену в акции"),
-        ("remove", "Удалить из акции"),
-        ("watch", "Внимание: Ozon может добавить сам по цене ниже минимальной"),
-    )
+    # ---------------------------------------------------------------- Акции: предельная цена (ползунок по артикулу)
+    # Один цвет на акцию во всём разделе (календарь, шкала ползунка, значки): слот закрепляется за акцией один раз,
+    # в порядке id — так цвет не зависит от того, какой артикул или блок отрисован первым. Белый текст читается на всех.
+    ACTION_PALETTE = {False: ["#2a78d6", "#d9622b", "#16936a", "#7b52e8", "#b07d10", "#cf3f74", "#138a9e", "#8d6440"],
+                      True: ["#4f93ea", "#e9783f", "#25ad82", "#9877f5", "#c99a1e", "#e3588b", "#24a5ba", "#a47d58"]}
+    action_color_slots: dict[str, int] = {}
 
-    def promo_spinner() -> ft.Control:
-        return ft.Row([ft.ProgressRing(width=24, height=24, stroke_width=2.4)], alignment=ft.MainAxisAlignment.CENTER)
+    def register_action_colors(action_ids) -> None:
+        for action_id in sorted({str(a) for a in action_ids}, key=lambda a: (len(a), a)):
+            action_color_slots.setdefault(action_id, len(action_color_slots))
 
-    def promo_boost(value) -> str:
-        return "—" if value is None else f"{value:g}%"
+    def action_color(action_id) -> str:
+        palette = ACTION_PALETTE[current_dark["value"]]
+        slot = action_color_slots.setdefault(str(action_id), len(action_color_slots))
+        return palette[slot % len(palette)]
 
-    def promo_row(primary: str, lines: list[tuple[str, str | None]], tone: str | None = None, checkbox: ft.Control | None = None) -> ft.Control:
-        dark = current_dark["value"]
-        texts = [ft.Text(primary, size=13, weight=ft.FontWeight.W_600, color=tone or ("#F3F4F6" if dark else TEXT))]
-        texts += [ft.Text(text, size=12, color=color or ("#B6C0BC" if dark else MUTED)) for text, color in lines]
-        body = ft.Column(texts, spacing=2, expand=True)
-        return ft.Container(
-            padding=ft.Padding.symmetric(horizontal=12, vertical=8),
-            border_radius=10,
-            bgcolor="#2A3136" if dark else "#F3F4F7",
-            content=ft.Row([checkbox, body] if checkbox else [body], spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
+    def short_action_name(name: str) -> str:
+        """«Эластичный бустинг. Без ограничения срока действия» → «Эластичный бустинг»; «Максимальный …» → «Макс. …»."""
+        short = name.split(". ")[0].rstrip(".").replace("Максимальный бустинг", "Макс. бустинг")
+        return short.split(" с ")[0] if len(short) > 28 else short
+
+    LIMIT_SLIDER_INSET = 12
+    LIMIT_PAGE = 12  # карточек за раз: 50+ ползунков разом заметно тормозят открытие раздела и смену темы
+    limit_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False, "prices": {}, "filter": "all",
+                                      "elasticity": None, "shown": LIMIT_PAGE, "collapsed": False, "action_filter": None}
+    limit_panel = ft.Container(padding=18, border_radius=18, data="preserve_excel_fill")
+
+    def limit_articles() -> list[dict]:
+        data = limit_state.get("data") or {}
+        return list(data.get("articles") or [])
+
+    def limit_current(article: dict) -> int | None:
+        return int(round(article["price"])) if article.get("price") else None
+
+    def limit_chosen(article: dict) -> int | None:
+        return limit_state["prices"].get(article["offer_id"], limit_current(article))
+
+    def limit_changed() -> dict[str, int]:
+        return {a["offer_id"]: limit_state["prices"][a["offer_id"]] for a in limit_articles()
+                if a["offer_id"] in limit_state["prices"] and limit_state["prices"][a["offer_id"]] != limit_current(a)}
+
+    def limit_load(_e=None) -> None:
+        if limit_state["busy"] or limit_price is None:
+            return
+        limit_state.update(busy=True, error=None, started=True)
+        render_limit_panel()
+
+        def worker() -> None:
+            try:
+                data = limit_price.load_board(ROOT)
+                if not data.get("ok"):
+                    limit_state["error"] = data.get("message")
+                limit_state["data"] = data
+                limit_state["prices"] = {}
+            except Exception as exc:
+                limit_state["error"] = str(exc)
+            finally:
+                limit_state["busy"] = False
+            ui_queue.put(("call", render_limit_panel))
+
+        page.run_thread(worker)
+
+    def limit_elasticity() -> float:
+        if limit_state["elasticity"] is None:
+            limit_state["elasticity"] = limit_price.load_elasticity(ROOT) if limit_price else 2.0
+        return float(limit_state["elasticity"])
+
+    def limit_set_elasticity(e: ft.ControlEvent) -> None:
+        limit_state["elasticity"] = float(e.control.value)
+        try:
+            limit_price.save_elasticity(ROOT, limit_state["elasticity"])
+        except OSError as exc:
+            toast(f"Не удалось сохранить настройку: {exc}", True)
+        render_limit_panel()
+
+    def limit_set_all(mode: str) -> None:
+        for article in limit_articles():
+            price = limit_price.balance_price(article, limit_elasticity()) if mode == "auto" else limit_current(article)
+            if price is not None:
+                limit_state["prices"][article["offer_id"]] = price
+        render_limit_panel()
+
+    def limit_money(value) -> str:
+        return _format_currency(value) if value else "—"
+
+    def limit_range(article: dict) -> tuple[int, int]:
+        values = [v for v in (article.get("min_price"), article.get("desired_price"), article.get("price"), article.get("ozon_min"))
+                  if v] + [a["threshold"] for a in article["actions"]]
+        low, high = math.floor(min(values) * 0.95), math.ceil(max(values) * 1.03)
+        return low, max(high, low + 10)
+
+    def limit_band(low: int, high: int, start: float, end: float, color: str, height: int, tooltip: str | None = None) -> ft.Control:
+        """Отрезок [start, end] на шкале [low, high] — те же пропорции, что у ползунка под ним."""
+        span = high - low
+        left = max(0, int((min(start, end) - low) / span * 1000))
+        mid = max(1, int((max(start, end) - min(start, end)) / span * 1000))
+        right = max(0, 1000 - left - mid)
+        parts: list[ft.Control] = []
+        if left:
+            parts.append(ft.Container(expand=left, height=height))
+        parts.append(ft.Container(expand=mid, height=height, bgcolor=color, border_radius=height, tooltip=tooltip, data="preserve_excel_fill"))
+        if right:
+            parts.append(ft.Container(expand=right, height=height))
+        return ft.Row(parts, spacing=0)
+
+    def limit_status(article: dict, price: int) -> list[ft.Control]:
+        """Компактные значки акций при этой цене: цвет акции, участие с бустингом, войдёт / выйдет."""
+        pal = dash_pal()
+        chips: list[ft.Control] = []
+        for entry in limit_price.evaluate(article, price):
+            color = action_color(entry["action_id"])
+            boost = entry["boost"]
+            future = entry["change"] == "future"
+            when = f"с {entry['start'][8:10]}.{entry['start'][5:7]} " if entry.get("start") else ""
+            if future and entry["participating"]:
+                own = entry["action_price"]
+                below = bool(own and article.get("min_price") and own < article["min_price"])
+                text, text_color = f"{when}по {limit_money(own)}", (pal["bad"] if below else pal["ink"])
+            elif future:
+                text, text_color = f"{when}при ≤ {limit_money(entry['threshold'])}", pal["muted"]
+            elif entry["in"]:
+                text, text_color = (f"{boost:g}%" if boost is not None else "в акции"), pal["ink"]
+            else:
+                text, text_color = f"≤ {limit_money(entry['threshold'])}", pal["muted"]
+            change = {"enter": ("↑ войдёт", pal["good"]), "exit": ("↓ выйдет", pal["bad"])}.get(entry["change"])
+            active = entry["in"] and not future or (future and entry["participating"])
+            tooltip = (f"{entry['name']}\nПорог участия: {limit_money(entry['threshold'])}"
+                       + (f"\nПорог акции у Ozon — {limit_money(entry['ozon_threshold'])}, но товар сейчас в ней по "
+                          f"{limit_money(entry['action_price'])}: считаем, что по этой цене он остаётся" if entry.get("above_limit") else "")
+                       + ("\nАкция ещё не началась: участие «с даты» со своей ценой, ползунок его не меняет" if future else "")
+                       + (f"\nБаллы Ozon за скидку: {entry['points']:g}% от цены продажи — в счёт комиссии и услуг, входят в прибыль"
+                          if entry.get("points") else "")
+                       + ("\nДобавлен Ozon автоматически" if entry["added_by_ozon"] else "")
+                       + ("\nOzon: скидка не соответствует условиям — 3 рабочих дня на исправление цены" if entry["alert"] else ""))
+            chips.append(ft.Container(
+                padding=ft.Padding.only(left=4, right=8, top=3, bottom=3), border_radius=999, data="preserve_excel_fill",
+                bgcolor=pal["surface"], border=ft.Border.all(1, color if active else pal["border"]), tooltip=tooltip,
+                content=ft.Row([
+                    ft.Container(width=14, height=14, border_radius=7, bgcolor=color if active else None,
+                                 border=None if active else ft.Border.all(2, color), data="preserve_excel_fill"),
+                    dtext(short_action_name(entry["name"]), 11, pal["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                    dtext(text, 11, text_color, ft.FontWeight.W_700),
+                    *([dtext(f"распродажа +{limit_price.SALE_BONUS:g}%", 11, pal["warn"], ft.FontWeight.W_700)]
+                      if entry.get("sale") and entry["in"] and not future else []),
+                    *([dtext(change[0], 11, change[1], ft.FontWeight.W_700)] if change else []),
+                    *([dtext("⚠", 11, pal["warn"])] if entry["alert"] else []),
+                ], spacing=5, tight=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ))
+        return chips
+
+    def limit_warnings(article: dict, price: int) -> list[tuple[str, str]]:
+        """Предупреждения (текст, цвет). Пусто — всё в порядке."""
+        pal = dash_pal()
+        notes = []
+        if article.get("min_price") and price < article["min_price"]:
+            notes.append((f"ниже вашей минимальной {limit_money(article['min_price'])} — продажа в минус", pal["bad"]))
+        if article.get("ozon_min") and price < article["ozon_min"]:
+            notes.append((f"ниже ограничения Ozon {limit_money(article['ozon_min'])} — Ozon опустит его до этой цены", pal["warn"]))
+        for entry in article["actions"]:
+            own = entry["action_price"]
+            if entry["start"] and entry["participating"] and own and article.get("min_price") and own < article["min_price"]:
+                notes.append((f"с {entry['start'][8:10]}.{entry['start'][5:7]} в «{short_action_name(entry['name'])}» по {limit_money(own)} — "
+                              "ниже минимальной; уберите в кабинете Ozon (участие «с даты» ползунок не меняет)", pal["bad"]))
+        if any(entry["alert"] for entry in article["actions"]):
+            notes.append(("Ozon пометил скидку как несоответствующую условиям: 3 рабочих дня на исправление", pal["warn"]))
+        return notes
+
+    def limit_row(article: dict, live: dict) -> ft.Control:
+        """Карточка артикула в одну строку: сведения · шкала с ползунком и значками акций · цена, прибыль, бустинг."""
+        pal = dash_pal()
+        low, high = limit_range(article)
+        current = limit_current(article)
+        chosen = limit_chosen(article) or current or low
+        chosen = min(max(chosen, low), high)
+        price_big, profit_big, boost_big = (dtext("", 20, weight=ft.FontWeight.W_800, max_lines=1, no_wrap=True) for _ in range(3))
+        price_note, profit_note, boost_note = (dtext("", 11, pal["muted"]) for _ in range(3))
+        status_row = ft.Row(spacing=6, run_spacing=6, wrap=True)
+        warning_text = dtext("", 11, pal["muted"], visible=False)
+        best = limit_price.balance_price(article, limit_elasticity())
+        best_button = ft.Container(
+            visible=bool(best), padding=ft.Padding.symmetric(horizontal=8, vertical=3), border_radius=999, data="preserve_excel_fill",
+            border=ft.Border.all(1, pal["accent"]), tooltip="Цена с наибольшей оценкой «прибыль с продажи × продажи» между минимальной и желательной",
+            content=ft.Row([ft.Icon(ft.Icons.AUTO_FIX_HIGH, size=12, color=pal["accent"]), dtext(f"баланс {limit_money(best)}", 11, pal["accent"], ft.FontWeight.W_700)],
+                           spacing=4, tight=True),
         )
 
-    def promo_item_lines(item: dict) -> list[tuple[str, str | None]]:
-        dark = current_dark["value"]
-        warn = "#E0A15F" if dark else ACCENT
-        good = "#70D4BC" if dark else PRIMARY
-        kind = item["kind"]
-        if kind == "watch":
-            return [
-                (f"Максимум акции {_format_currency(item['max_action_price'])} · минимальная {_format_currency(item['min_price'])}", None),
-                (item.get("note") or "", warn),
-                (f"Минимальная цена в Ozon — {_format_currency(item['ozon_min_price'])}, поэтому Ozon считает эту цену допустимой."
-                 if item.get("ozon_min_price") else "Минимальная цена в Ozon не задана — Ozon может добавить товар по любой цене.", None),
-                ("Чтобы Ozon не добавлял товар дешевле вашей минимальной, отправьте минимальные цены в Ozon "
-                 "(«Цены и скидки» → «Обновить минимальные цены в Ozon»). Здесь ничего не отправляется.", None),
-            ]
-        if kind == "remove":
-            if item.get("action_start"):
-                day, month = item["action_start"][8:10], item["action_start"][5:7]
-                price_line = (f"С {day}.{month} цена в акции станет {_format_currency(item['action_price'])}"
-                              f" — ниже минимальной {_format_currency(item['min_price'])}")
-            else:
-                price_line = f"Цена в акции {_format_currency(item['action_price'])} ниже минимальной {_format_currency(item['min_price'])}"
-            exit_price, product_price = item.get("exit_price"), item.get("product_price")
-            if exit_price and product_price and exit_price <= product_price:
-                price_line += (f" · для выхода цена товара останется {_format_currency(product_price)}"
-                               f" (лимит акции {_format_currency(item.get('max_action_price'))})")
-            elif exit_price:
-                price_line += (f" · для выхода из акции цена станет {_format_currency(exit_price)}"
-                               f" (лимит акции {_format_currency(item.get('max_action_price'))})")
-            else:
-                price_line += " · Ozon не сообщил лимит акции — вывести нельзя"
-        elif kind == "raise":
-            price_line = (
-                f"Цена {_format_currency(item['current_price'])} → {_format_currency(item['action_price'])}"
-                f" · минимальная {_format_currency(item['min_price'])} · желаемая {_format_currency(item['desired_price'])}"
-            )
-        else:
-            price_line = (
-                f"Цена в акции {_format_currency(item['action_price'])} · минимальная {_format_currency(item['min_price'])}"
-                f" · максимум акции {_format_currency(item['max_action_price'])}"
-            )
-        lines: list[tuple[str, str | None]] = [(price_line, None)]
-        if item.get("note"):
-            lines.append((item["note"], warn if item.get("added_by_ozon") else None))
+        def pct(value: float) -> str:
+            return f"{value:.1f}%".replace(".", ",").replace(",0%", "%")
 
-        boost_now, boost_new = item.get("boost_now"), item.get("boost_new")
-        boost_min, boost_max = item.get("boost_min"), item.get("boost_max")
-        is_range = boost_min is not None and boost_max is not None and boost_min != boost_max
-        range_text = f" (в этой акции {promo_boost(boost_min)}–{promo_boost(boost_max)})" if is_range else ""
-        if kind == "remove":
-            if boost_now is not None:
-                lines.append((f"Бустинг {promo_boost(boost_now)} будет потерян", warn))
-        elif kind == "raise":
-            if boost_now is None or boost_new is None:
-                lines.append(("Бустинг: Ozon не сообщает, как изменится", None))
-            elif boost_new < boost_now:
-                lines.append((f"Бустинг {promo_boost(boost_now)} → {promo_boost(boost_new)}{range_text}: товар будут показывать реже", warn))
-            else:
-                lines.append((f"Бустинг не изменится: {promo_boost(boost_new)}", good))
-        else:
-            if boost_new is None:
-                lines.append(("Бустинг: Ozon не сообщает", None))
-            else:
-                lines.append((f"Бустинг {promo_boost(boost_new)}{range_text}", good))
-        max_boost_price = item.get("max_boost_price")
-        if kind != "remove" and is_range and max_boost_price and boost_new is not None and boost_new < boost_max:
-            reachable = "не ниже минимальной" if max_boost_price >= item["min_price"] else "ниже минимальной — в убыток"
-            lines.append((f"Максимальный бустинг {promo_boost(boost_max)} — при цене {_format_currency(max_boost_price)} ({reachable})", None))
+        def refresh(price: int, push: bool) -> None:
+            profit = limit_price.unit_profit(article, price)
+            boost = limit_price.total_boost(article, price)
+            sale = limit_price.sale_bonus(article, price)
+            now_profit = limit_price.unit_profit(article, current) if current else None
+            now_effect = (limit_price.total_boost(article, current) + limit_price.sale_bonus(article, current)) if current else 0.0
+            moved = bool(current and price != current)
+            price_big.value = limit_money(price)
+            price_big.color = pal["accent"] if moved else pal["ink"]
+            price_note.value = (f"{'+' if price > current else '−'}{_format_currency(abs(price - current))} к {limit_money(current)}" if moved
+                                else "текущая")
+            profit_big.value = _format_currency(round(profit)) if profit is not None else "—"
+            profit_big.color = pal["bad"] if profit is not None and profit < 0 else (pal["good"] if profit is not None else pal["muted"])
+            profit_note.value = (f"сейчас {_format_currency(round(now_profit))}" if now_profit is not None and moved
+                                 else ("с продажи" if profit is not None else "нет отчёта или себестоимости"))
+            points = limit_price.points_percent(article, price)
+            if points and profit is not None:
+                profit_note.value += f" · в т.ч. баллы Ozon {pct(points)}: +{_format_currency(round(price * points / 100))}"
+            effect = boost + sale
+            boost_big.value = f"+{effect:.0f}%" if effect else "0%"
+            boost_big.color = pal["ink"] if effect else pal["muted"]
+            parts = ([f"бустинг {pct(boost)}"] if boost else []) + ([f"распродажа {pct(sale)}"] if sale else [])
+            boost_note.value = (" + ".join(parts) or "нет акций") + (f" · сейчас +{pct(now_effect)}" if moved and now_effect else
+                                                                     (" · сейчас 0%" if moved else ""))
+            status_row.controls = limit_status(article, price)
+            notes = limit_warnings(article, price)
+            warning_text.visible = bool(notes)
+            warning_text.value = "⚠ " + " · ".join(text for text, _ in notes) if notes else ""
+            warning_text.color = notes[0][1] if notes else pal["muted"]
+            if push and page.controls:
+                # Счётчики в шапке панели — сразу, без перерисовки всех артикулов.
+                count = len(limit_changed())
+                live["apply"].content = f"Применить в Ozon ({count})"
+                live["apply"].disabled = not count or bool(limit_state["busy"])
+                live["reset"].disabled = not count or bool(limit_state["busy"])
+                live["changed"].value = f"Изменённые ({count})"
+                page.update(stats, status_row, warning_text, live["apply"], live["reset"], live["changed"])
 
-        visibility = []
-        if item.get("views") is not None:
-            visibility.append(f"увидели {_format_number(item['views'])} покупателей")
-        if item.get("position") is not None:
-            visibility.append(f"средняя позиция {item['position']:.1f}".replace(".", ","))
-        if visibility:
-            lines.append(("Поиск за 14 дней: " + " · ".join(visibility), None))
-        return lines
+        def on_change(e: ft.ControlEvent) -> None:
+            price = int(round(float(e.control.value)))
+            limit_state["prices"][article["offer_id"]] = price
+            refresh(price, push=True)
 
-    def promo_selected_count() -> int:
-        plan = promo_state.get("plan")
-        if not isinstance(plan, dict):
-            return 0
-        return sum(1 for item in plan.get("items") or [] if item.get("selected", True))
+        def stat(label: str, big: ft.Control, note: ft.Control) -> ft.Control:
+            return ft.Column([dtext(label, 11, pal["muted"], ft.FontWeight.W_600), big, note], spacing=0, expand=True)
 
-    def refresh_promo_confirm() -> None:
-        count = promo_selected_count()
-        promo_confirm_button.content = f"Отправить в Ozon ({count})"
-        promo_confirm_button.disabled = count == 0
-        page.update(promo_confirm_button)
+        stats = ft.Row([stat("Цена", price_big, price_note), stat("Прибыль", profit_big, profit_note), stat("Эффект акций", boost_big, boost_note)],
+                       spacing=10, vertical_alignment=ft.CrossAxisAlignment.START)
+        refresh(chosen, push=False)
 
-    def promo_plan_rows(plan: dict) -> list[ft.Control]:
-        dark = current_dark["value"]
-        items = plan.get("items") or []
-        rows: list[ft.Control] = []
-        for kind, label in promo_groups:
-            group = [item for item in items if item["kind"] == kind]
-            if not group:
-                continue
-            rows.append(
-                ft.Container(
-                    padding=ft.Padding.only(top=6, bottom=2),
-                    content=ft.Text(f"{label} · {len(group)}", size=14, weight=ft.FontWeight.W_700, color="#F3F4F6" if dark else TEXT),
-                )
-            )
-            for item in group:
-                def on_toggle(e: ft.ControlEvent, target=item) -> None:
-                    target["selected"] = bool(e.control.value)
-                    refresh_promo_confirm()
+        # Шкала: тонкая дорожка, зелёный отрезок мин–жел и засечки порогов акций цветом акции (левее засечки — товар в акции).
+        span = high - low
+        track_layers: list[ft.Control] = [
+            ft.Container(left=0, right=0, top=7, height=4, bgcolor=pal["separator"], border_radius=2, data="preserve_excel_fill"),
+            ft.Container(left=0, right=0, top=5, height=8, content=limit_band(
+                low, high, article["min_price"], article["desired_price"] or article["min_price"], pal["good"], 8,
+                f"Между минимальной {limit_money(article['min_price'])} и желательной {limit_money(article['desired_price'])}")),
+        ]
+        for entry in sorted(article["actions"], key=lambda e: e["threshold"]):
+            tick = max(3, int(span * 0.006))
+            track_layers.append(ft.Container(left=0, right=0, top=0, height=18, content=limit_band(
+                low, high, entry["threshold"] - tick / 2, entry["threshold"] + tick / 2, action_color(entry["action_id"]), 18,
+                f"{entry['name']}: участие при цене до {limit_money(entry['threshold'])}")))
+        track = ft.Container(padding=ft.Padding.symmetric(horizontal=LIMIT_SLIDER_INSET), content=ft.Stack(track_layers, height=18))
+        slider = ft.Slider(min=low, max=high, value=chosen, divisions=high - low, label="{value}", round=0,
+                           active_color=pal["accent"], padding=ft.Padding.symmetric(horizontal=LIMIT_SLIDER_INSET), on_change=on_change)
 
-                # Предупреждения только для сведения: отправлять нечего.
-                checkbox = None if kind == "watch" else ft.Checkbox(value=item.get("selected", True), on_change=on_toggle)
-                rows.append(promo_row(f"{item['offer_id']} — {item['action_name']}", promo_item_lines(item), checkbox=checkbox))
-        return rows
+        def go_best(_e=None) -> None:
+            price = min(max(best, low), high)
+            slider.value = price
+            limit_state["prices"][article["offer_id"]] = price
+            refresh(price, push=False)
+            page.update(slider)
+            refresh(price, push=True)
 
-    def promo_plan_summary(plan: dict, mode: str) -> str:
-        items = plan.get("items") or []
-        parts = [str(plan.get("message") or "")]
-        if mode == "remove":
-            if any(item["kind"] == "raise" for item in items):
-                parts.append("Где акция позволяет цену не ниже минимальной, товар остаётся в ней с поднятой ценой и сохраняет бустинг.")
-            parts.append("При единой цене Ozon товар выходит из акции, только когда его цена выше лимита акции: "
-                         "отмеченным товарам будет установлена указанная цена продавца (не ниже минимальной, лимита + 1 ₽ "
-                         "и текущей цены товара). Цену для покупателя Ozon посчитает сам со своими скидками.")
-        else:
-            parts.append("Отмеченные товары будут добавлены в акции или получат новую цену в Ozon.")
-            if any(item["kind"] == "watch" for item in items):
-                parts.append("Предупреждения об автодобавлении — только для сведения: Ozon может сам добавить эти товары "
-                             "по цене ниже вашей минимальной.")
-            if any(item["kind"] == "raise" and not item.get("selected", True) for item in items):
-                parts.append("Подъёмы цены, которые снижают бустинг, по умолчанию не отмечены — решите сами, что важнее: маржа или показы.")
-        if not plan.get("visibility_available"):
-            parts.append("Показы и позицию в поиске Ozon по API для этих товаров не отдаёт — ориентируйтесь на процент бустинга.")
-        return " ".join(parts)
+        best_button.on_click = go_best
+        info = ft.Column([
+            ft.Row([dtext(article["offer_id"], 16, weight=ft.FontWeight.W_800), best_button], spacing=8,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True),
+            dtext(f"мин. {limit_money(article['min_price'])} · жел. {limit_money(article['desired_price'])}", 11, pal["muted"]),
+            *([dtext(f"ограничение Ozon {limit_money(article['ozon_min'])}", 11,
+                     pal["warn"] if article.get("min_price") and article["ozon_min"] < article["min_price"] else pal["muted"],
+                     tooltip="Минимальная цена в Ozon («ограничение для акций»). Если она ниже вашей минимальной, Ozon может сам "
+                             "добавить товар в акцию и опустить цену. Обновить: «Цены и скидки» → «⋯» → «Обновить минимальные цены в Ozon».")]
+              if article.get("ozon_min") else []),
+        ], spacing=2)
+        scale = ft.Column([
+            track,
+            slider,
+            ft.Row([dtext(limit_money(low), 10, pal["muted"]), dtext(limit_money(high), 10, pal["muted"])],
+                   alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            status_row,
+            warning_text,
+        ], spacing=2)
+        return ft.Container(
+            padding=ft.Padding.only(left=16, right=16, top=10, bottom=10), border_radius=14, data="preserve_excel_fill",
+            border=ft.Border.all(1, pal["border"]),
+            content=ft.ResponsiveRow([
+                ft.Container(col={"xs": 12, "md": 2}, content=info),
+                ft.Container(col={"xs": 12, "md": 6}, content=scale),
+                ft.Container(col={"xs": 12, "md": 4}, content=stats),
+            ], spacing=16, run_spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
+        )
 
-    def show_promo_dialog(title: str, summary: str, rows: list[ft.Control], can_confirm: bool, busy: bool = False) -> None:
-        dark = current_dark["value"]
-        promo_dialog.bgcolor = "#232A2F" if dark else "#FFFDF8"
-        promo_dialog_title.value = title
-        promo_dialog_title.color = "#F3F4F6" if dark else TEXT
-        promo_dialog_summary.value = summary
-        promo_dialog_summary.color = "#B6C0BC" if dark else MUTED
-        promo_dialog_list.controls = rows
-        promo_confirm_button.visible = can_confirm
-        promo_confirm_button.content = f"Отправить в Ozon ({promo_selected_count()})"
-        promo_confirm_button.disabled = busy or promo_selected_count() == 0
-        promo_confirm_button.bgcolor = DANGER if promo_state["mode"] == "remove" else PRIMARY
-        promo_cancel_button.disabled = busy
-        promo_cancel_button.content = "Отмена" if can_confirm else "Закрыть"
-        promo_dialog.open = True
-        page.update(promo_dialog)
-
-    def close_promo_dialog(_e=None) -> None:
-        promo_dialog.open = False
-        promo_state["plan"] = None
-        page.update(promo_dialog)
-
-    def open_promo_plan(mode: str) -> None:
-        if build_action_removal_plan is None:
-            toast(f"Модуль акций недоступен: {PRICING_IMPORT_ERROR or 'ошибка импорта'}", True)
+    def limit_confirm(_e=None) -> None:
+        changes = limit_changed()
+        if not changes:
             return
-        if not job_lock.acquire(blocking=False):
-            toast("Дождитесь завершения текущей операции.", True)
-            return
-        promo_state["mode"] = mode
-        promo_state["plan"] = None
-        title = promo_titles[mode]
-        set_status(title, "Собираю актуальные данные акций из Ozon...", ACCENT, busy=True, cancellable=False)
-        show_promo_dialog(title, "Собираю цены, бустинг и видимость товаров из Ozon. В Ozon пока ничего не отправляется.", [promo_spinner()], can_confirm=False, busy=True)
+        articles = [a for a in limit_articles() if a["offer_id"] in changes]
+        lines: list[ft.Control] = []
+        for article in articles:
+            price = changes[article["offer_id"]]
+            result = limit_price.evaluate(article, price)
+            enter = [e["name"] for e in result if e["change"] == "enter"]
+            leave = [e["name"] for e in result if e["change"] == "exit"]
+            text = f"{article['offer_id']}: {limit_money(limit_current(article))} → {limit_money(price)}"
+            if enter:
+                text += " · войдёт: " + ", ".join(enter)
+            if leave:
+                text += " · выйдет: " + ", ".join(leave)
+            if not limit_price.plan_changes([article], {article["offer_id"]: price}):
+                text += " · вне акций — меняется цена товара"
+            lines.append(ft.Text(text, size=13))
+        dark = current_dark["value"]
 
-        def worker() -> None:
-            try:
-                builder = {"remove": build_action_removal_plan, "add": build_action_add_plan}[mode]
-                plan = builder(ROOT)
-            except Exception as exc:
-                plan = {"ok": False, "message": f"Не удалось собрать список: {exc}", "items": []}
-            finally:
-                job_lock.release()
-            items = plan.get("items") or []
-            message = str(plan.get("message") or "")
-            set_status(title, message, PRIMARY if plan.get("ok") else DANGER, busy=False)
-            if not items:
-                show_promo_dialog(title, message, [], can_confirm=False)
+        def run(_e=None) -> None:
+            page.pop_dialog()
+            if not job_lock.acquire(blocking=False):
+                toast("Дождитесь завершения текущей операции.", True)
                 return
-            promo_state["plan"] = plan
-            show_promo_dialog(title, promo_plan_summary(plan, mode), promo_plan_rows(plan), can_confirm=True)
+            title = "Предельная цена"
+            set_status(title, "Отправляю цены в Ozon и проверяю участие в акциях…", ACCENT, busy=True, cancellable=False)
 
-        page.run_thread(worker)
+            def worker() -> None:
+                try:
+                    result = limit_price.apply_prices(articles, changes)
+                except Exception as exc:
+                    result = {"ok": False, "done": 0, "message": f"Не удалось: {exc}", "failed": [], "errors": []}
+                finally:
+                    job_lock.release()
+                message = str(result.get("message") or "")
+                append_log(f"{title}: {message}")
+                for item in result.get("items") or []:
+                    append_log(f"  {item['offer_id']} · {item['action_name']}: {item['change']} по {item['price']} ₽")
+                for item in result.get("failed") or []:
+                    append_log(f"  ✖ {item['offer_id']} · {item['action_name']}: {item['reason']}")
+                for error in result.get("errors") or []:
+                    append_log(f"  ✖ {error}")
+                for notice in result.get("notices") or []:
+                    append_log(f"  ⚠ {notice['text']}")
+                set_status(title, message, PRIMARY if result.get("ok") else DANGER, busy=False)
+                ui_queue.put(("call", lambda r=result: limit_show_result(r)))
+                ui_queue.put(("call", limit_load))
+                if result.get("done"):
+                    ui_queue.put(("run_job", "Обновление цен и акций", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "refresh-pricing"]))
+                    if calendar_state["started"]:
+                        ui_queue.put(("call", calendar_load))
 
-    def confirm_promo_plan(_e=None) -> None:
-        plan = promo_state.get("plan")
-        mode = promo_state.get("mode")
-        if not isinstance(plan, dict) or mode not in promo_titles or promo_selected_count() == 0:
+            page.run_thread(worker)
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Отправить цены в Ozon ({len(changes)})?", size=18, weight=ft.FontWeight.W_800, color="#F3F4F6" if dark else TEXT),
+            bgcolor="#232A2F" if dark else "#FFFDF8",
+            content=ft.Container(width=760, height=min(420, 60 + 26 * len(lines)), content=ft.Column([
+                ft.Text("Цена товара одна на все акции: ниже — что изменится по каждому артикулу. После отправки участие "
+                        "перечитывается из Ozon.", size=12, color="#B6C0BC" if dark else MUTED),
+                *lines,
+            ], spacing=6, scroll=ft.ScrollMode.AUTO)),
+            actions=[ft.TextButton("Отмена", on_click=lambda _e: page.pop_dialog()),
+                     ft.Button("Отправить в Ozon", bgcolor=PRIMARY, color="white", on_click=run)],
+            actions_alignment=ft.MainAxisAlignment.END,
+        ))
+
+    def limit_show_result(result: dict) -> None:
+        """Итог отправки: что применилось, что сообщил Ozon (сдвиг ограничения, выход из акций) и что не прошло."""
+        dark = current_dark["value"]
+        ink, muted = ("#F3F4F6", "#B6C0BC") if dark else (TEXT, MUTED)
+        warn, bad, good = ("#E0A15F", "#FF8F82", "#5FD0B1") if dark else (ACCENT, DANGER, PRIMARY)
+        notices = result.get("notices") or []
+        lowered = [n for n in notices if n["kind"] == "limit"]
+        rows: list[ft.Control] = [ft.Text(str(result.get("message") or ""), size=13, color=good if result.get("ok") else bad,
+                                          weight=ft.FontWeight.W_600)]
+        if lowered:
+            rows.append(ft.Text("Ozon опустил «ограничение для акций»", size=14, weight=ft.FontWeight.W_700, color=warn))
+            rows += [ft.Text("• " + n["text"], size=12, color=ink) for n in lowered]
+            rows.append(ft.Text("Если цена ниже вашей минимальной, Ozon может сам добавить товар в акцию в минус. Вернуть ограничение: "
+                                "«Цены и скидки» → «⋯» → «Обновить минимальные цены в Ozon».", size=12, color=muted))
+        left = [n for n in notices if n["kind"] == "left"]
+        if left:
+            rows.append(ft.Text("Вышли из акций", size=14, weight=ft.FontWeight.W_700, color=ink))
+            rows += [ft.Text("• " + n["text"], size=12, color=ink if n.get("expected") else warn) for n in left]
+        other = [n for n in notices if n["kind"] == "other"]
+        if other:
+            rows.append(ft.Text("Ozon также сообщил", size=14, weight=ft.FontWeight.W_700, color=ink))
+            rows += [ft.Text("• " + n["text"], size=12, color=muted) for n in other]
+        problems = [f"{item['offer_id']} · {item['action_name']}: {item['reason']}" for item in result.get("failed") or []] + list(result.get("errors") or [])
+        if problems:
+            rows.append(ft.Text("Не применилось", size=14, weight=ft.FontWeight.W_700, color=bad))
+            rows += [ft.Text("• " + text, size=12, color=ink) for text in problems]
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Предельная цена: итог", size=18, weight=ft.FontWeight.W_800, color=ink),
+            bgcolor="#232A2F" if dark else "#FFFDF8",
+            content=ft.Container(width=700, content=ft.Column(rows, spacing=6, tight=True, scroll=ft.ScrollMode.AUTO)),
+            actions=[ft.Button("Понятно", bgcolor=PRIMARY, color="white", on_click=lambda _e: page.pop_dialog())],
+            actions_alignment=ft.MainAxisAlignment.END,
+        ))
+
+    def limit_set_filter(mode: str) -> None:
+        limit_state["filter"] = mode
+        limit_state["shown"] = LIMIT_PAGE
+        render_limit_panel()
+
+    def limit_filter_action(action_id) -> None:
+        """Показать в панели только товары, которым доступна эта акция (None — все). Вызывается из календаря и легенды."""
+        limit_state.update(action_filter=action_id, collapsed=False, shown=LIMIT_PAGE)
+        render_limit_panel()
+        render_actions_calendar()
+
+    def limit_toggle_collapsed(_e=None) -> None:
+        limit_state["collapsed"] = not limit_state["collapsed"]
+        render_limit_panel()
+
+    def limit_show_more(_e=None) -> None:
+        limit_state["shown"] = int(limit_state["shown"]) + LIMIT_PAGE
+        render_limit_panel()
+
+    def render_limit_panel(push_update: bool = True) -> None:
+        pal = dash_pal()
+        data = limit_state.get("data") or {}
+        articles = limit_articles()
+        changed = limit_changed()
+        busy = bool(limit_state["busy"])
+        apply_button = ft.Button(f"Применить в Ozon ({len(changed)})", icon=ft.Icons.SEND, bgcolor=PRIMARY, color="white",
+                                 disabled=not changed or busy, on_click=limit_confirm)
+        reset_button = ft.TextButton("Сбросить", disabled=busy or not changed, on_click=lambda _e: limit_set_all("reset"))
+        changed_text = dtext(f"Изменённые ({len(changed)})", 12, "#FFFFFF" if limit_state["filter"] == "changed" else pal["ink"], ft.FontWeight.W_600)
+        live = {"apply": apply_button, "reset": reset_button, "changed": changed_text}
+        loaded = str(data.get("loaded") or "")
+        help_text = ("Двигайте ползунок — сразу видно цену, прибыль с продажи, общий бустинг и в каких акциях будет товар. "
+                     "Зелёный отрезок — между минимальной и желательной ценой. Цветные засечки — пороги акций: пока цена левее "
+                     "засечки, товар в этой акции. Цвет акции один во всём разделе.\n\n"
+                     "Эффект акций = наибольший бустинг из акций (бустинги не складываются, как и в кабинете Ozon) + 30% за распродажу "
+                     "(«Чёрная пятница», «11.11» и т. п.), пока она идёт. Надбавки Ozon за цель и индекс цен сюда не входят.")
+        if data.get("economics_note"):
+            help_text += "\n\n" + str(data["economics_note"]) + " Прибыль с продажи = цена × (1 − комиссия) − логистика − себестоимость; " \
+                         "бустинг — наибольший из идущих акций, где товар будет при этой цене."
+        collapsed = bool(limit_state["collapsed"])
+        summary = f"{len(articles)} товаров" + (f" · изменено {len(changed)}" if changed else "") if articles else ""
+        header = ft.Row([
+            ft.IconButton(icon=ft.Icons.EXPAND_MORE if collapsed else ft.Icons.EXPAND_LESS, icon_size=20,
+                          tooltip="Развернуть" if collapsed else "Свернуть", on_click=limit_toggle_collapsed),
+            dtext("Предельная цена", 18, weight=ft.FontWeight.W_800),
+            ft.Icon(ft.Icons.INFO_OUTLINE, size=16, color=pal["muted"], tooltip=help_text),
+            dtext(summary, 12, pal["muted"]) if collapsed else ft.Container(),
+        ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        toolbar = ft.Row([
+            ft.Button("Подобрать баланс", icon=ft.Icons.AUTO_FIX_HIGH, bgcolor=ACCENT, color="white", disabled=busy or not articles,
+                      tooltip="Каждому артикулу — цена между минимальной и желательной с наибольшей оценкой «прибыль с продажи × продажи»: "
+                              "продажи растут от бустинга и от более низкой цены. В Ozon ничего не отправляется до «Применить».",
+                      on_click=lambda _e: limit_set_all("auto")),
+            ft.Dropdown(label="Реакция покупателей на цену", width=230, dense=True, value=str(limit_elasticity()) if limit_price else None,
+                        options=[ft.dropdown.Option(str(value), f"{title} ({value:g})") for value, title in
+                                 (limit_price.ELASTICITY_PRESETS.items() if limit_price else [])],
+                        tooltip="Насколько продажи растут при снижении цены. Слабая (1): −10% цены ≈ +10% продаж; средняя (2) — +20%; "
+                                "сильная (3) — +30%. Влияет только на «Подобрать баланс» и «Лучший баланс».",
+                        on_select=limit_set_elasticity),
+            reset_button,
+            apply_button,
+            ft.IconButton(icon=ft.Icons.REFRESH, tooltip="Обновить из Ozon", disabled=busy, on_click=limit_load),
+        ], spacing=8, run_spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True)
+        toolbar.alignment = ft.MainAxisAlignment.END
+        if collapsed:
+            limit_panel.content = ft.Row([header], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            limit_panel.padding = ft.Padding.symmetric(horizontal=12, vertical=6)
+            limit_panel.bgcolor = pal["surface"]
+            limit_panel.border = ft.Border.all(1, pal["border"])
+            if push_update and page.controls and host.controls and host.controls[0] is actions:
+                page.update(limit_panel)
             return
-        if not job_lock.acquire(blocking=False):
-            toast("Дождитесь завершения текущей операции.", True)
-            return
-        title = promo_titles[mode]
-        set_status(title, "Отправляю изменения в Ozon...", ACCENT, busy=True, cancellable=False)
-        show_promo_dialog(title, "Отправляю изменения в Ozon и проверяю, что они применились...", [promo_spinner()], can_confirm=True, busy=True)
-        promo_state["plan"] = None
+        limit_panel.padding = 18
+        controls: list[ft.Control] = [ft.ResponsiveRow([
+            ft.Container(col={"xs": 12, "lg": 3}, content=header),
+            ft.Container(col={"xs": 12, "lg": 9}, alignment=ft.Alignment(1, 0), content=toolbar),
+        ], run_spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)]
+        legend: dict[str, dict] = {}
+        for article in articles:
+            for entry in article["actions"]:
+                legend.setdefault(str(entry["action_id"]), entry)
+        register_action_colors(legend)
+        action_filter = limit_state.get("action_filter")
+        if action_filter is not None and str(action_filter) not in legend:
+            limit_state["action_filter"] = action_filter = None
+        if legend:
+            controls.append(ft.Row([
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=3), border_radius=999, data="preserve_excel_fill",
+                    border=ft.Border.all(1.5, action_color(action_id)) if str(action_filter) == action_id else ft.Border.all(1, "#00000000"),
+                    on_click=lambda _e, a=entry["action_id"]: limit_filter_action(None if limit_state.get("action_filter") == a else a),
+                    content=ft.Row([ft.Container(width=10, height=10, border_radius=5, bgcolor=action_color(action_id), data="preserve_excel_fill"),
+                        dtext(short_action_name(entry["name"]) + (f" · с {entry['start'][8:10]}.{entry['start'][5:7]}" if entry.get("start") else "")
+                              + (" · распродажа" if entry.get("sale") else ""), 11, pal["ink"])],
+                       spacing=5, tight=True),
+                    tooltip=entry["name"] + "\nНажмите — показать только товары этой акции"
+                            + (f"\nРаспродажа: пока акция идёт и товар в ней, к продажам +{limit_price.SALE_BONUS:g}% "
+                               "сверх бустинга (подборки, баннеры, спрос дня распродажи)" if entry.get("sale") else ""))
+                for action_id, entry in sorted(legend.items(), key=lambda item: action_color_slots.get(item[0], 0))
+            ], spacing=6, run_spacing=6, wrap=True))
+        if limit_price is None:
+            controls.append(dtext(f"Модуль предельной цены не загрузился: {LIMIT_IMPORT_ERROR}", 13, pal["bad"]))
+        if busy:
+            controls.append(ft.Row([ft.ProgressRing(width=20, height=20, stroke_width=2.4),
+                                    dtext("Загружаю акции, участников и кандидатов…", 13, pal["muted"])], spacing=10))
+        if limit_state.get("error"):
+            controls.append(dtext(f"Не удалось загрузить: {limit_state['error']}", 13, pal["bad"]))
+        if articles:
+            mode = limit_state["filter"]
+            visible = [a for a in articles if mode == "all" or (mode == "changed" and a["offer_id"] in changed)
+                       or (mode == "warn" and limit_warnings(a, limit_chosen(a) or 0))]
+            if action_filter is not None:
+                def in_action(article: dict) -> dict | None:
+                    return next((e for e in article["actions"] if str(e["action_id"]) == str(action_filter)), None)
+                # Сначала участники акции, затем те, кто может войти.
+                visible = sorted((a for a in visible if in_action(a)), key=lambda a: not in_action(a)["participating"])
 
-        def worker() -> None:
-            try:
-                result = execute_action_plan(plan, mode)
-            except Exception as exc:
-                result = {"ok": False, "done": 0, "message": f"Ошибка отправки в Ozon: {exc}", "rejected": [], "unconfirmed": [], "errors": []}
-            finally:
-                job_lock.release()
-            message = str(result.get("message") or "")
-            append_log(f"{title}: {message}")
-            failures = [
-                (f"{entry['offer_id']} — {entry['action_name']}", f"Ozon отклонил: {entry['reason']}")
-                for entry in result.get("rejected") or []
-            ]
-            failures += [
-                (f"{entry['offer_id']} — {entry['action_name']}", "Ozon принял запрос, но изменение не применилось")
-                for entry in result.get("unconfirmed") or []
-            ]
-            failures += [("Ошибка запроса", error) for error in result.get("errors") or []]
-            for primary, detail in failures:
-                append_log(f"  ✖ {primary}: {detail}")
-            rows = [promo_row(primary, [(detail, None)], DANGER) for primary, detail in failures]
-            set_status(title, message, PRIMARY if result.get("ok") else DANGER, busy=False)
-            show_promo_dialog(title, message, rows, can_confirm=False)
-            if result.get("done"):
-                # Обновляем лист «Акции» и цены в costs.xlsx после изменений.
-                ui_queue.put(("run_job", "Обновление цен и акций", [str(PYTHON), str(SCRIPTS / "ui_actions.py"), "refresh-pricing"]))
-                if calendar_state["started"]:
-                    ui_queue.put(("call", calendar_load))
+            def chip(label: str, key: str, text: ft.Control | None = None) -> ft.Control:
+                active = mode == key
+                return ft.Container(padding=ft.Padding.symmetric(horizontal=12, vertical=6), border_radius=999, data="preserve_excel_fill",
+                                    bgcolor=pal["accent"] if active else None, border=None if active else ft.Border.all(1, pal["border"]),
+                                    on_click=lambda _e, k=key: limit_set_filter(k),
+                                    content=text or dtext(label, 12, "#FFFFFF" if active else pal["ink"], ft.FontWeight.W_600))
 
-        page.run_thread(worker)
-
-    promo_cancel_button.on_click = close_promo_dialog
-    promo_confirm_button.on_click = confirm_promo_plan
-
+            filter_chip = []
+            if action_filter is not None:
+                entry = legend[str(action_filter)]
+                members = sum(1 for a in visible if any(str(e["action_id"]) == str(action_filter) and e["participating"] for e in a["actions"]))
+                filter_chip = [ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=10, vertical=5), border_radius=999, data="preserve_excel_fill",
+                    bgcolor=action_color(action_filter), on_click=lambda _e: limit_filter_action(None), tooltip="Снять фильтр по акции",
+                    content=dtext(f"{short_action_name(entry['name'])}: участвуют {members} из {len(visible)}  ✕", 12, "#FFFFFF", ft.FontWeight.W_700))]
+            controls.append(ft.Row([*filter_chip, chip(f"Все ({len(articles)})", "all"), chip("", "changed", changed_text),
+                                    chip("С предупреждениями", "warn"),
+                                    dtext(f"обновлено {loaded[11:16]}" if loaded else "", 11, pal["muted"])],
+                                   spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+            shown = int(limit_state["shown"])
+            controls += [limit_row(article, live) for article in visible[:shown]]
+            if len(visible) > shown:
+                rest = len(visible) - shown
+                controls.append(ft.Row([ft.TextButton(f"Показать ещё {min(rest, LIMIT_PAGE)} из {rest}", icon=ft.Icons.EXPAND_MORE,
+                                                      on_click=limit_show_more)], alignment=ft.MainAxisAlignment.CENTER))
+            if not visible:
+                controls.append(dtext("Под этот фильтр артикулов нет.", 12, pal["muted"]))
+        elif not busy and limit_state["started"] and not limit_state.get("error"):
+            controls.append(dtext(str(data.get("message") or "Нет артикулов с доступными акциями."), 13, pal["muted"]))
+        limit_panel.content = ft.Column(controls, spacing=10)
+        limit_panel.bgcolor = pal["surface"]
+        limit_panel.border = ft.Border.all(1, pal["border"])
+        if push_update and page.controls and host.controls and host.controls[0] is actions:
+            page.update(limit_panel)
     actions_calendar = ft.Container(padding=18, border_radius=18, data="preserve_excel_fill")
     auto_panel = ft.Container(padding=18, border_radius=18, data="preserve_excel_fill")
     actions = ft.Column(
         [
             ft.Text("Акции", size=26, weight=ft.FontWeight.W_800, color=TEXT),
-            ft.Text("Продвинутые промо-операции Ozon: удаление невыгодных и добавление выгодных товаров в акции.", size=13, color=MUTED),
-            ft.ResponsiveRow(
-                run_spacing=14,
-                spacing=14,
-                controls=[
-                    card(
-                        "Акции Ozon",
-                        "Удалить невыгодные (или поднять им цену, если акция позволяет), добавить выгодные товары или поднять цену участвующим. "
-                        "Проверяются и акции, которые ещё не начались. Перед отправкой покажем список с бустингом.",
-                        [
-                            ft.Column(
-                                [
-                                    ft.Button("Удалить невыгодные", bgcolor=DANGER, color="white", on_click=lambda _e: open_promo_plan("remove")),
-                                    ft.Button("Добавить и поднять цены", bgcolor=PRIMARY, color="white", on_click=lambda _e: open_promo_plan("add")),
-                                ],
-                                spacing=8,
-                            )
-                        ],
-                        width=420,
-                    ),
-                ],
-            ),
+            ft.Text("Предельная цена задаёт участие во всех акциях Ozon сразу: товар в акции, пока его цена не выше её порога.",
+                    size=13, color=MUTED),
             actions_calendar,
+            limit_panel,
             auto_panel,
         ],
         spacing=18,
@@ -6457,7 +6536,8 @@ def main(page: ft.Page) -> None:
             page.update(analysis_view)
 
     # ---------------------------------------------------------------- Акции: календарь
-    calendar_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False, "open": set(), "offset": 0}
+    calendar_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False, "open": set(), "offset": 0,
+                                         "expanded": False}
     CALENDAR_PAST_DAYS, CALENDAR_DAYS = 3, 35
     MONTHS_RU = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
     WEEKDAYS_RU = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
@@ -6497,77 +6577,89 @@ def main(page: ft.Page) -> None:
         render_actions_calendar()
 
     def render_actions_calendar(push_update: bool = True) -> None:
+        """
+        Календарь акций сверху раздела. Компактный (по умолчанию): строка на акцию — полоса на шкале по неделям, число
+        товаров и бустинг, «Товары ›» фильтрует ползунки предельной цены по этой акции. Развёрнутый: ещё даты, сколько
+        можно добавить, автодобавление Ozon и участники. Цвет акции — общий для раздела (action_color).
+        """
         pal = ads_palette()
         dark = pal["dark"]
-        bar_color = "#3987e5" if dark else "#2a78d6"
         today_color = "#FF9C8F" if dark else DANGER
         warn = "#E0A15F" if dark else ACCENT
-        grid_line = "#2F363B" if dark else "#ECEEF3"
-        week_line = "#46505A" if dark else "#D3D8E2"
-        weekend_bg = "#252B30" if dark else "#F4F5F8"
-        today_bg = "#3A2D30" if dark else "#FDEDEA"
-        label_width = 260
+        legend_color = "#4f93ea" if dark else "#2a78d6"  # образец полосы в легенде; сами полосы — цветом акции
+        week_line = "#2F363B" if dark else "#ECEEF3"
+        expanded = bool(calendar_state.get("expanded"))
+        label_width = 230 if expanded else 200
+        side_width = 150
         offset = int(calendar_state.get("offset") or 0)
         today = date.today()
         start = today - timedelta(days=CALENDAR_PAST_DAYS) + timedelta(days=offset)
         days = [start + timedelta(days=i) for i in range(CALENDAR_DAYS)]
         end = days[-1]
-
-        nav = ft.Row([
-            ft.IconButton(ft.Icons.CHEVRON_LEFT, tooltip="Неделя назад", on_click=lambda _e: calendar_shift(-7)),
-            ft.TextButton("Сегодня", on_click=lambda _e: calendar_shift(None), disabled=offset == 0),
-            ft.IconButton(ft.Icons.CHEVRON_RIGHT, tooltip="Неделя вперёд", on_click=lambda _e: calendar_shift(7)),
-            ads_text(f"{start:%d.%m} — {end:%d.%m.%Y}", 12, pal["muted"]),
-        ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER)
-        controls: list[ft.Control] = [ft.Row([
-            ads_text("Календарь акций", 16, weight=ft.FontWeight.W_800),
-            ft.TextButton("Обновить", icon=ft.Icons.REFRESH, on_click=calendar_load, disabled=bool(calendar_state["busy"])),
-            ft.Container(expand=True),
-            nav,
-        ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)]
         data = calendar_state["data"]
+
+        def segments(parts: list[tuple[int, ft.Control | None]]) -> ft.Control:
+            """Строка из отрезков по дням окна: (сколько дней, содержимое)."""
+            return ft.Row([ft.Container(expand=n, content=c) for n, c in parts if n > 0], spacing=0)
+
+        def week_grid(height: int) -> ft.Control:
+            # Тонкие линии только по понедельникам — вместо сетки по каждому дню.
+            parts, run = [], 0
+            for day in days:
+                if day.weekday() == 0 and run:
+                    parts.append(run)
+                    run = 0
+                run += 1
+            parts.append(run)
+            return ft.Row([ft.Container(expand=n, height=height, border=ft.Border.only(left=ft.BorderSide(1, week_line)) if i else None,
+                                        data="preserve_excel_fill") for i, n in enumerate(parts)], spacing=0)
+
+        def today_line(height: int) -> ft.Control | None:
+            if not start <= today <= end:
+                return None
+            before = (today - start).days
+            return segments([(before, None), (1, ft.Container(alignment=ft.Alignment(0, 0), content=ft.Container(
+                width=2, height=height, bgcolor=today_color, data="preserve_excel_fill"))), (CALENDAR_DAYS - before - 1, None)])
+
+        title_info = ""
+        if isinstance(data, dict):
+            running = [a for a in data["actions"] if a.get("start") and a.get("end") and date.fromisoformat(a["start"]) <= today <= date.fromisoformat(a["end"])]
+            upcoming_count = sum(1 for a in data["actions"] if a.get("start") and date.fromisoformat(a["start"]) > today)
+            title_info = f"идут {len(running)}" + (f" · скоро {upcoming_count}" if upcoming_count else "")
+        controls: list[ft.Control] = [ft.Row([
+            ads_text("Календарь акций", 15, weight=ft.FontWeight.W_800),
+            ads_text(title_info, 12, pal["muted"]),
+            ft.Container(expand=True),
+            ft.IconButton(ft.Icons.CHEVRON_LEFT, tooltip="Неделя назад", icon_size=18, on_click=lambda _e: calendar_shift(-7)),
+            ft.TextButton("Сегодня", on_click=lambda _e: calendar_shift(None), disabled=offset == 0),
+            ft.IconButton(ft.Icons.CHEVRON_RIGHT, tooltip="Неделя вперёд", icon_size=18, on_click=lambda _e: calendar_shift(7)),
+            ft.IconButton(ft.Icons.REFRESH, tooltip="Обновить акции", icon_size=18, on_click=calendar_load, disabled=bool(calendar_state["busy"])),
+            ft.TextButton("Свернуть" if expanded else "Подробнее", icon=ft.Icons.EXPAND_LESS if expanded else ft.Icons.EXPAND_MORE,
+                          on_click=lambda _e: calendar_toggle()),
+        ], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER)]
         if calendar_state["busy"] and not data:
-            controls.append(ft.Row([ft.ProgressRing(width=20, height=20, stroke_width=2.4), ads_text("Загружаю акции и участников…", 13, pal["muted"])], spacing=10))
+            controls.append(ft.Row([ft.ProgressRing(width=18, height=18, stroke_width=2.4), ads_text("Загружаю акции и участников…", 12, pal["muted"])], spacing=10))
         if calendar_state["error"]:
-            controls.append(ads_text(f"Не удалось загрузить акции: {calendar_state['error']}", 13, pal["bad"]))
-
-        def day_border(day: date) -> ft.Border:
-            return ft.Border.only(left=ft.BorderSide(1, week_line if day.weekday() == 0 else grid_line))
-
-        def day_bg(day: date) -> str | None:
-            if day == today:
-                return today_bg
-            return weekend_bg if day.weekday() >= 5 else None
+            controls.append(ads_text(f"Не удалось загрузить акции: {calendar_state['error']}", 12, pal["bad"]))
 
         if isinstance(data, dict):
-            # Шапка: месяцы и дни
-            months, cursor = [], 0
-            while cursor < len(days):
-                month_start = days[cursor]
-                span = sum(1 for d in days[cursor:] if (d.year, d.month) == (month_start.year, month_start.month))
-                months.append(ft.Container(expand=span, padding=ft.Padding.only(left=4), border=day_border(month_start),
-                                           data="preserve_excel_fill",
-                                           content=ads_text(f"{MONTHS_RU[month_start.month - 1]} {month_start.year}", 11, pal["muted"], ft.FontWeight.W_700,
-                                                            max_lines=1, overflow=ft.TextOverflow.CLIP)))
-                cursor += span
-            day_cells = []
-            for day in days:
-                is_today = day == today
-                number = ft.Container(
-                    width=22, height=22, border_radius=11, alignment=ft.Alignment(0, 0), data="preserve_excel_fill",
-                    bgcolor=today_color if is_today else None,
-                    content=ads_text(str(day.day), 11, "#FFFFFF" if is_today else (pal["muted"] if day.weekday() >= 5 else pal["ink"]),
-                                     ft.FontWeight.W_800 if is_today else ft.FontWeight.W_600),
-                )
-                day_cells.append(ft.Container(
-                    expand=1, bgcolor=day_bg(day), border=day_border(day), padding=ft.Padding.symmetric(vertical=3), data="preserve_excel_fill",
-                    content=ft.Column([ads_text(WEEKDAYS_RU[day.weekday()], 9, pal["muted"]), number],
-                                      spacing=1, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
-                ))
-            controls.append(ft.Row([ft.Container(width=label_width), ft.Column([ft.Row(months, spacing=0), ft.Row(day_cells, spacing=0)], spacing=2, expand=True),
-                                    ft.Container(width=110)], spacing=12))
+            register_action_colors(action["id"] for action in data["actions"])
+            # Шкала: месяц у первой недели и понедельники с числом.
+            axis, run_start = [], 0
+            for i, day in enumerate(days):
+                if i and (day.weekday() == 0):
+                    axis.append((i - run_start, days[run_start]))
+                    run_start = i
+            axis.append((CALENDAR_DAYS - run_start, days[run_start]))
+            axis_row = ft.Row([ft.Container(expand=n, padding=ft.Padding.only(left=4), content=ads_text(
+                (f"{MONTHS_RU[d.month - 1][:3].lower()} " if index == 0 or d.day <= 7 else "") + f"{d.day}", 10, pal["muted"], ft.FontWeight.W_600,
+                max_lines=1, overflow=ft.TextOverflow.CLIP)) for index, (n, d) in enumerate(axis)], spacing=0)
+            controls.append(ft.Row([ft.Container(width=label_width), ft.Container(expand=True, content=axis_row), ft.Container(width=side_width)], spacing=10))
 
+            bar_height = 18 if expanded else 14
+            row_height = bar_height + 8
             shown = 0
+            active_filter = limit_state.get("action_filter")
             for action in data["actions"]:
                 if not action.get("start") or not action.get("end"):
                     continue
@@ -6576,110 +6668,89 @@ def main(page: ft.Page) -> None:
                     continue
                 shown += 1
                 participating = action["participating"]
-                cut_left, cut_right = first < start, last > end
+                color = action_color(action["id"])
                 bar_from, bar_to = max(first, start), min(last, end)
                 before = (bar_from - start).days
                 length = (bar_to - bar_from).days + 1
                 after = CALENDAR_DAYS - before - length
-                label = ("‹ " if cut_left else "") + f"{participating} тов. · {calendar_boost_text(action)}" + (" ›" if cut_right else "")
-                radius = ft.BorderRadius.only(top_left=0 if cut_left else 7, bottom_left=0 if cut_left else 7,
-                                             top_right=0 if cut_right else 7, bottom_right=0 if cut_right else 7)
+                label = f"{participating} тов. · {calendar_boost_text(action)}"
+                inside = length >= 9
                 bar = ft.Container(
-                    height=22, border_radius=radius, padding=ft.Padding.symmetric(horizontal=8), alignment=ft.Alignment(-1, 0),
-                    bgcolor=bar_color if participating else (pal["soft"]), border=None if participating else ft.Border.all(1, week_line),
+                    height=bar_height, border_radius=bar_height // 2, padding=ft.Padding.symmetric(horizontal=8), alignment=ft.Alignment(-1, 0),
+                    bgcolor=color if participating else pal["soft"], border=None if participating else ft.Border.all(1.5, color),
                     data="preserve_excel_fill",
                     tooltip=f"{action['name']}\n{first:%d.%m.%Y} — {last:%d.%m.%Y}\nУчаствует {participating}, можно добавить ещё {action['can_add']}",
+                    content=ads_text(label, 10, "#FFFFFF" if participating else pal["muted"], ft.FontWeight.W_700,
+                                     max_lines=1, overflow=ft.TextOverflow.ELLIPSIS) if inside else None,
                 )
-                # Короткая полоса: подпись справа от неё, чтобы не обрезалась.
-                label_outside = length <= 6 and after >= 6
-                label_text = ads_text(label, 11, pal["ink"] if label_outside else ("#FFFFFF" if participating else pal["muted"]), ft.FontWeight.W_700,
-                                      max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
-                if not label_outside:
-                    bar.content = label_text
-                bar_parts = ([ft.Container(expand=before)] if before else []) + [ft.Container(expand=length, content=bar)] + \
-                            ([ft.Container(expand=after, padding=ft.Padding.only(left=8), alignment=ft.Alignment(-1, 0),
-                                           content=label_text if label_outside else None)] if after else [])
+                outside = None if inside else ft.Container(padding=ft.Padding.only(left=6), alignment=ft.Alignment(-1, 0), content=ads_text(
+                    label, 10, pal["ink"], ft.FontWeight.W_700, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS))
                 auto_dates = {date.fromisoformat(d) for d in action.get("auto_add_dates") or []}
-                markers = [ft.Container(
-                    expand=1, alignment=ft.Alignment(0, 1),
-                    content=ft.Container(width=8, height=8, border_radius=4, bgcolor=warn, data="preserve_excel_fill",
-                                         tooltip=f"{day:%d.%m}: Ozon добавит товары сам") if day in auto_dates else None,
-                ) for day in days]
-                grid = ft.Row([ft.Container(expand=1, bgcolor=day_bg(day), border=day_border(day), data="preserve_excel_fill") for day in days], spacing=0)
-                timeline = ft.Stack([
-                    ft.Container(content=grid, left=0, right=0, top=0, bottom=0),
-                    ft.Container(content=ft.Row(bar_parts, spacing=0), left=0, right=0, top=5, height=22),
-                    ft.Container(content=ft.Row(markers, spacing=0), left=0, right=0, top=0, bottom=1),
-                ], height=38, expand=True)
+                markers = segments([(1, ft.Container(alignment=ft.Alignment(0, 1), content=ft.Container(
+                    width=7, height=7, border_radius=4, bgcolor=warn, data="preserve_excel_fill", tooltip=f"{day:%d.%m}: Ozon добавит товары сам")
+                    if day in auto_dates else None)) for day in days])
+                layers = [ft.Container(left=0, right=0, top=0, height=row_height, content=week_grid(row_height)),
+                          ft.Container(left=0, right=0, top=4, height=bar_height, content=segments([(before, None), (length, bar), (after, outside)]))]
+                line = today_line(row_height)
+                if line:
+                    layers.append(ft.Container(left=0, right=0, top=0, height=row_height, content=line))
+                layers.append(ft.Container(left=0, right=0, top=0, height=row_height, content=markers))
+                timeline = ft.Stack(layers, height=row_height, expand=True)
 
-                is_open = action["id"] in calendar_state["open"]
-                upcoming = sorted(d for d in auto_dates if d >= today)
-                notes = [ads_text(f"{first:%d.%m} — {last:%d.%m.%Y} · можно ещё {action['can_add']}", 10, pal["muted"])]
-                if upcoming:
-                    notes.append(ads_text("● Ozon добавит сам: " + ", ".join(f"{d:%d.%m}" for d in upcoming), 10, warn))
-                details = ft.Container(visible=is_open, padding=ft.Padding.only(left=label_width + 12, top=6, bottom=6))
-
-                def build_details(a=action) -> ft.Control:
-                    if a.get("error"):
-                        return ads_text(a["error"], 12, pal["bad"])
-                    if not a["participants"]:
-                        return ads_text("Ваших товаров в акции нет.", 12, pal["muted"])
-                    chips = []
-                    for item in a["participants"]:
-                        boost = f" · буст {item['boost']:g}%" if item.get("boost") is not None else ""
-                        chips.append(ft.Container(
-                            padding=ft.Padding.symmetric(horizontal=10, vertical=5), border_radius=8, border=ft.Border.all(1, pal["border"]),
-                            data="preserve_excel_fill",
-                            content=ads_text(f"{item['offer_id']} · {item['action_price']:,.0f} ₽{boost}".replace(",", " "), 11),
-                        ))
-                    return ft.Row(chips, wrap=True, spacing=6, run_spacing=6)
-
-                if is_open:
-                    details.content = build_details()
-                toggle_button = ft.TextButton("Скрыть" if is_open else "Товары", disabled=not action["participants"] and not action.get("error"))
-
-                def toggle(_e, a=action, panel=details, button=toggle_button, builder=build_details) -> None:
-                    if a["id"] in calendar_state["open"]:
-                        calendar_state["open"].discard(a["id"])
-                        panel.visible = False
-                    else:
-                        calendar_state["open"].add(a["id"])
-                        panel.content = builder()
-                        apply_control_theme(panel, current_dark["value"])
-                        panel.visible = True
-                    button.content = "Скрыть" if panel.visible else "Товары"
-                    page.update(panel, button)
-
-                toggle_button.on_click = toggle
-                controls.append(ft.Column([
-                    ft.Row([
-                        ft.Container(width=label_width, content=ft.Column([
-                            ads_text(action["name"], 12, pal["bad"] if action.get("error") else None, ft.FontWeight.W_700,
-                                     max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
-                            *notes,
-                        ], spacing=1, tight=True)),
+                filtered = active_filter == action["id"]
+                filter_button = ft.TextButton(
+                    "Показаны ✕" if filtered else "Товары ›",
+                    tooltip="Показать в «Предельной цене» только товары этой акции" if not filtered else "Снять фильтр по акции",
+                    on_click=lambda _e, a=action["id"]: limit_filter_action(None if limit_state.get("action_filter") == a else a))
+                name = ads_text(action["name"] if expanded else short_action_name(action["name"]), 12, pal["bad"] if action.get("error") else None,
+                                ft.FontWeight.W_700, max_lines=2 if expanded else 1, overflow=ft.TextOverflow.ELLIPSIS, expand=True)
+                label_parts: list[ft.Control] = [ft.Row([
+                    ft.Container(width=10, height=10, border_radius=5, bgcolor=color, data="preserve_excel_fill"), name], spacing=6)]
+                if expanded:
+                    upcoming = sorted(d for d in auto_dates if d >= today)
+                    label_parts.append(ads_text(f"{first:%d.%m} — {last:%d.%m.%Y} · можно ещё {action['can_add']}", 10, pal["muted"]))
+                    if upcoming:
+                        label_parts.append(ads_text("● Ozon добавит сам: " + ", ".join(f"{d:%d.%m}" for d in upcoming), 10, warn))
+                row = ft.Container(
+                    border_radius=8, bgcolor=pal["soft"] if filtered else None, data="preserve_excel_fill",
+                    padding=ft.Padding.symmetric(vertical=2),
+                    content=ft.Row([
+                        ft.Container(width=label_width, content=ft.Column(label_parts, spacing=1, tight=True)),
                         timeline,
-                        ft.Container(width=110, content=toggle_button),
-                    ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                    details,
-                ], spacing=0))
+                        ft.Container(width=side_width, alignment=ft.Alignment(1, 0), content=filter_button),
+                    ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+                controls.append(row)
+                if expanded and action["participants"]:
+                    chips = [ft.Container(
+                        padding=ft.Padding.symmetric(horizontal=8, vertical=3), border_radius=8, border=ft.Border.all(1, pal["border"]),
+                        data="preserve_excel_fill",
+                        content=ads_text(f"{item['offer_id']} · {item['action_price']:,.0f} ₽".replace(",", " ")
+                                         + (f" · {item['boost']:g}%" if item.get("boost") is not None else ""), 10))
+                        for item in action["participants"]]
+                    controls.append(ft.Container(padding=ft.Padding.only(left=label_width + 10, bottom=4),
+                                                 content=ft.Row(chips, wrap=True, spacing=4, run_spacing=4)))
             if not shown:
                 controls.append(ads_text("В эти дни акций нет — пролистайте назад или вперёд.", 12, pal["muted"]))
-            controls.append(ft.Row([
-                ft.Container(width=14, height=10, border_radius=3, bgcolor=bar_color, data="preserve_excel_fill"), ads_text("ваши товары участвуют", 11, pal["muted"]),
-                ft.Container(width=14, height=10, border_radius=3, bgcolor=pal["soft"], border=ft.Border.all(1, week_line), data="preserve_excel_fill"),
-                ads_text("не участвуют", 11, pal["muted"]),
-                ft.Container(width=8, height=8, border_radius=4, bgcolor=warn, data="preserve_excel_fill"), ads_text("автодобавление Ozon", 11, pal["muted"]),
-                ft.Container(width=14, height=10, border_radius=3, bgcolor=weekend_bg, border=ft.Border.all(1, grid_line), data="preserve_excel_fill"),
-                ads_text("выходные", 11, pal["muted"]),
-                ads_text(f"· обновлено {data['loaded'][11:16]}", 11, pal["muted"]),
-            ], spacing=8, wrap=True))
-        actions_calendar.content = ft.Column(controls, spacing=8)
+            if expanded:
+                controls.append(ft.Row([
+                    ft.Container(width=14, height=8, border_radius=4, bgcolor=legend_color, data="preserve_excel_fill"), ads_text("ваши товары участвуют", 10, pal["muted"]),
+                    ft.Container(width=14, height=8, border_radius=4, bgcolor=pal["soft"], border=ft.Border.all(1.5, legend_color), data="preserve_excel_fill"),
+                    ads_text("не участвуют", 10, pal["muted"]),
+                    ft.Container(width=7, height=7, border_radius=4, bgcolor=warn, data="preserve_excel_fill"), ads_text("автодобавление Ozon", 10, pal["muted"]),
+                    ft.Container(width=2, height=10, bgcolor=today_color, data="preserve_excel_fill"), ads_text("сегодня", 10, pal["muted"]),
+                    ads_text(f"· обновлено {data['loaded'][11:16]}", 10, pal["muted"]),
+                ], spacing=6, wrap=True))
+        actions_calendar.content = ft.Column(controls, spacing=4 if not expanded else 6)
+        actions_calendar.padding = ft.Padding.symmetric(horizontal=16, vertical=10)
         actions_calendar.bgcolor = pal["surface"]
         actions_calendar.border = ft.Border.all(1, pal["border"])
         apply_control_theme(actions_calendar, current_dark["value"])
         if push_update and page.controls and host.controls and host.controls[0] is actions:
             page.update(actions_calendar)
+
+    def calendar_toggle() -> None:
+        calendar_state["expanded"] = not calendar_state.get("expanded")
+        render_actions_calendar()
 
     # ---------------------------------------------------------------- Акции: автодобавление и учёт минимальной цены
     auto_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False, "selected": set(), "filter": "all"}
@@ -7146,10 +7217,10 @@ def main(page: ft.Page) -> None:
     ai_refresh_button.on_click = lambda _e: ai_refresh_status()
     ai_new_chat_button.on_click = ai_reset
     ai_model_select.on_change = ai_model_changed
-    ai_quick_month_button.on_click = ai_quick_prompt("Что произошло в марте 2026?")
-    ai_quick_pressure_button.on_click = ai_quick_prompt("Что сильнее всего давит на прибыль в марте 2026?")
-    ai_quick_brief_button.on_click = ai_quick_prompt("Сделай краткий управленческий разбор марта 2026.")
-    ai_quick_risk_button.on_click = ai_quick_prompt("Какие риски ты видишь в месячной экономике марта 2026?")
+    ai_quick_month_button.on_click = ai_quick_prompt("Как дела в магазине за последний месяц и что улучшить в первую очередь?")
+    ai_quick_pressure_button.on_click = ai_quick_prompt("Что сильнее всего давит на прибыль за последние месяцы?")
+    ai_quick_brief_button.on_click = ai_quick_prompt("Какие товары срочно пополнить и сколько денег на это нужно?")
+    ai_quick_risk_button.on_click = ai_quick_prompt("Какие товары теряют продажи и почему?")
 
     ai_messages_shell = ft.Container(
         expand=True,
@@ -7650,10 +7721,560 @@ def main(page: ft.Page) -> None:
         spacing=14,
     )
 
-    views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, supply, stock_view, settings, file_view]
+    # ---------------------------------------------------------------- Поиск и ключевые слова
+    SEARCH_COLLECT_TITLE = "Сбор поисковой аналитики"
+    SEARCH_TABS = [("overview", "Обзор"), ("queries", "Запросы"), ("products", "Товары"), ("positions", "Позиции")]
+    SEARCH_PAGE = 40
+    search_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False, "tab": "overview",
+                                       "filter": "", "targets_only": False, "open": set(), "cluster_rows": {}, "limit": SEARCH_PAGE,
+                                       "sku": None, "product": None, "product_busy": False}
+    search_subtitle = ft.Text("", size=13, color=MUTED)
+    search_refresh_button = ft.Button("Обновить данные", icon=ft.Icons.REFRESH, bgcolor=PRIMARY, color="white",
+                                      tooltip="Загрузить из Ozon свежую поисковую аналитику, карточки и продажи (1–3 минуты)")
+    search_body = ft.Column(spacing=14)
+    search_filter = ft.TextField(hint_text="Найти запрос или кластер", prefix_icon=ft.Icons.SEARCH, dense=True, width=320)
+
+    def search_load(_e=None) -> None:
+        if search_state["busy"] or search_view is None:
+            return
+        search_state.update(busy=True, error=None, started=True, cluster_rows={})
+        render_search_view()
+
+        def worker() -> None:
+            try:
+                search_state["data"] = search_view.load()
+                if search_state["sku"] is not None:
+                    search_state["product"] = search_view.load_product(int(search_state["sku"]))
+            except Exception as exc:
+                search_state["error"] = str(exc)
+            finally:
+                search_state["busy"] = False
+            ui_queue.put(("call", render_search_view))
+
+        page.run_thread(worker)
+
+    def search_collect(_e=None) -> None:
+        job(SEARCH_COLLECT_TITLE, [str(PYTHON), str(SCRIPTS / "search_collect.py")])
+
+    search_refresh_button.on_click = search_collect
+
+    def search_set_tab(tab: str) -> None:
+        search_state["tab"] = tab
+        render_search_view()
+
+    def search_open_product(sku: int | None) -> None:
+        search_state.update(sku=sku, product=None, product_busy=sku is not None, tab="products")
+        render_search_view()
+        if sku is None:
+            return
+
+        def worker() -> None:
+            try:
+                search_state["product"] = search_view.load_product(int(sku))
+            except Exception as exc:
+                search_state["error"] = f"Не удалось открыть товар: {exc}"
+            finally:
+                search_state["product_busy"] = False
+            ui_queue.put(("call", render_search_view))
+
+        page.run_thread(worker)
+
+    def search_toggle_cluster(cluster_id: int) -> None:
+        opened = search_state["open"]
+        if cluster_id in opened:
+            opened.discard(cluster_id)
+            render_search_view()
+            return
+        opened.add(cluster_id)
+        render_search_view()
+
+        def worker() -> None:
+            try:
+                search_state["cluster_rows"][cluster_id] = search_view.load_cluster(cluster_id)
+            except Exception as exc:
+                search_state["error"] = f"Не удалось открыть кластер: {exc}"
+            ui_queue.put(("call", render_search_view))
+
+        page.run_thread(worker)
+
+    def search_toggle_target(keyword_id: int, target: bool) -> None:
+        def worker() -> None:
+            try:
+                search_view.toggle_target(keyword_id, target)
+                clusters = {c["id"]: c for c in (search_state.get("data") or {}).get("clusters") or []}
+                for cluster_id, rows in search_state["cluster_rows"].items():
+                    for row in rows:
+                        if row["id"] == keyword_id:
+                            row["target"] = target
+                    if cluster_id in clusters:
+                        clusters[cluster_id]["target"] = any(row["target"] for row in rows)
+                product = search_state.get("product")
+                if isinstance(product, dict):
+                    for row in product["queries"]:
+                        if row["id"] == keyword_id:
+                            row["target"] = target
+            except Exception as exc:
+                search_state["error"] = f"Не удалось изменить целевой запрос: {exc}"
+            ui_queue.put(("call", render_search_view))
+
+        page.run_thread(worker)
+
+    def search_filter_changed(_e=None) -> None:
+        search_state["filter"] = (search_filter.value or "").strip().lower()
+        search_state["limit"] = SEARCH_PAGE
+        render_search_view()
+
+    search_filter.on_submit = search_filter_changed
+    search_filter.on_change = search_filter_changed
+
+    def s_change(value: float | None, inverse: bool = False) -> tuple[str, str | None]:
+        """Изменение к прошлой неделе: текст и цвет (рост — зелёный, падение — красный; мелкие колебания — серые)."""
+        pal = dash_pal()
+        if value is None:
+            return "—", pal["muted"]
+        text = f"{value * 100:+.0f}%".replace("-", "−")
+        if abs(value) < 0.05:
+            return text, pal["muted"]
+        good = value > 0 if not inverse else value < 0
+        return text, pal["good"] if good else pal["bad"]
+
+    def s_cell(content: ft.Control, weight: int, right: bool = True, tooltip: str | None = None) -> ft.Control:
+        return ft.Container(expand=weight, alignment=ft.Alignment(1 if right else -1, 0), tooltip=tooltip, content=content)
+
+    def s_header(columns: list[tuple]) -> ft.Control:
+        """Заголовок таблицы: (название, вес, подсказка[, влево]). Первая колонка и текстовые (4-й элемент True) — влево."""
+        pal = dash_pal()
+        cells = []
+        for index, column in enumerate(columns):
+            name, w, tip = column[:3]
+            right = bool(index) and not (len(column) > 3 and column[3])
+            cells.append(s_cell(dtext(name, 12, pal["muted"], ft.FontWeight.W_600, text_align=ft.TextAlign.RIGHT if right else None), w, right, tip))
+        return ft.Container(padding=ft.Padding.only(bottom=8), content=ft.Row(cells, spacing=12, vertical_alignment=ft.CrossAxisAlignment.END))
+
+    def s_row(cells: list[ft.Control], on_click=None, highlight: bool = False) -> ft.Control:
+        pal = dash_pal()
+        return ft.Container(
+            padding=ft.Padding.symmetric(vertical=9, horizontal=4), data="preserve_excel_fill", on_click=on_click, ink=on_click is not None,
+            bgcolor=semantic_surface("warning", dark=pal["dark"]) if highlight else None, border_radius=8 if highlight else None,
+            border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])),
+            content=ft.Row(cells, spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+
+    def s_chip(label: str, selected: bool, on_click) -> ft.Control:
+        pal = dash_pal()
+        return ft.Container(
+            padding=ft.Padding.symmetric(horizontal=14, vertical=8), border_radius=999, ink=True, data="preserve_excel_fill",
+            bgcolor=semantic_surface("positive", dark=pal["dark"]) if selected else None,
+            border=ft.Border.all(2 if selected else 1, PRIMARY if selected else pal["border"]),
+            on_click=on_click, content=dtext(label, 12, weight=ft.FontWeight.W_700))
+
+    def s_star(keyword_id: int, target: bool) -> ft.Control:
+        pal = dash_pal()
+        return ft.IconButton(
+            icon=ft.Icons.STAR if target else ft.Icons.STAR_BORDER, icon_size=18, icon_color=pal["warn"] if target else pal["muted"],
+            tooltip="Целевой запрос: парсер выдачи замеряет его первым. Нажмите, чтобы " + ("снять отметку." if target else "отметить."),
+            on_click=lambda _e, k=keyword_id, t=target: search_toggle_target(k, not t))
+
+    def s_position(value: float | None, measured: bool) -> ft.Control:
+        pal = dash_pal()
+        if not measured:
+            return dtext("—", 13, pal["muted"])
+        if value is None:
+            return dtext("нет", 13, pal["bad"], tooltip="Не найден в просмотренной глубине выдачи")
+        color = pal["good"] if value <= 10 else (pal["warn"] if value <= 50 else pal["bad"])
+        return dtext(f"{value:.0f}", 13, color, ft.FontWeight.W_700)
+
+    def s_bars(title: str, caption: str, points: list[dict], key: str, color: str, unit: str) -> ft.Control:
+        """Столбики по дням (как «Заказы по неделям» в «Анализе»): наведите — точное значение."""
+        pal = dash_pal()
+        top = max((p[key] for p in points), default=0) or 1
+        bars = []
+        for p in points:
+            day = datetime.strptime(p["date"], "%Y-%m-%d")
+            bars.append(ft.Container(
+                expand=1, tooltip=f"{day:%d.%m}: {_format_number(p[key])} {unit}",
+                content=ft.Column([
+                    ft.Container(height=max(2, p[key] / top * 110), bgcolor=color, border_radius=ft.BorderRadius.only(top_left=3, top_right=3),
+                                 data="preserve_excel_fill"),
+                    dtext(f"{day:%d}", 9, pal["muted"], text_align=ft.TextAlign.CENTER),
+                ], spacing=2, alignment=ft.MainAxisAlignment.END, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)))
+        return ft.Column([dtext(title, 14, weight=ft.FontWeight.W_700), dtext(caption, 12, pal["muted"]),
+                          ft.Container(height=135, content=ft.Row(bars, spacing=3, vertical_alignment=ft.CrossAxisAlignment.END))], spacing=4)
+
+    def s_per_100k(value: float | None) -> str:
+        """Заказов на 100 тыс. искавших (на входе — на 1000): у товара на 10 тыс. почти всегда «0,0», сравнивать нечего."""
+        return "—" if value is None else f"{value * 100:.1f}".replace(".", ",")
+
+    def search_overview(data: dict) -> list[ft.Control]:
+        pal = dash_pal()
+        k = data["kpis"]
+        w7 = data["windows"]["7"]
+        period = f"{w7[0][8:10]}.{w7[0][5:7]}–{w7[1][8:10]}.{w7[1][5:7]}"
+
+        def stat(label: str, value: str, key: str, extra: str = "", tooltip: str = "") -> ft.Control:
+            text, color = s_change(k[key]["change"])
+            control = dash_stat(label, value, f"{text} к прошлой неделе{extra}", None)
+            control.content.controls[2].color = color
+            control.tooltip = tooltip or None
+            return control
+
+        controls: list[ft.Control] = [dpanel(ft.ResponsiveRow([
+            stat("Спрос в поиске", _format_number(k["searches"]["value"]), "searches",
+                 tooltip=f"Сколько раз за {period} искали запросы, по которым Ozon показывал ваши товары (по каждому запросу — максимум по товарам)."),
+            stat("Запросов с вашими товарами", _format_number(k["queries"]["value"]), "queries",
+                 tooltip="Разных поисковых запросов, по которым Ozon показывал товары магазина. Больше запросов — шире охват."),
+            stat("Заказано", _format_number(k["orders"]["value"]), "orders", f" · {_format_number(round(k['revenue']['value']))} ₽",
+                 tooltip="Заказано штук за те же дни (все источники: поиск, реклама, рекомендации)."),
+            stat("Заказов на 100 тыс. поисков", s_per_100k(k["per_1000"]["value"]), "per_1000",
+                 tooltip="Конверсия спроса в заказы. Падает при неизменном спросе — проблема в карточке, цене или наличии, а не в поиске."),
+        ], spacing=24, run_spacing=12), padding=ft.Padding.symmetric(horizontal=24, vertical=16))]
+
+        icons = {"conversion": (ft.Icons.WARNING_AMBER_ROUNDED, pal["bad"]), "demand": (ft.Icons.TRENDING_DOWN, pal["bad"]),
+                 "no_sales": (ft.Icons.WARNING_AMBER_ROUNDED, pal["warn"]),
+                 "gap": (ft.Icons.TEXT_FIELDS, pal["accent"]), "rising": (ft.Icons.TRENDING_UP, pal["good"]),
+                 "drop": (ft.Icons.TRENDING_DOWN, pal["warn"])}
+        lines: list[ft.Control] = []
+        for item in data["actions"]:
+            icon, color = icons.get(item["kind"], (ft.Icons.LIGHTBULB_OUTLINE, pal["muted"]))
+            offers = item.get("offers") or []
+            chips = [ft.Container(padding=ft.Padding.symmetric(horizontal=8, vertical=2), border_radius=999, ink=True,
+                                  border=ft.Border.all(1, pal["border"]), data="preserve_excel_fill", tooltip="Открыть товар",
+                                  on_click=lambda _e, o=offer: search_open_offer(o), content=dtext(offer, 11, weight=ft.FontWeight.W_600))
+                     for offer in offers[:8]]
+            if len(offers) > 8:
+                chips.append(dtext(f"и ещё {len(offers) - 8}", 11, pal["muted"]))
+            lines.append(ft.Container(
+                padding=ft.Padding.symmetric(vertical=8), border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])) if lines else None,
+                data="preserve_excel_fill",
+                content=ft.Row([ft.Icon(icon, size=18, color=color),
+                                ft.Column([dtext(item["text"], 13), *([ft.Row(chips, wrap=True, spacing=4, run_spacing=4)] if chips else [])],
+                                          spacing=4, expand=True)],
+                               spacing=10, vertical_alignment=ft.CrossAxisAlignment.START)))
+        if not lines:
+            lines.append(dtext("Явных проблем не видно: спрос и заказы стабильны, главные слова запросов есть в названиях.", 13, pal["muted"]))
+        controls.append(dpanel(ft.Column([dtext("Что сделать в первую очередь", 15, weight=ft.FontWeight.W_700),
+                                           dtext(f"По данным за {period}; важнее то, что выше. Нажмите на артикул, чтобы открыть товар.", 12, pal["muted"]),
+                                           ft.Container(height=4), *lines], spacing=2),
+                               padding=ft.Padding.only(left=20, right=20, top=14, bottom=12)))
+        controls.append(dpanel(ft.ResponsiveRow([
+            ft.Container(col={"xs": 12, "lg": 6}, content=s_bars("Спрос по дням", "Поисков по запросам с вашими товарами", data["daily"], "searches",
+                                                                pal["accent"], "поисков")),
+            ft.Container(col={"xs": 12, "lg": 6}, content=s_bars("Заказы по дням", "Заказано штук, все источники", data["daily"], "orders",
+                                                                pal["good"], "шт.")),
+        ], spacing=24, run_spacing=16), padding=ft.Padding.only(left=20, right=20, top=14, bottom=12)))
+        return controls
+
+    def search_open_offer(offer: str) -> None:
+        data = search_state.get("data") or {}
+        for p in data.get("products") or []:
+            if str(p["offer_id"]) == str(offer) or str(p["sku"]) == str(offer):
+                search_open_product(p["sku"])
+                return
+
+    def search_queries(data: dict) -> list[ft.Control]:
+        pal = dash_pal()
+        text = str(search_state["filter"])
+        rows = [c for c in data["clusters"] if (not text or text in c["name"].lower()) and (not search_state["targets_only"] or c["target"])]
+        toolbar = ft.Row([
+            search_filter,
+            s_chip("Только целевые ★", bool(search_state["targets_only"]),
+                   lambda _e: (search_state.update(targets_only=not search_state["targets_only"], limit=SEARCH_PAGE), render_search_view())),
+            dtext(f"Кластеров: {len(rows)}", 12, pal["muted"]),
+        ], wrap=True, spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        columns = [("Кластер запросов", 5, None),
+                   ("Спрос, 28 дн.", 2, "Сколько раз искали запросы кластера за 28 дней (по каждому запросу — максимум по товарам)"),
+                   ("Неделя", 2, "Спрос последних 7 дней к предыдущим 7. «—» — мало данных: Ozon отдаёт по товару только 15 главных "
+                                 "запросов в день, и редкий запрос был в данных меньше 4 дней из 7"),
+                   ("Запросов", 1, "Сколько формулировок в кластере"),
+                   ("Товаров", 1, "Сколько ваших товаров Ozon показывал по этим запросам"),
+                   ("В названии", 2, "У скольких из этих товаров все слова кластера есть в названии"),
+                   ("Лучшая позиция", 2, "Медиана позиции в выдаче за 3 дня (лучший из ваших товаров); «—» — не замерялась")]
+        table: list[ft.Control] = [s_header(columns)]
+        for cluster in rows[: int(search_state["limit"])]:
+            trend, trend_color = s_change(cluster["trend"])
+            opened = cluster["id"] in search_state["open"]
+            weak = cluster["products"] and cluster["in_title"] == 0 and cluster["demand_28"] >= 1000
+            table.append(s_row([
+                s_cell(ft.Row([ft.Icon(ft.Icons.EXPAND_LESS if opened else ft.Icons.EXPAND_MORE, size=16, color=pal["muted"]),
+                               ft.Icon(ft.Icons.STAR, size=14, color=pal["warn"], visible=bool(cluster["target"])),
+                               dtext(cluster["name"], 13, weight=ft.FontWeight.W_600, expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)],
+                              spacing=4), 5, right=False),
+                s_cell(dtext(_format_number(round(cluster["demand_28"])), 13), 2),
+                s_cell(dtext(trend, 13, trend_color), 2),
+                s_cell(dtext(str(cluster["queries"]), 13), 1),
+                s_cell(dtext(str(cluster["products"]), 13), 1),
+                s_cell(dtext(f"{cluster['in_title']} из {cluster['products']}" if cluster["products"] else "—", 13,
+                             pal["bad"] if weak else None, ft.FontWeight.W_700 if weak else None), 2,
+                       tooltip="Частый кластер, но ни в одном названии его слов нет целиком" if weak else None),
+                s_cell(s_position(cluster["best_position"], cluster["best_position"] is not None), 2),
+            ], on_click=lambda _e, cid=cluster["id"]: search_toggle_cluster(cid)))
+            if opened:
+                members = search_state["cluster_rows"].get(cluster["id"])
+                if members is None:
+                    table.append(ft.Container(padding=ft.Padding.only(left=28, top=6, bottom=6), content=ft.ProgressRing(width=16, height=16, stroke_width=2)))
+                    continue
+                for q in members:
+                    q_trend, q_color = s_change(q["trend"])
+                    table.append(ft.Container(
+                        padding=ft.Padding.only(left=28, top=2, bottom=2), data="preserve_excel_fill",
+                        content=ft.Row([
+                            s_cell(ft.Row([s_star(q["id"], q["target"]), dtext(q["query"], 12, expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                           dtext("вручную" if q["source"] in ("manual", "csv") else "", 11, pal["muted"])], spacing=2), 5, right=False),
+                            s_cell(dtext(_format_number(round(q["demand_28"])), 12), 2),
+                            s_cell(dtext(q_trend, 12, q_color), 2),
+                            s_cell(dtext(", ".join(q["offers"][:4]) + (f" +{len(q['offers']) - 4}" if len(q["offers"]) > 4 else ""), 11, pal["muted"],
+                                         max_lines=1, overflow=ft.TextOverflow.ELLIPSIS), 6, tooltip=", ".join(q["offers"]) or None),
+                        ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER)))
+        if len(rows) > int(search_state["limit"]):
+            table.append(ft.Container(padding=ft.Padding.only(top=8), content=ft.TextButton(
+                f"Показать ещё (осталось {len(rows) - int(search_state['limit'])})",
+                on_click=lambda _e: (search_state.update(limit=int(search_state["limit"]) + SEARCH_PAGE), render_search_view()))))
+        return [dpanel(ft.Column([
+            dtext("Семантическое ядро", 15, weight=ft.FontWeight.W_700),
+            dtext("Запросы, по которым Ozon показывал ваши товары, склеены по смыслу: разные формы и порядок слов — один кластер. "
+                  "Нажмите на кластер, чтобы увидеть формулировки и отметить целевые ★. Свои запросы и CSV добавляются командой "
+                  "scripts/search_semantics.py (см. README).", 12, pal["muted"]),
+            ft.Container(height=6), toolbar, ft.Container(height=6), ft.Column(table, spacing=0),
+        ], spacing=4), padding=ft.Padding.only(left=20, right=20, top=14, bottom=10))]
+
+    def search_products(data: dict) -> list[ft.Control]:
+        pal = dash_pal()
+        if search_state["sku"] is not None:
+            return search_product_detail()
+        columns = [("Артикул", 2, None), ("Название", 6, None, True),
+                   ("Спрос, 7 дн.", 2, "Сколько покупателей искали запросы, по которым Ozon показывал этот товар"),
+                   ("Неделя", 2, "Спрос последних 7 дней к предыдущим 7"),
+                   ("Заказы, 28 дн.", 2, None),
+                   ("На 100 тыс.", 2, "Заказов на 100 тыс. искавших за 28 дней — сравнивайте товары между собой"),
+                   ("В названии", 2, "Доля спроса товара, все слова которого есть в названии"),
+                   ("Пробелы", 2, "Частые кластеры, слов которых нет в названии")]
+        table: list[ft.Control] = [s_header(columns)]
+        for p in data["products"]:
+            trend, trend_color = s_change(p["trend"])
+            share = p["title_coverage"]
+            table.append(s_row([
+                s_cell(dtext(str(p["offer_id"] or p["sku"]), 13, weight=ft.FontWeight.W_700), 2, right=False),
+                s_cell(dtext(p["name"] or "", 12, pal["muted"], max_lines=1, overflow=ft.TextOverflow.ELLIPSIS), 6, right=False, tooltip=p["name"]),
+                s_cell(dtext(_format_number(round(p["demand_7"])), 13), 2),
+                s_cell(dtext(trend, 13, trend_color), 2),
+                s_cell(dtext(_format_number(round(p["orders_28"])), 13, pal["bad"] if p["no_sales"] else None,
+                             ft.FontWeight.W_700 if p["no_sales"] else None), 2,
+                       tooltip="Ищут, но не заказывают: большой спрос и ни одного заказа за 28 дней" if p["no_sales"] else None),
+                s_cell(dtext(s_per_100k(p["per_1000"]), 13), 2),
+                s_cell(dtext("—" if share is None else f"{share * 100:.0f}%", 13, pal["bad"] if share is not None and share < 0.5 else None), 2),
+                s_cell(dtext(str(p["gaps"]) if p["gaps"] else "—", 13, pal["warn"] if p["gaps"] else pal["muted"], ft.FontWeight.W_700), 2),
+            ], on_click=lambda _e, sku=p["sku"]: search_open_product(sku)))
+        return [dpanel(ft.Column([
+            dtext("Товары в поиске", 15, weight=ft.FontWeight.W_700),
+            dtext("Нажмите на товар: по каким запросам его находят, каких слов не хватает в карточке и что в ней менялось.", 12, pal["muted"]),
+            ft.Container(height=6), ft.Column(table, spacing=0),
+        ], spacing=4), padding=ft.Padding.only(left=20, right=20, top=14, bottom=10))]
+
+    def search_product_detail() -> list[ft.Control]:
+        pal = dash_pal()
+        back = ft.TextButton("Все товары", icon=ft.Icons.ARROW_BACK, on_click=lambda _e: search_open_product(None))
+        product = search_state.get("product")
+        if search_state["product_busy"] or not isinstance(product, dict):
+            return [back, dpanel(ft.Row([ft.ProgressRing(width=20, height=20, stroke_width=2.4), dtext("Открываю товар…", 13, pal["muted"])], spacing=12))]
+        summary = next((p for p in (search_state.get("data") or {}).get("products") or [] if p["sku"] == product["sku"]), {})
+        trend, trend_color = s_change(summary.get("trend"))
+        share = product["title_coverage"]
+        stats = [
+            dash_stat("Спрос, 7 дней", _format_number(round(summary.get("demand_7") or 0)), f"{trend} к прошлой неделе"),
+            dash_stat("Заказы, 28 дней", _format_number(round(summary.get("orders_28") or 0)), f"на 100 тыс. искавших: {s_per_100k(summary.get('per_1000'))}"),
+            dash_stat("Название покрывает", "—" if share is None else f"{share * 100:.0f}%", "спроса товара",
+                      pal["bad"] if share is not None and share < 0.5 else None),
+            dash_stat("Карточка", f"{product['card']['images']} фото", f"описание {product['card']['description_length']} знаков · "
+                      f"{product['card']['attributes']} характеристик"),
+        ]
+        stats[0].content.controls[2].color = trend_color
+        controls: list[ft.Control] = [
+            back,
+            ft.Column([dtext(str(product["offer_id"] or product["sku"]), 20, weight=ft.FontWeight.W_800),
+                       dtext(product["name"] or "", 13, pal["muted"])], spacing=2),
+            dpanel(ft.ResponsiveRow(stats, spacing=24, run_spacing=12), padding=ft.Padding.symmetric(horizontal=24, vertical=16)),
+        ]
+        if summary.get("no_sales"):
+            controls.append(dpanel(ft.Row([ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=18, color=pal["warn"]), dtext(
+                "Товар ищут, но не заказывают: за 28 дней ни одного заказа. Слова в названии этого не исправят. Сначала проверьте, "
+                "видят ли его (позиция в выдаче), затем — цену и индекс цен, главное фото, рейтинг и отзывы, срок доставки.", 13, expand=True)],
+                spacing=10, vertical_alignment=ft.CrossAxisAlignment.START), padding=ft.Padding.symmetric(horizontal=20, vertical=12)))
+        if product["gaps"]:
+            lines = []
+            for gap in product["gaps"][:6]:
+                text = (f"Добавьте «{', '.join(gap['missing'])}» — этих слов нет нигде в карточке" if gap["kind"] == "missing"
+                        else "Слова есть в описании или характеристиках — перенесите в название")
+                lines.append(ft.Row([ft.Icon(ft.Icons.TEXT_FIELDS, size=16, color=pal["accent"]),
+                                     dtext(f"«{gap['cluster']}»", 13, weight=ft.FontWeight.W_700),
+                                     dtext(f"{_format_number(round(gap['demand']))} искавших за 28 дн. · {text}", 13, pal["muted"], expand=True)],
+                                    spacing=8, vertical_alignment=ft.CrossAxisAlignment.START))
+            controls.append(dpanel(ft.Column([dtext("Пробелы в карточке", 15, weight=ft.FontWeight.W_700),
+                                              dtext("Кластеры, по которым товар ищут, но их слов нет в названии. Добавляйте, только если товар "
+                                                    "действительно подходит под запрос: нерелевантные слова снижают конверсию.", 12, pal["muted"]),
+                                              ft.Container(height=4), *lines], spacing=6),
+                                   padding=ft.Padding.only(left=20, right=20, top=14, bottom=12)))
+        mark = lambda flag, share_value: dtext("✓", 14, pal["good"], ft.FontWeight.W_800) if flag else dtext(  # noqa: E731
+            f"{share_value * 100:.0f}%" if share_value else "—", 12, pal["muted"])
+        cov_table: list[ft.Control] = [s_header([("Кластер", 5, None, True), ("Спрос товара, 28 дн.", 2, "Сколько покупателей искали запросы кластера и видели этот товар"),
+                                                 ("Название", 1, "✓ — все слова кластера есть в названии; % — доля слов"),
+                                                 ("Описание", 1, None), ("Характеристики", 2, None), ("Нет нигде", 3, "Слова кластера, которых нет ни в названии, ни в описании, ни в характеристиках")])]
+        for row in product["coverage"][:25]:
+            weak = not row["in_title"] and row["demand"] >= 500
+            cov_table.append(s_row([
+                s_cell(dtext(row["cluster"], 13, weight=ft.FontWeight.W_600, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS), 5, right=False),
+                s_cell(dtext(_format_number(round(row["demand"])), 13), 2),
+                s_cell(mark(row["in_title"], row["shares"]["title"]), 1),
+                s_cell(mark(row["in_description"], row["shares"]["description"]), 1),
+                s_cell(mark(row["in_attributes"], row["shares"]["attributes"]), 2),
+                s_cell(dtext(", ".join(row["missing"]) or "—", 12, pal["bad"] if row["missing"] else pal["muted"]), 3),
+            ], highlight=weak))
+        controls.append(dpanel(ft.Column([dtext("Покрытие запросов карточкой", 15, weight=ft.FontWeight.W_700),
+                                          dtext("Сверху — то, по чему товар ищут чаще всего. Подсвечены частые кластеры, которых нет в названии.", 12, pal["muted"]),
+                                          ft.Container(height=6), ft.Column(cov_table, spacing=0)], spacing=4),
+                               padding=ft.Padding.only(left=20, right=20, top=14, bottom=10)))
+        q_table: list[ft.Control] = [s_header([("Запрос", 6, None), ("Спрос товара, 28 дн.", 2, None), ("Неделя", 2, None),
+                                               ("Позиция", 2, "Медиана позиции в выдаче за 3 дня по всем регионам")])]
+        for q in product["queries"]:
+            q_trend, q_color = s_change(q["trend"])
+            q_table.append(s_row([
+                s_cell(ft.Row([s_star(q["id"], q["target"]), dtext(q["query"], 13, expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)], spacing=2),
+                       6, right=False),
+                s_cell(dtext(_format_number(round(q["demand_28"])), 13), 2),
+                s_cell(dtext(q_trend, 13, q_color), 2),
+                s_cell(s_position(q["position"], q["measured"]), 2),
+            ]))
+        controls.append(dpanel(ft.Column([dtext("Главные запросы товара", 15, weight=ft.FontWeight.W_700), ft.Container(height=6),
+                                          ft.Column(q_table, spacing=0)], spacing=4),
+                               padding=ft.Padding.only(left=20, right=20, top=14, bottom=10)))
+        controls.append(dpanel(ft.ResponsiveRow([
+            ft.Container(col={"xs": 12, "lg": 6}, content=s_bars("Спрос товара по дням", "Покупателей искали и могли увидеть товар",
+                                                                product["daily"], "searches", pal["accent"], "искавших")),
+            ft.Container(col={"xs": 12, "lg": 6}, content=s_bars("Заказы товара по дням", "Заказано штук", product["daily"], "orders",
+                                                                pal["good"], "шт.")),
+        ], spacing=24, run_spacing=16), padding=ft.Padding.only(left=20, right=20, top=14, bottom=12)))
+        changes = product["changes"]
+        change_lines = [dtext(f"{c['date'][8:10]}.{c['date'][5:7]} — изменено: {', '.join(c['parts'])}", 13) for c in changes[:10]]
+        controls.append(dpanel(ft.Column([
+            dtext("Изменения карточки", 15, weight=ft.FontWeight.W_700),
+            *(change_lines or [dtext(f"Программа сохраняет снимок карточки каждый день (первый — {product['card']['date'] or '—'}). "
+                                     "Когда название, описание, характеристики или фото изменятся, здесь появится дата — по ней будет видно, "
+                                     "как правка повлияла на спрос и позиции.", 13, pal["muted"])]),
+        ], spacing=6), padding=ft.Padding.only(left=20, right=20, top=14, bottom=12)))
+        return controls
+
+    def search_positions(data: dict) -> list[ft.Control]:
+        pal = dash_pal()
+        serp = data["serp"]
+        status_lines: list[ft.Control] = []
+
+        def status(ok: bool, text: str) -> ft.Control:
+            return ft.Row([ft.Icon(ft.Icons.CHECK_CIRCLE if ok else ft.Icons.REMOVE, size=16, color=pal["good"] if ok else pal["muted"]),
+                           dtext(text, 13, expand=True)], spacing=8)
+
+        status_lines.append(status(serp["installed"], "Браузер для парсера установлен" if serp["installed"]
+                                   else "Браузер для парсера не установлен: scripts/serp_profile.py setup"))
+        ready_regions = [r for r in serp["regions"] if r["profile"] and r["active"]]
+        status_lines.append(status(bool(ready_regions), "Профили регионов: " + (", ".join(r["name"] for r in ready_regions) if ready_regions
+                                                                                else "нет — scripts/serp_profile.py create msk \"Москва\"")))
+        status_lines.append(status(serp["enabled"], "Парсер включён" if serp["enabled"] else "Парсер выключен: добавьте SERP_PARSER_ENABLED=1 в .env"))
+        if serp["blocked_until"]:
+            until = datetime.fromisoformat(serp["blocked_until"]).astimezone()
+            status_lines.append(ft.Row([ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=16, color=pal["bad"]),
+                                        dtext(f"Ozon показал капчу — замеры на паузе до {until:%d.%m %H:%M}.", 13, pal["bad"])], spacing=8))
+        if serp["last_run"]:
+            run = serp["last_run"]
+            status_lines.append(dtext(f"Последний замер: {str(run['started_at'])[:16].replace('T', ' ')} UTC — {run['status']}"
+                                      + (f" ({run['message']})" if run.get("message") else ""), 12, pal["muted"]))
+        controls: list[ft.Control] = [dpanel(ft.Column([
+            dtext("Позиции в выдаче по регионам", 15, weight=ft.FontWeight.W_700),
+            dtext("Без подписки Premium Ozon не отдаёт позиции через API, поэтому их раз в день замеряет парсер сайта: до 15 запросов "
+                  "в каждом регионе, с паузами. Позиция — медиана за 3 дня: один удачный замер не делает запрос «в топе».", 12, pal["muted"]),
+            ft.Container(height=4), *status_lines,
+        ], spacing=6), padding=ft.Padding.only(left=20, right=20, top=14, bottom=12))]
+        rows = data["positions"]
+        if not rows:
+            controls.append(dpanel(dtext("Замеров пока нет. Когда парсер заработает, здесь будет таблица «запрос × регион» с изменением "
+                                         "за неделю и подсветкой запросов, где позиции в регионах сильно расходятся — это сигнал "
+                                         "перераспределить остатки по кластерам.", 13, pal["muted"])))
+            return controls
+        regions = [r["name"] for r in serp["regions"] if r["active"]]
+        columns = [("Запрос", 5, None), ("Артикул", 2, None)] + [(name, 2, "Медиана за 3 дня; в скобках — изменение к замеру неделю назад") for name in regions]
+        table: list[ft.Control] = [s_header(columns)]
+        for row in rows:
+            cells = [s_cell(dtext(row["query"] or "", 13, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS), 5, right=False),
+                     s_cell(dtext(str(row["offer_id"] or row["sku"]), 13, weight=ft.FontWeight.W_700), 2)]
+            for name in regions:
+                value = row["regions"].get(name)
+                if not value:
+                    cells.append(s_cell(dtext("—", 13, pal["muted"]), 2))
+                    continue
+                moved = value["change"]
+                suffix = "" if not moved else f" ({'+' if moved > 0 else '−'}{abs(moved):.0f})"
+                cells.append(s_cell(ft.Row([s_position(value["position"], True), dtext(suffix, 11, pal["good"] if moved and moved > 0 else pal["bad"])],
+                                           spacing=2, tight=True, alignment=ft.MainAxisAlignment.END), 2))
+            spread = row["spread"]
+            table.append(s_row(cells, highlight=spread is not None and spread >= 20))
+        controls.append(dpanel(ft.Column([dtext("Запрос × регион", 15, weight=ft.FontWeight.W_700),
+                                          dtext("Подсвечены запросы, где позиции в регионах расходятся на 20+ мест или товар найден не везде.", 12, pal["muted"]),
+                                          ft.Container(height=6), ft.Column(table, spacing=0)], spacing=4),
+                               padding=ft.Padding.only(left=20, right=20, top=14, bottom=10)))
+        return controls
+
+    def render_search_view(push_update: bool = True) -> None:
+        pal = dash_pal()
+        data = search_state.get("data") or {}
+        parts = ["по каким запросам находят товары и чего не хватает карточкам"]
+        if data and not data.get("empty"):
+            last = data["last_date"]
+            parts.append(f"данные Ozon по {last[8:10]}.{last[5:7]} (Ozon отдаёт их через 2 дня)")
+            if data.get("collected_at"):
+                collected = datetime.fromisoformat(data["collected_at"]).astimezone()
+                parts.append(f"загружено {collected:%d.%m в %H:%M}")
+        search_subtitle.value = " · ".join(parts)
+        search_refresh_button.disabled = bool(search_state["busy"]) or job_lock.locked()
+
+        controls: list[ft.Control] = []
+        if search_view is None:
+            controls.append(dpanel(dtext(f"Модуль поиска не загрузился: {SEARCH_IMPORT_ERROR}", 13, pal["bad"])))
+        if search_state.get("error"):
+            controls.append(dpanel(dtext(str(search_state["error"]), 13, pal["bad"])))
+        if search_state["busy"] and not data:
+            controls.append(dpanel(ft.Row([ft.ProgressRing(width=20, height=20, stroke_width=2.4),
+                                           dtext("Считаю спрос, кластеры и покрытие карточек…", 13, pal["muted"])], spacing=12)))
+        elif data.get("empty"):
+            controls.append(dpanel(dtext("Данных пока нет. Нажмите «Обновить данные» — программа загрузит из Ozon запросы за последний месяц "
+                                         "(1–3 минуты). Дальше данные обновляются сами раз в день при запуске программы.", 13, pal["muted"])))
+        elif data:
+            controls.append(ft.Row([s_chip(label, search_state["tab"] == key, lambda _e, k=key: search_set_tab(k)) for key, label in SEARCH_TABS],
+                                   spacing=8, wrap=True))
+            tab = search_state["tab"]
+            builder = {"overview": search_overview, "queries": search_queries, "products": search_products, "positions": search_positions}[tab]
+            controls.extend(builder(data))
+        search_body.controls = controls
+        apply_control_theme(search_body, current_dark["value"])
+        if push_update and page.controls and host.controls and host.controls[0] is search_view_section:
+            page.update(search_view_section)
+
+    search_view_section = ft.Column(
+        [
+            ft.ResponsiveRow(
+                [
+                    ft.Container(col={"xs": 12, "lg": 8},
+                                 content=ft.Column([ft.Text("Поиск и ключевые слова", size=26, weight=ft.FontWeight.W_800, color=TEXT),
+                                                    search_subtitle], spacing=2)),
+                    ft.Container(col={"xs": 12, "lg": 4}, alignment=ft.Alignment(1, 0), content=search_refresh_button),
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                run_spacing=12,
+            ),
+            search_body,
+        ],
+        spacing=14,
+    )
+
+    views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, search_view_section, supply, stock_view, settings, file_view]
     active_store = {"value": "ozon"}
     store_sections = {"ozon": 0, "wb": 0}
-    section_names = ["Бизнес-сводка", "AI-ассистент", "ABC/XYZ-анализ", "Цены и скидки", "Акции", "Реклама", "Анализ", "Поставки", "Остатки", "Настройки", "Файлы"]
+    section_names = ["Бизнес-сводка", "AI-ассистент", "ABC/XYZ-анализ", "Цены и скидки", "Акции", "Реклама", "Анализ", "Поиск", "Поставки", "Остатки", "Настройки", "Файлы"]
 
     wb_dashboard = build_wb_dashboard(
         months=MONTHS, metric=metric, hero_metric=hero_metric, card=card,
@@ -7718,10 +8339,13 @@ def main(page: ft.Page) -> None:
         if is_ozon and views[selected_index] is analysis_view:
             render_analysis_view(push_update=False)
         if is_ozon and views[selected_index] is actions:
+            render_limit_panel(push_update=False)
             render_actions_calendar(push_update=False)
             render_auto_panel(push_update=False)
         if is_ozon and views[selected_index] is stock_view:
             render_stock_view(push_update=False)
+        if is_ozon and views[selected_index] is search_view_section:
+            render_search_view(push_update=False)
         is_ai_view = is_ozon and selected_index == 1
         host.scroll = ft.ScrollMode.HIDDEN if is_ai_view else ft.ScrollMode.AUTO
         host_shell.padding = 0 if is_ai_view else ft.Padding.only(left=8, right=10, top=20, bottom=20)
@@ -7746,8 +8370,12 @@ def main(page: ft.Page) -> None:
             calendar_load()
         if is_ozon and views[selected_index] is actions and not auto_state["started"]:
             auto_load()
+        if is_ozon and views[selected_index] is actions and not limit_state["started"]:
+            limit_load()
         if views[selected_index] is stock_view and not stock_state["started"]:
             stock_load()
+        if is_ozon and views[selected_index] is search_view_section and not search_state["started"]:
+            search_load()
 
     def open_section(view) -> None:
         index = views.index(view)
@@ -7837,6 +8465,7 @@ def main(page: ft.Page) -> None:
             ft.NavigationRailDestination(icon=ft.Icons.LOCAL_ACTIVITY_OUTLINED, selected_icon=ft.Icons.LOCAL_ACTIVITY, label="Акции"),
             ft.NavigationRailDestination(icon=ft.Icons.CAMPAIGN_OUTLINED, selected_icon=ft.Icons.CAMPAIGN, label="Реклама"),
             ft.NavigationRailDestination(icon=ft.Icons.INSIGHTS_OUTLINED, selected_icon=ft.Icons.INSIGHTS, label="Анализ"),
+            ft.NavigationRailDestination(icon=ft.Icons.MANAGE_SEARCH_OUTLINED, selected_icon=ft.Icons.MANAGE_SEARCH, label="Поиск"),
             ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2_OUTLINED, selected_icon=ft.Icons.INVENTORY_2, label="Поставки"),
             ft.NavigationRailDestination(icon=ft.Icons.WAREHOUSE_OUTLINED, selected_icon=ft.Icons.WAREHOUSE, label="Остатки"),
             ft.NavigationRailDestination(icon=ft.Icons.SETTINGS_OUTLINED, selected_icon=ft.Icons.SETTINGS, label="Settings"),
@@ -7971,6 +8600,7 @@ def main(page: ft.Page) -> None:
         render_abc_view(push_update=False)
         render_wb_supply_results(push_update=False)
         render_auto_panel(push_update=False)
+        render_limit_panel(push_update=False)
         render_stock_view(push_update=False)
         style_store_tabs()
         set_status(state.value, status_detail.value, status_tone["value"], busy=spin.visible, cancellable=cancel_button.visible)
@@ -8142,6 +8772,50 @@ def main(page: ft.Page) -> None:
     apply_sidebar_layout()
     apply_theme(start_dark)
 
+    def auto_collect_search() -> None:
+        """
+        Ежедневный сбор поисковой аналитики (scripts/search_collect.py) при запуске, если сегодня его ещё не было,
+        затем — если включён SERP_PARSER_ENABLED — замер позиций в выдаче (scripts/serp_collect.py).
+        Без job_lock: оба только читают Ozon и держат свои блокировки, пользователю не мешают.
+        """
+        settings = read_settings(ROOT)
+        if search_db is None or not settings.get("OZON_CLIENT_ID") or not settings.get("OZON_API_KEY"):
+            return
+        serp_enabled = str(settings.get("SERP_PARSER_ENABLED") or "").strip().lower() in ("1", "true", "yes", "да")
+        try:
+            collect_due = not search_db.collected_today()
+        except Exception as exc:
+            log_store.append(f"Поисковая аналитика: не удалось открыть базу — {exc}")
+            return
+        # Замер позиций сам пропускает уже замеренное сегодня, поэтому запускаем его, даже если аналитика уже собрана.
+        if not collect_due and not serp_enabled:
+            return
+
+        def report(title: str, code: int, output: str, message: str | None) -> None:
+            def done() -> None:
+                log_store.append(f"{title} (фон):\n" + output)
+                # Плашку статуса не трогаем, пока идёт задача пользователя: сообщение осталось бы поверх её статуса.
+                if message and not job_lock.locked():
+                    toast(message, error=True)
+                if search_state["started"]:
+                    search_load()  # раздел «Поиск» уже открывали — показываем свежие данные
+            ui_queue.put(("call", done))
+
+        def worker() -> None:
+            if collect_due:
+                code, output = stream_process([PYTHON, str(ROOT / "scripts" / "search_collect.py")], on_line=lambda _line: None)
+                report("Сбор поисковой аналитики", code, output,
+                       "Поисковая аналитика собрана не полностью — подробности в журнале." if code == 1 else None)
+            if not serp_enabled:
+                return
+            # Замер позиций идёт 20–30 минут: паузы между запросами, чтобы Ozon не показал капчу.
+            code, output = stream_process([PYTHON, str(ROOT / "scripts" / "serp_collect.py")], on_line=lambda _line: None)
+            messages = {1: "Замер позиций в выдаче прошёл с ошибками — подробности в журнале.",
+                        3: "Ozon показал капчу — замер позиций остановлен на сутки. Подробности в журнале."}
+            report("Замер позиций в выдаче", code, output, messages.get(code))
+
+        page.run_thread(worker)
+
     async def initialize_app() -> None:
         page.update()
         await asyncio.sleep(0.12)
@@ -8158,6 +8832,7 @@ def main(page: ft.Page) -> None:
         page.update()
         if needs_setup(ROOT):
             open_marketplace_settings()
+        auto_collect_search()
 
     page.run_task(ui_event_loop)
     page.run_task(initialize_app)

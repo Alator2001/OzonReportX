@@ -31,7 +31,7 @@
 - Слева `sidebar`: переключатель магазина и темы (`top_tools_shell`), меню разделов (`rail`),
   блок статуса задачи (`status_shell`) с кнопкой «Отмена».
 - Справа `host` — колонка, в которую подставляется текущий раздел. Список разделов —
-  `views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, supply, finance, settings, file_view]`
+  `views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, search_view_section, supply, stock_view, settings, file_view]`
   (`app_flet.py:7731`), подписи — `section_names`.
 - `show_store_section(index)` (`app_flet.py:7786`) меняет содержимое `host`, перерисовывает
   раздел и **запускает автоматические загрузки при входе**:
@@ -41,6 +41,7 @@
 | «Цены и скидки» | загрузка заявок на скидку, затем синхронизация цен `ui_actions.py refresh-pricing` — не чаще раза в 5 минут и только если нет другой задачи и несохранённых правок (`auto_sync_pricing`) | синхронизация — да, заявки — нет |
 | «Акции» (первый вход) | `calendar_load()` — календарь акций; `auto_load()` — автоакции | нет |
 | «Реклама», «Анализ» | только перерисовка, загрузок нет | — |
+| «Поиск» (первый вход) | `search_load()` — чтение `search data/search.db` через `search_view.load()`, без сети | нет |
 
 - **Магазин Wildberries.** `active_store` переключает Ozon/WB. Для WB `wb_section(index)` возвращает
   свои экраны: сводку `wb_dashboard` (собирается в `scripts/wb_dashboard.py`), план запасов
@@ -120,7 +121,7 @@ finish(title, code, output)  — в потоке интерфейса
 | `("call", fn)` | выполнить `fn()` в потоке интерфейса |
 | `("prompt", label, source_line, holder, event)` | показать диалог ввода суммы маркетинга (см. ниже) |
 | `("ads_rebuild",)` | пересобрать план рекламы |
-| `("ai_step" / "ai_stream_start" / "ai_thinking_chunk" / "ai_stream_chunk" / "ai_finish", …)` | потоковый вывод AI-ассистента |
+| `("ai_step" / "ai_stream_start" / "ai_thinking_chunk" / "ai_stream_chunk" / "ai_stream_reset" / "ai_finish", …)` | потоковый вывод AI-ассистента ([14](14-ai-assistant.md#цикл-ответа--ai_agentagent)) |
 
 ### Вопрос пользователю из дочернего процесса
 
