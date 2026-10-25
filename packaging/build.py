@@ -82,6 +82,7 @@ def pack(version: str) -> Path:
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # консоль Windows бывает в cp1252
     parser = argparse.ArgumentParser(description="Сборка OzonReportX для текущей ОС.")
     parser.add_argument("--version", default=None, help="Номер версии; по умолчанию — из README.md")
     args = parser.parse_args()

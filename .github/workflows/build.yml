@@ -27,6 +27,9 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       GH_TOKEN: ${{ github.token }}
+      # Консоль Windows-раннера в cp1252: без этого Python падает на первом же print с кириллицей.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
         with:
