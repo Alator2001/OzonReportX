@@ -54,3 +54,8 @@ Desktop.ini
 /actions history
 /search data
 search_settings.json
+
+# Сборка приложения (packaging/build.py)
+/build/
+/dist/
+*.spec

@@ -1,0 +1,4 @@
+# Сборка приложения (packaging/build.py); для работы программы не нужны.
+-r requirements.lock.txt
+pyinstaller==6.22.3
+flet-cli==0.84.0

@@ -21,6 +21,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
+try:
+    from scripts.app_paths import ENV_FILE
+except ModuleNotFoundError:
+    from app_paths import ENV_FILE
 
 try:
     from scripts.report_http import create_session
@@ -43,7 +47,7 @@ class AccessDenied(Exception):
 
 def _headers() -> Dict[str, str]:
     # Ключи читаются при каждом запросе: модуль импортирует приложение, и без ключей он не должен падать при импорте.
-    load_dotenv()
+    load_dotenv(ENV_FILE)
     client_id, api_key = os.getenv("OZON_CLIENT_ID"), os.getenv("OZON_API_KEY")
     if not client_id or not api_key:
         raise RuntimeError("Не заданы OZON_CLIENT_ID и OZON_API_KEY. Укажите их в «Настройках».")

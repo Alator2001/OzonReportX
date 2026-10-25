@@ -17,8 +17,12 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+try:
+    from scripts.app_paths import DATA_ROOT
+except ModuleNotFoundError:
+    from app_paths import DATA_ROOT
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = DATA_ROOT
 DATA_DIR = ROOT / "search data"
 DB_PATH = DATA_DIR / "search.db"
 

@@ -22,10 +22,12 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 script_dir = Path(__file__).resolve().parent
-repo_root = script_dir.parent
-for path in (str(repo_root), str(script_dir)):
+code_root = script_dir.parent
+for path in (str(code_root), str(script_dir)):
     if path not in sys.path:
         sys.path.insert(0, path)
+from app_paths import DATA_ROOT  # noqa: E402
+repo_root = DATA_ROOT
 
 import fbo_supply_plan as ozon_plan  # noqa: E402
 import wb_supply_plan as wb_plan  # noqa: E402

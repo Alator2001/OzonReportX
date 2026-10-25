@@ -27,10 +27,12 @@ import pandas as pd
 import requests
 
 script_dir = Path(__file__).resolve().parent
-repo_root = script_dir.parent
-for path in (str(repo_root), str(script_dir)):
+code_root = script_dir.parent
+for path in (str(code_root), str(script_dir)):
     if path not in sys.path:
         sys.path.insert(0, path)
+from app_paths import DATA_ROOT  # noqa: E402
+repo_root = DATA_ROOT
 
 from fbo_supply_plan import STOCKS_REPORTS_DIR, _article_sort_key, format_rub, poisson_quantile  # noqa: E402
 

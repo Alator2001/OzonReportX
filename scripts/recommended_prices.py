@@ -30,6 +30,10 @@ from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 try:
+    from scripts.app_paths import DATA_ROOT, ENV_FILE, SCRIPTS_DIR, script_command
+except ModuleNotFoundError:
+    from app_paths import DATA_ROOT, ENV_FILE, SCRIPTS_DIR, script_command
+try:
     from scripts.file_lock import locked_costs
 except ModuleNotFoundError:
     from file_lock import locked_costs
@@ -39,7 +43,7 @@ except ModuleNotFoundError:
     from file_io import costs_excel_writer, save_workbook_atomic, write_costs_dataframe, read_costs_dataframe
 
 # Загружаем переменные окружения для API Ozon
-load_dotenv()
+load_dotenv(ENV_FILE)
 OZON_CLIENT_ID = os.getenv('OZON_CLIENT_ID')
 OZON_API_KEY = os.getenv('OZON_API_KEY')
 
@@ -1227,21 +1231,14 @@ def generate_monthly_report(repo_root: Path, month: int, year: int) -> Path:
     reports_dir = repo_root / REPORTS_DIR_NAME
     reports_dir.mkdir(exist_ok=True)
     
-    # Определяем путь к Python из виртуального окружения или системный
-    venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
-    if not venv_python.exists():
-        venv_python = repo_root / ".venv" / "bin" / "python"
-    if not venv_python.exists():
-        venv_python = Path(sys.executable)  # Используем текущий интерпретатор
-    
-    report_script = repo_root / "scripts" / "Monthly_sales_report.py"
+    report_script = SCRIPTS_DIR / "Monthly_sales_report.py"
     if not report_script.exists():
         raise FileNotFoundError(f"Скрипт генерации отчёта не найден: {report_script}")
     
     # Запускаем генерацию отчёта с параметрами месяца и года
     print("⏳ Запуск генерации отчёта...")
     result = subprocess.run(
-        [str(venv_python), str(report_script), "--month", str(month), "--year", str(year)],
+        script_command("Monthly_sales_report.py", "--month", str(month), "--year", str(year)),
         cwd=repo_root,
     )
     
@@ -2292,8 +2289,7 @@ def get_fbo_stocks_by_offer_ids(offer_ids: List[str]) -> Dict[str, int]:
 
 def main():
     import argparse
-    script_dir = Path(__file__).resolve().parent
-    repo_root = script_dir.parent
+    repo_root = DATA_ROOT
 
     parser = argparse.ArgumentParser(description="Рассчёт рекомендуемых цен продажи по артикулам (минимальная и желательная).")
     args = parser.parse_args()

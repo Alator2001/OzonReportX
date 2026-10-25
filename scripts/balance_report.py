@@ -17,8 +17,12 @@ try:
     from scripts.file_io import excel_writer, atomic_output_path
 except ModuleNotFoundError:
     from file_io import excel_writer, atomic_output_path
+try:
+    from scripts.app_paths import DATA_ROOT, ENV_FILE
+except ModuleNotFoundError:
+    from app_paths import DATA_ROOT, ENV_FILE
 
-load_dotenv()
+load_dotenv(ENV_FILE)
 
 BALANCE_REPORTS_DIR = "balance reports"
 
@@ -284,7 +288,7 @@ def main(argv=None):
         print(f"   Период не более {MAX_DAYS} дней.\n")
         date_from, date_to = ask_date_range()
 
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = DATA_ROOT
     print(f"\n⏳ Запрос отчёта за {date_from} – {date_to}...")
     try:
         data = get_balance_report(date_from, date_to)

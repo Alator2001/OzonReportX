@@ -20,9 +20,13 @@ except ModuleNotFoundError:
     from file_io import read_costs_dataframe
 import requests
 from dotenv import load_dotenv
+try:
+    from scripts.app_paths import DATA_ROOT, ENV_FILE
+except ModuleNotFoundError:
+    from app_paths import DATA_ROOT, ENV_FILE
 
 # Загружаем переменные окружения для API Ozon
-load_dotenv()
+load_dotenv(ENV_FILE)
 OZON_CLIENT_ID = os.getenv('OZON_CLIENT_ID')
 OZON_API_KEY = os.getenv('OZON_API_KEY')
 
@@ -412,8 +416,7 @@ def run(repo_root: Path) -> None:
 
 
 def main():
-    script_dir = Path(__file__).resolve().parent
-    repo_root = script_dir.parent
+    repo_root = DATA_ROOT
     
     try:
         run(repo_root)

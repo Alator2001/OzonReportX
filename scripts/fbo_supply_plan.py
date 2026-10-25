@@ -29,9 +29,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 script_dir = Path(__file__).resolve().parent
-repo_root = script_dir.parent
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
+from app_paths import DATA_ROOT  # noqa: E402
+repo_root = DATA_ROOT
 
 try:
     from scripts.file_io import atomic_output_path

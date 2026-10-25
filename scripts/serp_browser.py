@@ -12,6 +12,10 @@ from typing import Any, Dict, Iterator, Optional
 from urllib.parse import quote, unquote, urlsplit
 
 from dotenv import load_dotenv
+try:
+    from scripts.app_paths import ENV_FILE
+except ModuleNotFoundError:
+    from app_paths import ENV_FILE
 
 try:
     from scripts import serp_parser as parser
@@ -36,7 +40,7 @@ def proxy_settings(env_name: Optional[str]) -> Optional[Dict[str, str]]:
     """Прокси региона из .env по имени переменной: http://user:pass@host:port → настройки Playwright."""
     if not env_name:
         return None
-    load_dotenv()
+    load_dotenv(ENV_FILE)
     url = (os.getenv(env_name) or "").strip()
     if not url:
         raise RuntimeError(f"В .env нет переменной {env_name} с адресом прокси для региона.")

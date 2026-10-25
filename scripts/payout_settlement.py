@@ -14,7 +14,6 @@
 """
 
 import json
-import os
 import re
 import sys
 from calendar import monthrange
@@ -27,9 +26,11 @@ from openpyxl import load_workbook
 try:
     from scripts.balance_report import get_balance_report, BALANCE_REPORTS_DIR
     from scripts.file_io import save_workbook_atomic
+    from scripts.app_paths import DATA_ROOT
 except ModuleNotFoundError:
     from balance_report import get_balance_report, BALANCE_REPORTS_DIR
     from file_io import save_workbook_atomic
+    from app_paths import DATA_ROOT
 
 MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
           "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
@@ -261,7 +262,7 @@ def print_summary(summary: dict) -> None:
 
 
 def main() -> None:
-    reports_dir = Path(os.path.dirname(os.path.abspath(__file__))).parent / "reports"
+    reports_dir = DATA_ROOT / "reports"
     print("💸 Сверяем выплаты Ozon с отчётами...")
     print_summary(update_reports(reports_dir))
 

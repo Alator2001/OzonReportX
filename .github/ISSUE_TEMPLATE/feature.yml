@@ -1,0 +1,20 @@
+name: Идея или пожелание
+description: Чего не хватает в программе
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу хотите решить
+      description: Например, «каждый месяц вручную считаю X в Excel»
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Как это могло бы выглядеть
+  - type: dropdown
+    id: marketplace
+    attributes:
+      label: Маркетплейс
+      options: [Ozon, Wildberries, Оба]

@@ -10,11 +10,16 @@ import subprocess
 import tempfile
 from pathlib import Path
 from packaging import version
+try:
+    from scripts.app_paths import CODE_ROOT, DATA_ROOT, FROZEN
+except ModuleNotFoundError:
+    from app_paths import CODE_ROOT, DATA_ROOT, FROZEN
 
 # Конфигурация
 GITHUB_REPO = "Alator2001/OzonReportX"
 CURRENT_VERSION = "1.0.0"
-VERSION_FILE = Path(__file__).resolve().parent.parent / "version.txt"
+# В сборке version.txt кладётся внутрь при сборке (packaging/build.py), из исходников — лежит в корне репозитория.
+VERSION_FILE = CODE_ROOT / "version.txt"
 
 
 def get_current_version():
@@ -40,6 +45,7 @@ def get_latest_release():
         return {
             'tag': data['tag_name'].lstrip('v'),
             'download_url': data['zipball_url'],
+            'page_url': data.get('html_url') or f"https://github.com/{GITHUB_REPO}/releases/latest",
             'name': data.get('name', 'Без названия'),
             'notes': data.get('body', 'Нет описания')
         }
@@ -232,6 +238,15 @@ def check_and_update(assume_yes=False, restart=True):
     print(f"\n🎉 Доступно обновление: {latest_info['name']}")
     print(f"\nЧто нового:\n{latest_info['notes']}\n")
     
+    if FROZEN:
+        # Собранное приложение не может заменить само себя: открываем страницу релиза со сборками.
+        print(f"Скачайте новую версию для своей системы: {latest_info['page_url']}")
+        print(f"Ваши отчёты, ключи и себестоимость в папке {DATA_ROOT} сохранятся.")
+        if assume_yes:
+            import webbrowser
+            webbrowser.open(latest_info['page_url'])
+        return False
+
     if not assume_yes:
         if not sys.stdin.isatty():
             print("Чтобы установить, нажмите «Установить обновление» в разделе «Настройки».")
@@ -242,7 +257,7 @@ def check_and_update(assume_yes=False, restart=True):
             return False
     
     # Процесс обновления
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = CODE_ROOT
     temp_dir = Path(tempfile.gettempdir()) / "ozonreportx_update"
     
     try:

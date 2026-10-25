@@ -28,8 +28,12 @@ try:
     from scripts.file_lock import exclusive_file
 except ModuleNotFoundError:
     from file_lock import exclusive_file
+try:
+    from scripts.app_paths import DATA_ROOT
+except ModuleNotFoundError:
+    from app_paths import DATA_ROOT
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = DATA_ROOT
 WAREHOUSE_PATH = Path(".cache") / "ai" / "warehouse.db"
 # Меняйте при изменении CATALOG: старая база удаляется и собирается заново.
 SCHEMA_VERSION = 3

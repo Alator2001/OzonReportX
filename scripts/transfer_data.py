@@ -16,8 +16,12 @@ import unicodedata
 import zipfile
 from datetime import datetime
 from pathlib import Path
+try:
+    from scripts.app_paths import DATA_ROOT
+except ModuleNotFoundError:
+    from app_paths import DATA_ROOT
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = DATA_ROOT
 
 # Файлы и папки, которые нужны программе, но исключены из git.
 TRANSFER_FILES = [".env", "costs.xlsx", "wb_costs.xlsx", "margin_settings.json", "search_settings.json"]

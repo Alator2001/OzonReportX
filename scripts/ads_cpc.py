@@ -22,9 +22,10 @@ from typing import Any, Dict, List, Optional
 import requests
 
 script_dir = Path(__file__).resolve().parent
-repo_root = script_dir.parent
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
+from app_paths import DATA_ROOT  # noqa: E402
+repo_root = DATA_ROOT
 
 PERF_HOST = "https://api-performance.ozon.ru"
 SETTINGS_FILENAME = "ads_settings.json"

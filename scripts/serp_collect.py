@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+try:
+    from scripts.app_paths import ENV_FILE
+except ModuleNotFoundError:
+    from app_paths import ENV_FILE
 
 try:
     from scripts import search_db as db
@@ -51,7 +55,7 @@ class RegionMismatch(Exception):
 
 
 def enabled() -> bool:
-    load_dotenv()
+    load_dotenv(ENV_FILE)
     return (os.getenv("SERP_PARSER_ENABLED") or "").strip().lower() in ("1", "true", "yes", "да")
 
 

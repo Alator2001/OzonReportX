@@ -1,0 +1,35 @@
+name: Ошибка
+description: Программа работает не так, как ожидалось
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Не прикладывайте ключи API, файл .env и отчёты с цифрами, которые не хотите раскрывать."
+  - type: input
+    id: version
+    attributes:
+      label: Версия программы
+      description: «Настройки» → «Проверить обновления»
+      placeholder: "3.4.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Система
+      options: [Windows, "macOS (Apple M1–M4)", macOS (Intel), Из исходников]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Что случилось
+      description: Что делали, что ожидали и что получилось. Скриншот поможет.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Журнал
+      description: Сообщение об ошибке или конец файла из папки с данными `.cache/logs/`
+      render: text

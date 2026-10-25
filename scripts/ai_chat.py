@@ -12,8 +12,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
+try:
+    from scripts.app_paths import ENV_FILE
+except ModuleNotFoundError:
+    from app_paths import ENV_FILE
 
-load_dotenv()
+load_dotenv(ENV_FILE)
 OLLAMA_HOST = (os.getenv("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
 OLLAMA_CHAT_URL = f"{OLLAMA_HOST}/api/chat"
 

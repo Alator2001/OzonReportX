@@ -103,6 +103,10 @@ except Exception as exc:
     ads_save_settings = None
     ADS_IMPORT_ERROR = str(exc)
 
+from scripts.app_paths import (
+    CODE_ROOT, DATA_ROOT, DATA_ROOT_SOURCE, DEFAULT_DATA_ROOT, FROZEN, SCRIPTS_DIR, python_executable, save_data_folder,
+)
+
 try:
     from scripts.organic_analysis import load_last_result as organic_load_last, run_analysis as organic_run_analysis
     ORGANIC_IMPORT_ERROR = None
@@ -111,12 +115,10 @@ except Exception as exc:
     organic_run_analysis = None
     ORGANIC_IMPORT_ERROR = str(exc)
 
-ROOT = Path(__file__).resolve().parent
-SCRIPTS = ROOT / "scripts"
-PYTHON = next(
-    (p for p in [ROOT / ".venv" / "Scripts" / "python.exe", ROOT / ".venv" / "bin" / "python"] if p.exists()),
-    Path(sys.executable),
-)
+# ROOT — данные пользователя (отчёты, costs.xlsx, .env), CODE_ROOT — код и картинки; в сборке это разные папки.
+ROOT = DATA_ROOT
+SCRIPTS = SCRIPTS_DIR
+PYTHON = python_executable()
 MONO_FONT = "Consolas" if os.name == "nt" else "Menlo" if sys.platform == "darwin" else "monospace"
 
 BG = "#F5F5F7"
@@ -203,6 +205,31 @@ def open_path(path: Path) -> None:
         os.startfile(str(path))
         return
     subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+
+
+def pick_folder(prompt: str, initial: Path) -> Path | None:
+    """Системный диалог выбора папки. Не ft.FilePicker: клиенту Flet на macOS не хватает разрешения
+    на доступ к файлам (ENTITLEMENT_NOT_FOUND), и диалог ронял окно программы."""
+    if sys.platform == "darwin":
+        # Строки AppleScript экранируются как в JSON, но без \uXXXX: кириллицу AppleScript так не читает.
+        quote = lambda text: json.dumps(text, ensure_ascii=False)  # noqa: E731
+        script = f"POSIX path of (choose folder with prompt {quote(prompt)} default location (POSIX file {quote(str(initial))}))"
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    elif os.name == "nt":
+        script = (
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = $env:PICK_PROMPT; "
+            "$d.SelectedPath = $env:PICK_INITIAL; if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script], capture_output=True, text=True, encoding="utf-8",
+            env={**os.environ, "PICK_PROMPT": prompt, "PICK_INITIAL": str(initial)},
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    else:
+        result = subprocess.run(["zenity", "--file-selection", "--directory", f"--title={prompt}"], capture_output=True, text=True)
+    path = result.stdout.strip() if result.returncode == 0 else ""
+    return Path(path) if path else None
 
 
 def kill_process_tree(proc: subprocess.Popen, force: bool = False) -> None:
@@ -7519,6 +7546,43 @@ def main(page: ft.Page) -> None:
         page.update()
         page.run_task(load_recent_periods)
 
+    def data_folder_note() -> str:
+        if DATA_ROOT_SOURCE == "env":
+            return "Папка задана переменной OZONREPORTX_HOME при запуске — выбор ниже начнёт действовать без неё."
+        if DATA_ROOT_SOURCE == "chosen":
+            return "Выбрана вами. Программа запомнила её и открывает данные отсюда."
+        return "По умолчанию. Можно выбрать другую — например, папку, где уже лежат ваши отчёты и costs.xlsx."
+
+    async def choose_data_folder(_e=None) -> None:
+        folder = await asyncio.to_thread(pick_folder, "Папка с данными OzonReportX", ROOT)
+        if not folder:
+            return
+        if not os.access(folder, os.W_OK):
+            toast("В эту папку нельзя записывать — выберите другую.", True)
+            return
+        save_data_folder(folder)
+        has_data = any((folder / name).exists() for name in (".env", "costs.xlsx", "reports"))
+        toast(f"Папка с данными: {folder}. Перезапустите программу, чтобы открыть её."
+              + ("" if has_data else " В ней пока нет данных OzonReportX — программа начнёт с чистого листа."))
+
+    def reset_data_folder(_e=None) -> None:
+        save_data_folder(None)
+        toast(f"Папка с данными: {DEFAULT_DATA_ROOT}. Перезапустите программу, чтобы открыть её.")
+
+    data_folder_card = card(
+        "Папка с данными",
+        "Здесь программа хранит отчёты, costs.xlsx, ключи и настройки. Новая папка начинает действовать после перезапуска.",
+        [
+            ft.Text(str(ROOT), size=12, color=TEXT, selectable=True),
+            ft.Text(data_folder_note(), size=12, color=MUTED),
+            ft.Button("Выбрать папку…", on_click=choose_data_folder),
+            ft.TextButton("Открыть папку", on_click=lambda _e: reveal_path(ROOT, "папка с данными")),
+            ft.TextButton("Вернуть «Документы/OzonReportX»", on_click=reset_data_folder,
+                          visible=DATA_ROOT_SOURCE == "chosen"),
+        ],
+        width=320,
+    )
+
     settings = ft.Column(
         [
             ft.Text("Настройки", size=26, weight=ft.FontWeight.W_800, color=TEXT),
@@ -7538,6 +7602,7 @@ def main(page: ft.Page) -> None:
                         ],
                         width=320,
                     ),
+                    *([data_folder_card] if FROZEN else []),
                     card(
                         "Рабочие файлы",
                         "Быстрый доступ к ключевым папкам и costs.xlsx.",
@@ -7550,12 +7615,14 @@ def main(page: ft.Page) -> None:
                     ),
                     card(
                         "Проверка обновлений",
+                        "«Проверить» показывает новую версию и что в ней изменилось. «Скачать» открывает страницу новой "
+                        "версии: установите её поверх старой, данные в папке с данными сохранятся." if FROZEN else
                         "«Проверить» показывает новую версию и что в ней изменилось. «Установить» делает резервную копию, "
                         "ставит новую версию из GitHub и сохраняет ваши данные; после установки перезапустите приложение.",
                         [
                             ft.Button("Проверить обновления", bgcolor=ACCENT, color="white",
                                       on_click=lambda _e: job("Проверка обновлений", [str(PYTHON), str(SCRIPTS / "_auto_update.py")])),
-                            ft.TextButton("Установить обновление",
+                            ft.TextButton("Скачать обновление" if FROZEN else "Установить обновление",
                                           on_click=lambda _e: job("Установка обновления",
                                                                   [str(PYTHON), str(SCRIPTS / "_auto_update.py"), "--yes", "--no-restart"])),
                         ],
@@ -8709,7 +8776,7 @@ def main(page: ft.Page) -> None:
                     [
                         ft.Container(
                             content=ft.Image(
-                                src=str((ROOT / "img" / "ozonreportx-mark.svg").resolve()),
+                                src=str((CODE_ROOT / "img" / "ozonreportx-mark.svg").resolve()),
                                 width=42,
                                 height=42,
                             ),
@@ -8803,13 +8870,13 @@ def main(page: ft.Page) -> None:
 
         def worker() -> None:
             if collect_due:
-                code, output = stream_process([PYTHON, str(ROOT / "scripts" / "search_collect.py")], on_line=lambda _line: None)
+                code, output = stream_process([PYTHON, str(SCRIPTS / "search_collect.py")], on_line=lambda _line: None)
                 report("Сбор поисковой аналитики", code, output,
                        "Поисковая аналитика собрана не полностью — подробности в журнале." if code == 1 else None)
             if not serp_enabled:
                 return
             # Замер позиций идёт 20–30 минут: паузы между запросами, чтобы Ozon не показал капчу.
-            code, output = stream_process([PYTHON, str(ROOT / "scripts" / "serp_collect.py")], on_line=lambda _line: None)
+            code, output = stream_process([PYTHON, str(SCRIPTS / "serp_collect.py")], on_line=lambda _line: None)
             messages = {1: "Замер позиций в выдаче прошёл с ошибками — подробности в журнале.",
                         3: "Ozon показал капчу — замер позиций остановлен на сутки. Подробности в журнале."}
             report("Замер позиций в выдаче", code, output, messages.get(code))

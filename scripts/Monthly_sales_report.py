@@ -18,6 +18,10 @@ try:
 except ModuleNotFoundError:
     from report_http import create_session
 try:
+    from scripts.app_paths import DATA_ROOT, ENV_FILE
+except ModuleNotFoundError:
+    from app_paths import DATA_ROOT, ENV_FILE
+try:
     from scripts.payout_settlement import update_reports as update_payout_settlement, print_summary as print_payout_summary
 except ModuleNotFoundError:
     from payout_settlement import update_reports as update_payout_settlement, print_summary as print_payout_summary
@@ -27,7 +31,7 @@ except ModuleNotFoundError:
     from file_io import excel_writer, atomic_output_path, save_workbook_atomic, read_costs_dataframe
 
 # 🔐 Загружаем данные для авторизации из переменных окружения
-load_dotenv()
+load_dotenv(ENV_FILE)
 CLIENT_ID = os.getenv('OZON_CLIENT_ID')
 API_KEY = os.getenv('OZON_API_KEY')
 
@@ -82,8 +86,7 @@ def _normalize_articul_key(s: str) -> str:
 
 # 📄 Загрузка карты себестоимости из внешнего файла
 def load_cost_map():
-    script_dir = os.path.dirname(__file__)
-    repo_root = os.path.abspath(os.path.join(script_dir, '..'))
+    repo_root = str(DATA_ROOT)
 
     candidates = [
         os.path.join(repo_root, 'costs.xlsx'),
@@ -437,8 +440,7 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
 
     # Формируем путь и имя файла в папке ../reports относительно этого скрипта
     if not output_file:
-        script_dir = os.path.dirname(__file__)
-        reports_dir = os.path.abspath(os.path.join(script_dir, '..', 'reports'))
+        reports_dir = str(DATA_ROOT / 'reports')
         _ensure_reports_dir_and_check_space(reports_dir)
         output_file = os.path.join(reports_dir, f"{month_name} {year}.xlsx")
 
@@ -1104,7 +1106,7 @@ def main(argv=None):
         all_orders = fbs_orders + fbo_orders
         print(f"🔢 Найдено заказов: {len(all_orders)}")
 
-        reports_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'reports'))
+        reports_dir = str(DATA_ROOT / 'reports')
         _ensure_reports_dir_and_check_space(reports_dir)
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]

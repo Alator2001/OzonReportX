@@ -19,9 +19,10 @@ except ModuleNotFoundError:
 import numpy as np
 
 script_dir = Path(__file__).resolve().parent
-repo_root = script_dir.parent
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
+from app_paths import DATA_ROOT, SCRIPTS_DIR, python_executable  # noqa: E402
+repo_root = DATA_ROOT
 
 MONTHS_RU = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -62,13 +63,9 @@ def _ensure_abc_xyz_report(repo_root: Path, from_month: int, from_year: int, to_
     # Запуск построения ABC&XYZ
     reports_dir = repo_root / REPORTS_DIR
     reports_dir.mkdir(parents=True, exist_ok=True)
-    main_script = repo_root / "scripts" / "Monthly_sales_report.py"
-    abc_script = repo_root / "scripts" / "ABC_XYZ_analytics_report.py"
-    venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
-    if not venv_python.exists():
-        venv_python = repo_root / ".venv" / "bin" / "python"
-    if not venv_python.exists():
-        venv_python = Path(sys.executable)
+    main_script = SCRIPTS_DIR / "Monthly_sales_report.py"
+    abc_script = SCRIPTS_DIR / "ABC_XYZ_analytics_report.py"
+    venv_python = python_executable()
     import subprocess
     # Недостающие месячные отчёты
     months_need = []
