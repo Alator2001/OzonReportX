@@ -78,7 +78,10 @@ class ReportWritingTests(unittest.TestCase):
             report(reports / "Март 2025.xlsx", cost=80, profit=20)
             report(reports / "WB Март 2025.xlsx", cost=999, profit=999)
             fetch = balance_api({"2025-03-14": 120.0, "2025-04-10": 60.0})
-            summary = ps.update_reports(reports, today=date(2025, 4, 20), fetch=fetch)
+            # Отчёты лежат по-старому прямо в reports/ — сверка сама раскладывает их по reports/Ozon|WB/<год>/.
+            summary = ps.update_reports(Path(tmp), today=date(2025, 4, 20), fetch=fetch)
+            wb_reports, reports = reports / "WB" / "2025", reports / "Ozon" / "2025"
+            self.assertEqual(sorted(p.name for p in reports.glob("*.xlsx")), ["Март 2025.xlsx", "Февраль 2025.xlsx"])
 
             self.assertEqual(summary["paid"], 180.0)
             self.assertEqual(summary["first_open_month"], date(2025, 3, 1))
@@ -88,7 +91,7 @@ class ReportWritingTests(unittest.TestCase):
             self.assertEqual((feb["Y2"].value, feb["Y5"].value, feb["X7"].value), (0.0, 0.0, "Да"))
             mar = load_workbook(reports / "Март 2025.xlsx")["Заказы"]
             self.assertEqual((mar["X2"].value, mar["Y2"].value, mar["Y5"].value, mar["X7"].value), (30.0, 50.0, 20.0, "Нет"))
-            self.assertIsNone(load_workbook(reports / "WB Март 2025.xlsx")["Заказы"]["S1"].value)
+            self.assertIsNone(load_workbook(wb_reports / "WB Март 2025.xlsx")["Заказы"]["S1"].value)
 
 
 if __name__ == "__main__":

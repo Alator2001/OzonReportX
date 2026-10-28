@@ -59,7 +59,7 @@
 ### Расходы Ozon: `CostStructure`
 
 `load_cost_structure(report_path)` (`recommended_prices.py:1049`) читает **месячный отчёт за прошлый месяц**
-(`reports/<Месяц> <Год>.xlsx`, см. [04](04-monthly-report.md)). Если его нет — формирует его
+(`reports/Ozon/<Год>/<Месяц> <Год>.xlsx`, см. [04](04-monthly-report.md)). Если его нет — формирует его
 (`generate_monthly_report`, маркетинг = 0).
 
 - **Комиссия — доля от цены**: Q15 «Комиссии Ozon %» (среднее по строкам |комиссия| / цена).

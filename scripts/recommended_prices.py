@@ -30,6 +30,12 @@ from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 try:
+    from scripts.report_book import data_sheet_name
+    from scripts.report_paths import ozon_report_path
+except ModuleNotFoundError:
+    from report_book import data_sheet_name
+    from report_paths import ozon_report_path
+try:
     from scripts.app_paths import DATA_ROOT, ENV_FILE, SCRIPTS_DIR, script_command
 except ModuleNotFoundError:
     from app_paths import DATA_ROOT, ENV_FILE, SCRIPTS_DIR, script_command
@@ -74,7 +80,6 @@ MONTHS_RU = [
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
 ]
 
-REPORTS_DIR_NAME = "reports"
 COSTS_FILENAME = "costs.xlsx"
 ORDER_SHEET = "Заказы"
 MARGIN_SETTINGS_FILE = "margin_settings.json"
@@ -1028,9 +1033,8 @@ def get_prev_month_year():
 
 
 def get_report_path(repo_root: Path, year: int, month: int) -> Path:
-    """Путь к файлу месячного отчёта вида «Декабрь 2025.xlsx»."""
-    name = f"{MONTHS_RU[month - 1]} {year}.xlsx"
-    return repo_root / REPORTS_DIR_NAME / name
+    """Путь к файлу месячного отчёта: reports/Ozon/2025/Декабрь 2025.xlsx."""
+    return ozon_report_path(repo_root, year, month)
 
 
 LOGISTICS_COLUMN = "Логистика (Включает операционные ошибки продавца)"
@@ -1101,9 +1105,10 @@ def load_cost_structure(report_path: Path) -> CostStructure:
             wb = books.enter_context(closing(load_workbook(report_path, data_only=True)))
         except Exception as e:
             raise ValueError(f"Не удалось открыть файл отчёта: {e}")
-        if ORDER_SHEET not in wb.sheetnames:
+        sheet_name = data_sheet_name(wb.sheetnames)
+        if not sheet_name:
             raise ValueError(f"В файле отчёта нет листа «{ORDER_SHEET}».")
-        ws = wb[ORDER_SHEET]
+        ws = wb[sheet_name]
 
         def to_float(val) -> Optional[float]:
             if val is None:
@@ -1227,9 +1232,8 @@ def generate_monthly_report(repo_root: Path, month: int, year: int) -> Path:
     """
     print(f"\n📊 Генерация отчёта за {MONTHS_RU[month - 1]} {year}...")
     
-    # Убеждаемся, что папка reports существует
-    reports_dir = repo_root / REPORTS_DIR_NAME
-    reports_dir.mkdir(exist_ok=True)
+    # Убеждаемся, что папка года в reports/Ozon существует
+    ozon_report_path(repo_root, year, month, create=True)
     
     report_script = SCRIPTS_DIR / "Monthly_sales_report.py"
     if not report_script.exists():

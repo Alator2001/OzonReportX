@@ -48,8 +48,8 @@ Ollama — исключений нет), `cancelled`. `context_overflow` — з�
 
 | Источник (`SOURCES`) | Файлы | Таблицы |
 |---|---|---|
-| `ozon_reports` | `reports/<Месяц Год>.xlsx` | `ozon_orders`, `ozon_month_metrics` (блок P/Q), `ozon_other_expenses`, `ozon_ad_campaigns` |
-| `wb_reports` | `reports/WB <Месяц Год>.xlsx` | `wb_orders`, `wb_month_metrics` |
+| `ozon_reports` | `reports/Ozon/<Год>/<Месяц Год>.xlsx` | `ozon_orders`, `ozon_month_metrics` (блок P/Q), `ozon_other_expenses`, `ozon_ad_campaigns` |
+| `wb_reports` | `reports/WB/<Год>/WB <Месяц Год>.xlsx`, лист «Данные» (в старых — «Заказы») | `wb_orders`, `wb_month_metrics` |
 | `costs` | `costs.xlsx` | `products` (лист «Основной»), `product_promotions` (лист «Акции», одна строка — товар × акция) |
 | `abc_xyz` | `ABC&XYZ reports/*.xlsx` | `abc_xyz` (лист «Итог» каждого отчёта, с `report_period`) |
 | `supply` | `stocks reports/Поставка FBO <дата>.json` | `fbo_supply_plan` (артикул × зона), `fbs_needs` |

@@ -10,6 +10,10 @@ try:
 except ModuleNotFoundError:
     sys.path.append(str(Path(__file__).resolve().parent))
     from utils import print_step, prompt_yes_no, set_prompt_force, log_verbose, VERBOSE  # type: ignore
+try:
+    from scripts.report_paths import migrate as migrate_reports, ozon_report_path, ozon_reports_dir
+except ModuleNotFoundError:
+    from report_paths import migrate as migrate_reports, ozon_report_path, ozon_reports_dir
 
 
 def ensure_auto_update_package(venv_python: Path, repo_root: Path):
@@ -137,6 +141,7 @@ def ensure_costs(venv_python, repo_root: Path) -> bool:
 
 def ensure_reports_dir(repo_root: Path):
     (repo_root / "reports").mkdir(parents=True, exist_ok=True)
+    migrate_reports(repo_root)
 
 
 def open_local_file(path: Path):
@@ -194,7 +199,8 @@ def list_report_files(repo_root: Path, folder_name: str) -> list[Path]:
     folder = repo_root / folder_name
     if not folder.exists():
         return []
-    return sorted((p for p in folder.glob("*.xlsx") if p.is_file() and not p.name.startswith(("~$", "~tmp_"))), key=lambda p: p.name)
+    # Отчёты разложены по reports/Ozon|WB/<год>/ — ищем во вложенных папках.
+    return sorted((p for p in folder.rglob("*.xlsx") if p.is_file() and not p.name.startswith(("~$", "~tmp_"))), key=lambda p: p.name)
 
 
 def print_system_status(repo_root: Path):
@@ -308,7 +314,7 @@ def run_abc_xyz(
     to_year: int,
 ):
     ensure_reports_dir(repo_root)
-    reports_dir = repo_root / "reports"
+    reports_dir = ozon_reports_dir(repo_root)
     main_script = repo_root / "scripts" / "Monthly_sales_report.py"
     abc_script = repo_root / "scripts" / "ABC_XYZ_analytics_report.py"
 
@@ -321,8 +327,7 @@ def run_abc_xyz(
 
     missing = []
     for y, m in months_to_need:
-        fname = f"{MONTHS_RU[m - 1]} {y}.xlsx"
-        if not (reports_dir / fname).exists():
+        if not ozon_report_path(repo_root, y, m).exists():
             missing.append((y, m))
 
     if missing:

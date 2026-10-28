@@ -167,7 +167,8 @@ class RefreshTests(WarehouseTestCase):
 
     def test_deleted_file_removes_its_rows(self):
         self.refresh()
-        (self.root / "reports" / "Сентябрь 2026.xlsx").unlink()
+        # Отчёты созданы в старом месте (reports/) и при первом обновлении переехали в reports/Ozon/2026/.
+        (self.root / "reports" / "Ozon" / "2026" / "Сентябрь 2026.xlsx").unlink()
         self.refresh()
         self.assertEqual(self.query("SELECT COUNT(*) FROM ozon_orders"), [(0,)])
         self.assertEqual(self.query("SELECT COUNT(*) FROM wb_orders"), [(1,)])

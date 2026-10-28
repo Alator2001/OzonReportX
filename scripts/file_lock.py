@@ -54,6 +54,10 @@ def exclusive_file(destination):
         # Closing the descriptor releases the OS lock, including after exceptions.
         if handle is not None:
             handle.close()
+            # A temporary file of atomic writes (~tmp_<random>) is never locked again — drop its lock file,
+            # otherwise every saved report leaves one behind. Lock files of real files stay: other processes share them.
+            if destination.name.startswith("~tmp_"):
+                lock_path.unlink(missing_ok=True)
         state["lock"].release()
 
 

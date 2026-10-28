@@ -18,13 +18,25 @@ try:
 except ModuleNotFoundError:
     from report_http import create_session
 try:
+    from scripts.report_book import CHARGES, data_sheet_name
+except ModuleNotFoundError:
+    from report_book import CHARGES, data_sheet_name
+try:
     from scripts.app_paths import DATA_ROOT, ENV_FILE
 except ModuleNotFoundError:
     from app_paths import DATA_ROOT, ENV_FILE
 try:
+    from scripts.report_design import apply_design_file as apply_report_design
+except ModuleNotFoundError:
+    from report_design import apply_design_file as apply_report_design
+try:
     from scripts.payout_settlement import update_reports as update_payout_settlement, print_summary as print_payout_summary
 except ModuleNotFoundError:
     from payout_settlement import update_reports as update_payout_settlement, print_summary as print_payout_summary
+try:
+    from scripts.report_paths import ozon_report_path
+except ModuleNotFoundError:
+    from report_paths import ozon_report_path
 try:
     from scripts.file_io import excel_writer, atomic_output_path, save_workbook_atomic, read_costs_dataframe
 except ModuleNotFoundError:
@@ -431,18 +443,10 @@ def to_excel(postings, date_from, date_to, month, year, output_file=None, sessio
     rows = []
     total_posts = max(len(postings or []), 1)
 
-    # Название месяца на русском в родительном падеже (Сентябрь → сентября)
-    months = [
-        "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
-    ]
-    month_name = months[month-1]
-
-    # Формируем путь и имя файла в папке ../reports относительно этого скрипта
+    # reports/Ozon/<год>/<Месяц Год>.xlsx в папке данных
     if not output_file:
-        reports_dir = str(DATA_ROOT / 'reports')
-        _ensure_reports_dir_and_check_space(reports_dir)
-        output_file = os.path.join(reports_dir, f"{month_name} {year}.xlsx")
+        output_file = str(ozon_report_path(DATA_ROOT, year, month, create=True))
+        _ensure_reports_dir_and_check_space(os.path.dirname(output_file))
 
 
     # карта себестоимости: ключ может быть точным offer_id или префиксом
@@ -678,10 +682,11 @@ def write_account_charges_sheet(filename: str, charges: List[Dict[str, Any]]) ->
 
 def read_account_charges(wb) -> Dict[str, float]:
     """{вид расхода: сумма} по листу «Расходы вне заказов» — только то, что ещё не вычтено другими строками."""
-    if ACCOUNT_CHARGES_SHEET not in wb.sheetnames:
+    sheet = data_sheet_name(wb.sheetnames, CHARGES)
+    if not sheet:
         return {}
     result: Dict[str, float] = {}
-    for row in wb[ACCOUNT_CHARGES_SHEET].iter_rows(min_row=2, values_only=True):
+    for row in wb[sheet].iter_rows(min_row=2, values_only=True):
         if not row or row[4] is None or row[2] in ACCOUNT_CHARGES_COUNTED_ELSEWHERE:
             continue
         result[str(row[1])] = result.get(str(row[1]), 0.0) + float(row[4])
@@ -1106,11 +1111,10 @@ def main(argv=None):
         all_orders = fbs_orders + fbo_orders
         print(f"🔢 Найдено заказов: {len(all_orders)}")
 
-        reports_dir = str(DATA_ROOT / 'reports')
-        _ensure_reports_dir_and_check_space(reports_dir)
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
-        output_file = os.path.join(reports_dir, f"{months[month - 1]} {year}.xlsx")
+        output_file = str(ozon_report_path(DATA_ROOT, year, month, create=True))
+        _ensure_reports_dir_and_check_space(os.path.dirname(output_file))
         start_ts = time.time()
         # Publish only after orders, financial metrics and workbook writes succeed.
         with atomic_output_path(output_file) as temporary:
@@ -1124,6 +1128,8 @@ def main(argv=None):
                 ozon_promotion_cost_override=args.ozon_promotion_cost,
                 external_marketing_cost_override=args.external_marketing_cost,
             )
+            # Данные остаются в прежней раскладке на скрытых листах, поверх — оформление для человека.
+            apply_report_design(str(temporary), title=f"{months[month - 1]} {year}")
         duration_s = time.time() - start_ts
         print(f"✅ Отчёт сохранён: {output_file}")
 
@@ -1131,7 +1137,7 @@ def main(argv=None):
     # Её сбой не должен отменять уже сохранённый отчёт.
     print("💸 Сверяем выплаты Ozon с отчётами...")
     try:
-        print_payout_summary(update_payout_settlement(reports_dir))
+        print_payout_summary(update_payout_settlement(DATA_ROOT))
     except Exception as exc:
         print(f"⚠️ Не удалось сверить выплаты Ozon: {exc}")
     # Краткий итог

@@ -213,8 +213,8 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(df[cost_col].iloc[0], 20)
 
     def test_temporary_reports_are_hidden_from_lists(self):
-        folder = self.directory / "reports"
-        folder.mkdir()
+        folder = self.directory / "reports" / "Ozon" / "2026"
+        folder.mkdir(parents=True)
         for name in ["Август 2026.xlsx", "~tmp_failed.xlsx", "~$Август 2026.xlsx"]:
             (folder / name).write_bytes(b"fixture")
         expected = [folder / "Август 2026.xlsx"]
@@ -228,8 +228,8 @@ class OfflineTests(unittest.TestCase):
         folder.mkdir()
         for name in ["Октябрь 2026.xlsx", "WB Октябрь 2026.xlsx"]:
             (folder / name).write_bytes(b"fixture")
-        self.assertEqual(ai_warehouse._monthly_reports(self.directory, wb=False), [folder / "Октябрь 2026.xlsx"])
-        self.assertEqual(ai_warehouse._monthly_reports(self.directory, wb=True), [folder / "WB Октябрь 2026.xlsx"])
+        self.assertEqual(ai_warehouse._monthly_reports(self.directory, wb=False), [folder / "Ozon" / "2026" / "Октябрь 2026.xlsx"])
+        self.assertEqual(ai_warehouse._monthly_reports(self.directory, wb=True), [folder / "WB" / "2026" / "WB Октябрь 2026.xlsx"])
 
     def test_template_creation_handles_apostrophe_in_path(self):
         target = self.directory / "seller's folder"
@@ -290,12 +290,13 @@ class OfflineTests(unittest.TestCase):
                 update_prices.run(self.directory)
 
     def test_monthly_failure_does_not_publish_partial_workbook(self):
-        (self.directory / "reports").mkdir()
-        target = self.directory / "reports" / "Август 2026.xlsx"
+        target = self.directory / "reports" / "Ozon" / "2026" / "Август 2026.xlsx"
+        target.parent.mkdir(parents=True)
         target.write_bytes(b"previous report")
         def write_orders(*args, **kwargs):
             Path(kwargs["output_file"]).write_bytes(b"partial report")
-        with patch.object(monthly, "__file__", str(self.directory / "scripts" / "Monthly_sales_report.py")), \
+        # Папка данных — временная: тест не должен трогать настоящие отчёты.
+        with patch.object(monthly, "DATA_ROOT", self.directory), \
                 patch.object(monthly, "create_session", return_value=contextlib.nullcontext(Mock())), \
                 patch.object(monthly, "get_orders", return_value=[]), \
                 patch.object(monthly, "get_fbo_orders", return_value=[]), \
@@ -317,7 +318,9 @@ class OfflineTests(unittest.TestCase):
         wb.save(target)
         wb.close()
         from datetime import datetime
-        fn = ui_function("read_business_metrics", {"load_workbook": load_workbook, "datetime": datetime})
+        from scripts.report_book import data_sheet
+        fn = ui_function("read_business_metrics", {"load_workbook": load_workbook, "datetime": datetime,
+                                                    "report_data_sheet": data_sheet})
         metrics, _ = fn(target)
         self.assertEqual(metrics, {"Общая выручка": 100, "Количество возвращённых заказов": 1,
             "Количество заказов в доставке": 1, "Комиссии Ozon сумма": 2.0, "Логистика сумма": 7.0})

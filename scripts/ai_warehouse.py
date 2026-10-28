@@ -29,6 +29,14 @@ try:
 except ModuleNotFoundError:
     from file_lock import exclusive_file
 try:
+    from scripts.report_book import CAMPAIGNS, CHARGES, ORDERS, data_sheet_name
+except ModuleNotFoundError:
+    from report_book import CAMPAIGNS, CHARGES, ORDERS, data_sheet_name
+try:
+    from scripts.report_paths import ozon_report_files, wb_report_files
+except ModuleNotFoundError:
+    from report_paths import ozon_report_files, wb_report_files
+try:
     from scripts.app_paths import DATA_ROOT
 except ModuleNotFoundError:
     from app_paths import DATA_ROOT
@@ -52,7 +60,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
     "ozon_orders": {
         "description": "Заказы Ozon построчно из месячных отчётов (лист «Заказы»). Месяц — по дате отгрузки. "
                        "Прибыль строки = начисление Ozon + себестоимость; " + SIGN_NOTE + ".",
-        "source": "reports/<Месяц Год>.xlsx",
+        "source": "reports/Ozon/<Год>/<Месяц Год>.xlsx",
         "date_column": "period",
         "columns": {
             "period": ("TEXT", PERIOD),
@@ -76,7 +84,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "description": "Итоговые показатели месяца Ozon (блок P/Q листа «Заказы»): выручка, чистая прибыль, "
                        "рентабельность, расходы на продвижение, комиссии, логистика, хранение, баланс, выплаты. "
                        "Одна строка — один показатель; это официальные итоги месяца, их не нужно пересчитывать.",
-        "source": "reports/<Месяц Год>.xlsx",
+        "source": "reports/Ozon/<Год>/<Месяц Год>.xlsx",
         "date_column": "period",
         "columns": {
             "period": ("TEXT", PERIOD),
@@ -88,7 +96,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
     "ozon_other_expenses": {
         "description": "Расходы Ozon вне заказов (лист «Расходы вне заказов»): хранение, кросс-докинг, приёмка, "
                        "ранний вывод средств и т. п.; " + SIGN_NOTE + ". Есть не во всех месяцах.",
-        "source": "reports/<Месяц Год>.xlsx",
+        "source": "reports/Ozon/<Год>/<Месяц Год>.xlsx",
         "date_column": "date",
         "columns": {
             "period": ("TEXT", PERIOD),
@@ -102,7 +110,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
     },
     "ozon_ad_campaigns": {
         "description": "Рекламные кампании Ozon за месяц (лист «Кампании»): расход, показы, клики, заказы, ДРР.",
-        "source": "reports/<Месяц Год>.xlsx",
+        "source": "reports/Ozon/<Год>/<Месяц Год>.xlsx",
         "date_column": "period",
         "columns": {
             "period": ("TEXT", PERIOD),
@@ -279,7 +287,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
     },
     "wb_orders": {
         "description": "Заказы Wildberries построчно из месячных отчётов WB (лист «Заказы»).",
-        "source": "reports/WB <Месяц Год>.xlsx",
+        "source": "reports/WB/<Год>/WB <Месяц Год>.xlsx",
         "date_column": "period",
         "columns": {
             "period": ("TEXT", PERIOD),
@@ -299,7 +307,7 @@ CATALOG: Dict[str, Dict[str, Any]] = {
     },
     "wb_month_metrics": {
         "description": "Итоговые показатели месяца Wildberries (блок показателей листа «Заказы» отчёта WB).",
-        "source": "reports/WB <Месяц Год>.xlsx",
+        "source": "reports/WB/<Год>/WB <Месяц Год>.xlsx",
         "date_column": "period",
         "columns": {
             "period": ("TEXT", PERIOD),
@@ -565,13 +573,8 @@ def _insert(conn: sqlite3.Connection, table: str, rows: Iterable[Sequence[Any]])
 
 
 def _monthly_reports(root: Path, wb: bool) -> List[Path]:
-    folder = root / "reports"
-    if not folder.is_dir():
-        return []
     result = []
-    for path in sorted(folder.glob("*.xlsx")):
-        if path.name.startswith(("~", ".")):
-            continue
+    for path in (wb_report_files(root) if wb else ozon_report_files(root)):
         if path.name.startswith("WB ") == wb and period_from_name(path.stem):
             result.append(path)
     return result
@@ -651,24 +654,27 @@ def load_ozon_reports(root: Path, conn: sqlite3.Connection) -> None:
     for path in _monthly_reports(root, wb=False):
         period = period_from_name(path.stem)
         with _open_book(path) as book:
-            if "Заказы" in book.sheetnames:
-                rows = _sheet_rows(book["Заказы"])
+            orders_sheet = data_sheet_name(book.sheetnames, ORDERS)
+            if orders_sheet:
+                rows = _sheet_rows(book[orders_sheet])
                 _insert(conn, "ozon_orders", (
                     _convert("ozon_orders", values, {"period": period})
                     for values in _rows_by_header(rows, ORDER_COLUMNS)
                     if _text(values.get("order_number")) or _text(values.get("artikul"))
                 ))
                 _insert(conn, "ozon_month_metrics", _metric_rows(period, _metrics_block(rows)))
-            if "Расходы вне заказов" in book.sheetnames:
+            charges_sheet = data_sheet_name(book.sheetnames, CHARGES)
+            if charges_sheet:
                 _insert(conn, "ozon_other_expenses", (
                     _convert("ozon_other_expenses", values, {"period": period})
-                    for values in _rows_by_header(_sheet_rows(book["Расходы вне заказов"]), EXPENSE_COLUMNS)
+                    for values in _rows_by_header(_sheet_rows(book[charges_sheet]), EXPENSE_COLUMNS)
                     if _num(values.get("amount")) is not None
                 ))
-            if "Кампании" in book.sheetnames:
+            campaigns_sheet = data_sheet_name(book.sheetnames, CAMPAIGNS)
+            if campaigns_sheet:
                 _insert(conn, "ozon_ad_campaigns", (
                     _convert("ozon_ad_campaigns", values, {"period": period})
-                    for values in _rows_by_header(_sheet_rows(book["Кампании"]), CAMPAIGN_COLUMNS)
+                    for values in _rows_by_header(_sheet_rows(book[campaigns_sheet]), CAMPAIGN_COLUMNS)
                     if _text(values.get("campaign_id"))
                 ))
 
@@ -693,9 +699,11 @@ def load_wb_reports(root: Path, conn: sqlite3.Connection) -> None:
     for path in _monthly_reports(root, wb=True):
         period = period_from_name(path.stem)
         with _open_book(path) as book:
-            if "Заказы" not in book.sheetnames:
+            # Отчёт нового вида: прежний лист «Заказы» лежит скрытым под именем «Данные» (report_book).
+            sheet = data_sheet_name(book.sheetnames, ORDERS)
+            if not sheet:
                 continue
-            rows = _sheet_rows(book["Заказы"])
+            rows = _sheet_rows(book[sheet])
             _insert(conn, "wb_orders", (
                 _convert("wb_orders", values, {"period": period})
                 for values in _rows_by_header(rows, WB_ORDER_COLUMNS)

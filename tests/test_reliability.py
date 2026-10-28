@@ -121,6 +121,15 @@ except FileBusyError:
         with exclusive_file(target):
             pass
 
+    def test_nested_atomic_save_leaves_no_lock_files_of_temporaries(self):
+        from openpyxl import Workbook
+        from scripts.file_io import atomic_output_path, save_workbook_atomic
+        target = self.directory / "Август 2026.xlsx"
+        with atomic_output_path(target) as temporary:
+            save_workbook_atomic(Workbook(), temporary)   # как отчёт: оформление дописывается во временный файл
+        locks = sorted(p.name for p in self.directory.glob(".*.ozon-lock"))
+        self.assertEqual(locks, [".Август 2026.xlsx.ozon-lock"])
+
     def test_lock_registry_is_shared_by_both_import_styles(self):
         self.assertIs(importlib.import_module("file_lock"), importlib.import_module("scripts.file_lock"))
 

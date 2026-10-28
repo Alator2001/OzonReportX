@@ -24,6 +24,12 @@ import requests
 script_dir = Path(__file__).resolve().parent
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
+try:
+    from scripts.report_book import data_sheet_name
+    from scripts.report_paths import ozon_report_path
+except ModuleNotFoundError:
+    from report_book import data_sheet_name
+    from report_paths import ozon_report_path
 from app_paths import DATA_ROOT  # noqa: E402
 repo_root = DATA_ROOT
 
@@ -598,10 +604,12 @@ def load_price_history(root: Path, spans: Dict[str, Tuple[date, date]]) -> Dict[
     frames = []
     month = date(start.year, start.month, 1)
     while month < end:
-        path = root / "reports" / f"{MONTHS_RU[month.month - 1]} {month.year}.xlsx"
+        path = ozon_report_path(root, month.year, month.month)
         if path.exists():
             try:
-                frames.append(pd.read_excel(path, sheet_name="Заказы", usecols=["Статус", "Артикул", "Количество шт.", "Цена продажи", "Дата отгрузки"]))
+                with pd.ExcelFile(path) as book:
+                    sheet = data_sheet_name(book.sheet_names) or 0
+                frames.append(pd.read_excel(path, sheet_name=sheet, usecols=["Статус", "Артикул", "Количество шт.", "Цена продажи", "Дата отгрузки"]))
             except (ValueError, OSError):
                 pass
         month = date(month.year + (month.month // 12), month.month % 12 + 1, 1)

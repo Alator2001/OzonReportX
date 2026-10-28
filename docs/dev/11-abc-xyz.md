@@ -15,7 +15,7 @@ ABC_XYZ_analytics_report.py -i reports --output_dir "ABC&XYZ reports" --from-mon
 
 ## Входные данные
 
-- Файлы `reports/*.xlsx|xlsm|xls` с именем «Месяц Год», попадающие в диапазон (`parse_filename_to_month_year`).
+- Файлы `reports/Ozon/**/*.xlsx|xlsm|xls` (включая папки по годам) с именем «Месяц Год», попадающие в диапазон (`parse_filename_to_month_year`).
   Без диапазона берутся все файлы папки.
 - Только лист «Заказы» (или «Orders»), только строки со статусом **`delivered`**. Возвраты (`returned`),
   отмены, заказы в пути и «ожидает расчёта» не участвуют.

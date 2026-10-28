@@ -11,6 +11,7 @@ import requests
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 import time
 from dataclasses import dataclass
 from collections import deque
@@ -25,9 +26,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scripts import balance_report
 from scripts.file_io import save_workbook_atomic
+from scripts.report_paths import migrate as migrate_reports, ozon_report_path, ozon_reports_dir, wb_reports_dir
+from scripts.report_book import CAMPAIGNS as REPORT_CAMPAIGNS, data_sheet as report_data_sheet, data_sheet_name as report_data_sheet_name
 from scripts.file_lock import exclusive_file, file_signature
 from scripts.ui_log import SessionLog
-from scripts.wb_dashboard import build_dashboard as build_wb_dashboard
+from scripts.wb_dashboard import HELP as WB_DASHBOARD_HELP, WbDashboard
+from scripts.wb_prices_view import WbPricesView
+from scripts.wb_promotions_view import WbPromotionsView
 try:
     from scripts import auto_actions
 except Exception:  # модуль автоакций необязателен для запуска интерфейса
@@ -343,7 +348,7 @@ def files_by_relevance(folder: Path, pattern: str = "*.xlsx") -> list[Path]:
 
 
 def report_path_for_period(month: int, year: int) -> Path:
-    return ROOT / "reports" / f"{MONTHS[month - 1]} {year}.xlsx"
+    return ozon_report_path(ROOT, year, month)
 
 
 def iter_periods(month: int, year: int, count: int) -> list[tuple[int, int]]:
@@ -704,7 +709,7 @@ def read_business_metrics(report_path: Path) -> tuple[dict[str, object], str | N
         return {}, None
     wb = load_workbook(report_path, data_only=True, read_only=True)
     try:
-        ws = wb["Заказы"] if "Заказы" in wb.sheetnames else wb.active
+        ws = report_data_sheet(wb)
         metrics: dict[str, object] = {}
         for label, value in ws.iter_rows(min_row=1, max_row=70, min_col=16, max_col=17, values_only=True):
             if label:
@@ -756,9 +761,10 @@ def read_campaign_metrics(report_path: Path) -> tuple[dict[str, float], list[dic
         return {}, []
     wb = load_workbook(report_path, data_only=True, read_only=True)
     try:
-        if "Кампании" not in wb.sheetnames:
+        campaigns_sheet = report_data_sheet_name(wb.sheetnames, REPORT_CAMPAIGNS)
+        if not campaigns_sheet:
             return {}, []
-        ws = wb["Кампании"]
+        ws = wb[campaigns_sheet]
         rows = ws.iter_rows(values_only=True)
         headers = next(rows, ())
         header_names = [str(header).strip() if header else f"column_{idx}" for idx, header in enumerate(headers, start=1)]
@@ -1326,6 +1332,10 @@ def system_prefers_dark(brightness: ft.Brightness | None) -> bool:
 
 def main(page: ft.Page) -> None:
     page.title = "OzonReportX"
+    try:
+        migrate_reports(ROOT)  # отчёты из общей кучи reports/ — в reports/Ozon|WB/<год>/
+    except OSError as exc:
+        print(f"⚠️ Не удалось разложить отчёты по папкам: {exc}")
     start_dark = system_prefers_dark(page.platform_brightness)
     page.theme_mode = ft.ThemeMode.DARK if start_dark else ft.ThemeMode.LIGHT
     page.bgcolor = "#1A1F23" if start_dark else BG
@@ -1579,7 +1589,8 @@ def main(page: ft.Page) -> None:
     ai_tools = AnalyticsTools(ROOT) if AnalyticsTools else None
 
     folder_specs = [
-        FolderSpec("Месячные отчёты", ROOT / "reports"),
+        FolderSpec("Отчёты Ozon", ROOT / "reports" / "Ozon", "**/*.xlsx"),
+        FolderSpec("Отчёты WB", ROOT / "reports" / "WB", "**/*.xlsx"),
         FolderSpec("ABC/XYZ аналитика", ROOT / "ABC&XYZ reports"),
         FolderSpec("Поставки", ROOT / "stocks reports"),
         FolderSpec("Баланс", ROOT / "balance reports"),
@@ -2361,6 +2372,8 @@ def main(page: ft.Page) -> None:
         to_year: int,
     ) -> tuple[list[str], list[float], list[float], list[float], float]:
         periods = iter_period_range(from_month, from_year, to_month, to_year)
+        if is_wb_store():
+            return wb_dash.chart_data(periods)
         labels: list[str] = []
         revenue_values: list[float] = []
         profit_values: list[float] = []
@@ -2436,7 +2449,7 @@ def main(page: ft.Page) -> None:
             text.set_color(text_color)
         fig.subplots_adjust(bottom=0.26, top=0.86, left=0.07, right=0.98)
         cache_stamp = int(latest_source_mtime) if latest_source_mtime else int(datetime.now().timestamp())
-        chart_render_path = chart_dir / f"dashboard_trend_{chart_kind}_{cache_stamp}.png"
+        chart_render_path = chart_dir / f"dashboard_trend_{active_store['value']}_{chart_kind}_{cache_stamp}.png"
         fig.savefig(chart_render_path, facecolor=fig_bg, bbox_inches="tight")
         plt.close(fig)
 
@@ -2536,7 +2549,8 @@ def main(page: ft.Page) -> None:
             page.update(dashboard_chart_panel)
 
     # ---------------------------------------------------------------- Бизнес-сводка
-    dashboard_state: dict[str, object] = {"metrics": None, "promo": {}, "campaigns": [], "built_at": None, "period": ""}
+    dashboard_state: dict[str, object] = {"metrics": None, "promo": {}, "campaigns": [], "built_at": None, "period": "",
+                                          "store": "ozon"}
     DASHBOARD_HELP = {
         "Выручка": "Общая выручка за период по месячному отчёту. Основной показатель оборота.",
         "Чистая прибыль": "Прибыль после вычета себестоимости, комиссий, логистики, маркетинга и прочих расходов.",
@@ -2645,7 +2659,18 @@ def main(page: ft.Page) -> None:
     def dash_money(value) -> str:
         return _format_currency(value)
 
+    def is_wb_store() -> bool:
+        return active_store["value"] == "wb"
+
     def render_dashboard(push_update: bool = True) -> None:
+        if is_wb_store():
+            # Тот же экран, что у Ozon; показатели и блоки WB — из scripts/wb_dashboard.py.
+            dashboard_freshness.value = wb_dash.freshness()
+            dashboard_metrics_area.controls = wb_dash.controls(launch_dashboard_report)
+            apply_control_theme(dashboard_metrics_area, current_dark["value"])
+            if push_update and page.controls:
+                page.update(dashboard_metrics_area, dashboard_freshness)
+            return
         pal = dash_pal()
         metrics = dashboard_state["metrics"]
         period = str(dashboard_state["period"] or "")
@@ -2811,9 +2836,16 @@ def main(page: ft.Page) -> None:
                    padding=ft.Padding.only(left=20, right=20, top=16, bottom=8)),
         ]
 
-    def refresh_dashboard() -> None:
+    def refresh_dashboard(push_update: bool = True) -> None:
         selected_month = int(dashboard_m.value or today.month)
         selected_year = int(dashboard_y.value or today.year)
+        if is_wb_store():
+            wb_dash.load(selected_year, selected_month)
+            period_title = f"{MONTHS[selected_month - 1]} {selected_year}"
+            set_status("Данные загружены" if wb_dash.data else "Нет отчёта", f"Wildberries · {period_title}",
+                       PRIMARY if wb_dash.data else DANGER, busy=False)
+            render_dashboard(push_update)
+            return
         report_path = report_path_for_period(selected_month, selected_year)
         set_status("Чтение отчёта", f"{report_path.name}", ACCENT, busy=True)
         try:
@@ -2830,8 +2862,8 @@ def main(page: ft.Page) -> None:
             set_status("Данные загружены", period_title, PRIMARY, busy=False)
         else:
             set_status("Нет отчёта", period_title, DANGER, busy=False)
-        render_dashboard()
-        if page.controls:
+        render_dashboard(push_update)
+        if push_update and page.controls:
             page.update(dashboard_chart_panel)
 
     def valid_dashboard_chart_period() -> str | None:
@@ -2850,6 +2882,8 @@ def main(page: ft.Page) -> None:
         return None
 
     def get_missing_chart_reports() -> list[tuple[int, int]]:
+        if is_wb_store():
+            return []  # месяц WB грузится минутами — график строим по уже загруженным месяцам
         from_month = int(dashboard_chart_from_m.value or prev.month)
         from_year = int(dashboard_chart_from_y.value or prev.year)
         to_month = int(dashboard_chart_to_m.value or prev.month)
@@ -2977,7 +3011,7 @@ def main(page: ft.Page) -> None:
                 str(PYTHON),
                 str(SCRIPTS / "ABC_XYZ_analytics_report.py"),
                 "-i",
-                "reports",
+                str(ozon_reports_dir(ROOT)),
                 "--output_dir",
                 "ABC&XYZ reports",
                 "--from-month",
@@ -2994,6 +3028,9 @@ def main(page: ft.Page) -> None:
     def dashboard_period_changed(_e=None) -> None:
         selected_month = int(dashboard_m.value or today.month)
         selected_year = int(dashboard_y.value or today.year)
+        if is_wb_store():
+            refresh_dashboard()
+            return
         report_path = report_path_for_period(selected_month, selected_year)
         set_log(f"Открываем отчёт за {MONTHS[selected_month - 1]} {selected_year}: {report_path.name}")
         set_status("Открытие периода", f"{MONTHS[selected_month - 1]} {selected_year}", ACCENT, busy=True)
@@ -3047,7 +3084,7 @@ def main(page: ft.Page) -> None:
         files_col.controls = []
         for spec in folder_specs:
             rows: list[ft.Control] = [ft.TextButton("Открыть папку", on_click=lambda _e, x=spec.path: reveal_path(x, x.name))]
-            batch = files_by_relevance(spec.path)[:12]
+            batch = files_by_relevance(spec.path, spec.pattern)[:12]
             if not batch:
                 rows.append(ft.Text("Файлы пока не найдены.", color=MUTED))
             else:
@@ -3706,7 +3743,9 @@ def main(page: ft.Page) -> None:
         if month_error:
             toast(month_error, True)
             return
-        report_path = report_path_for_period(int(dashboard_m.value or today.month), int(dashboard_y.value or today.year))
+        selected_month, selected_year = int(dashboard_m.value or today.month), int(dashboard_y.value or today.year)
+        report_path = (wb_dash.report_path(selected_year, selected_month) if is_wb_store()
+                       else report_path_for_period(selected_month, selected_year))
         if not report_path.exists():
             toast("Отчёт за выбранный период пока не найден.", True)
             return
@@ -3716,6 +3755,9 @@ def main(page: ft.Page) -> None:
         month_error = valid_month_year(dashboard_m.value or "", dashboard_y.value or "")
         if month_error:
             toast(month_error, True)
+            return
+        if is_wb_store():
+            page.run_task(wb_dash.download, int(dashboard_y.value or today.year), int(dashboard_m.value or today.month))
             return
         monthly_m.value = dashboard_m.value
         monthly_y.value = dashboard_y.value
@@ -4433,6 +4475,7 @@ def main(page: ft.Page) -> None:
 
     dashboard_sync_label = ft.Text("Обновляю отчёт: загружаю продажи, расходы и выплаты из Ozon…",
                                    size=13, weight=ft.FontWeight.W_600, text_align=ft.TextAlign.CENTER)
+    dashboard_sync_cancel = ft.TextButton("Отмена", visible=False, on_click=lambda _e: wb_dash.cancel())
     dashboard_sync_overlay = ft.Container(
         left=0, top=0, right=0, bottom=0,
         visible=False,
@@ -4445,16 +4488,22 @@ def main(page: ft.Page) -> None:
             border_radius=18,
             data="preserve_excel_fill",
             content=ft.Column(
-                [ft.ProgressRing(width=36, height=36, stroke_width=3), dashboard_sync_label],
+                [ft.ProgressRing(width=36, height=36, stroke_width=3), dashboard_sync_label, dashboard_sync_cancel],
                 spacing=14, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
         ),
     )
     dashboard_metrics_area = ft.Column(spacing=16)
 
-    def set_dashboard_sync(active: bool) -> None:
-        """Пока обновляется отчёт, показатели закрыты заглушкой с загрузкой и не принимают клики."""
+    def set_dashboard_sync(active: bool, text: str | None = None) -> None:
+        """Пока обновляется отчёт, показатели закрыты заглушкой с загрузкой и не принимают клики.
+        text — подпись под индикатором (WB пишет сюда ход загрузки); у WB есть своя кнопка «Отмена»."""
         dark = current_dark["value"]
+        if text:
+            dashboard_sync_label.value = text
+        elif active:
+            dashboard_sync_label.value = "Обновляю отчёт: загружаю продажи, расходы и выплаты из Ozon…"
+        dashboard_sync_cancel.visible = active and is_wb_store()
         dashboard_sync_overlay.visible = active
         dashboard_sync_overlay.bgcolor = ("#CC1E2328" if dark else "#CCF5F7FB") if active else None
         dashboard_sync_label.color = "#F3F4F6" if dark else TEXT
@@ -4473,7 +4522,9 @@ def main(page: ft.Page) -> None:
         tooltip="Ещё",
         items=[
             ft.PopupMenuItem(content=ft.Text("Открыть отчёт в Excel"), on_click=lambda _e: open_selected_dashboard_report()),
-            ft.PopupMenuItem(content=ft.Text("Открыть папку с отчётами"), on_click=lambda _e: reveal_path(ROOT / "reports", "reports")),
+            ft.PopupMenuItem(content=ft.Text("Открыть папку с отчётами"), on_click=lambda _e: reveal_path(wb_reports_dir(ROOT), "reports/WB") if is_wb_store()
+                             else reveal_path(ozon_reports_dir(ROOT), "reports/Ozon")),
+            ft.PopupMenuItem(content=ft.Text("Себестоимость WB"), visible=False, on_click=lambda _e: wb_dash.open_costs()),
         ],
     )
     dash_header = ft.ResponsiveRow(
@@ -7113,6 +7164,7 @@ def main(page: ft.Page) -> None:
         fbw, fbs = summary["fbw"], summary["fbs"]
         season_note = (f"сезон ×{season['factor']:.2f} по истории WB".replace(".", ",") if season["method"] == "season"
                        else "истории мало — без сезонности")
+        order_days = summary.get("order_days", 90)  # нет в расчётах до исправления темпа
         bad, good = pal["bad"], pal["good"]
         colors = {"wb_fbw": "#C08CFF" if pal["dark"] else "#8A3FD1"}
 
@@ -7141,7 +7193,7 @@ def main(page: ft.Page) -> None:
                   f"уровень сервиса {settings['service_level']:.0%}", 12, pal["muted"]),
             dash_stats_panel([
                 dash_stat("Прогноз WB за цикл", f"{summary['window_units']:.0f} шт.",
-                          f"{summary['recent_units']:.0f} заказов за 90 дн. · {season_note}"),
+                          f"{summary['recent_units']:.0f} заказов за {order_days} дн. · {season_note}"),
                 dash_stat("На склады WB", f"{fbw['ship']} шт.",
                           f"{fbw['articles']} арт. · {_format_currency(fbw['cost'])}" if fbw["ship"] else "пока везти не нужно"),
                 dash_stat("Свой склад для WB", f"{fbs['need']} шт.", f"выставлено на WB {fbs['stock']} шт."),
@@ -7163,7 +7215,7 @@ def main(page: ft.Page) -> None:
             dtext(f"Сейчас {summary['own_share']:.0%} заказов WB уходят со своего склада. Сюда входит спрос артикулов, которые на WB не возим, "
                   "и спрос до прихода поставки сверх остатка на складах WB. «Есть» — остаток, выставленный на WB; остатки и поставки Ozon сюда не входят.",
                   12, pal["muted"]),
-            table([("Артикул", 2, False), ("Заказов за 90 дн.", 2, True), ("Спрос на дни", 2, True), ("Нужно", 2, True),
+            table([("Артикул", 2, False), ("Заказов", 2, True), ("Спрос на дни", 2, True), ("Нужно", 2, True),
                    ("Есть", 2, True), ("Не хватает", 2, True), ("Себестоимость", 3, True)], fbs_rows),
             *([dtext(f"Ещё {len(idle)} арт. без спроса на WB на эти дни, на складе по ним {sum(r['stock'] or 0 for r in idle)} шт.: "
                      + ", ".join(r["article"] for r in idle), 12, pal["muted"])] if idle else []),
@@ -7204,7 +7256,8 @@ def main(page: ft.Page) -> None:
             ], spacing=4, alignment=ft.MainAxisAlignment.END, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
         ) for m in months]
         season_text = (f"Год назад в окне продаж выкупили {season['window_last_year']:.0f} шт., в базовые {season['base_days']} дн. — "
-                       f"{season['base_last_year']:.0f} шт.: коэффициент " + f"{season['factor']:.2f}".replace(".", ",") + "."
+                       f"{season['base_last_year']:.0f} шт.: коэффициент " + f"{season['factor']:.2f}".replace(".", ",")
+                       + (" (истории меньше двух лет — ослаблен вдвое)." if season.get("weight", 1) < 1 else ".")
                        if season["method"] == "season" else "Истории за прошлый год мало — прогноз без сезонности.")
         controls.append(dpanel(ft.Column([
             dtext("Выкупы WB по месяцам", 15, weight=ft.FontWeight.W_700),
@@ -7644,8 +7697,10 @@ def main(page: ft.Page) -> None:
     )
 
     # ---------------------------------------------------------------- Остатки (общая таблица Ozon + WB)
-    stock_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False}
+    stock_state: dict[str, object] = {"data": None, "busy": False, "error": None, "started": False, "filter": "all"}
     stock_subtitle = ft.Text("", size=13, color=MUTED)
+    stock_search = ft.TextField(hint_text="Найти артикул", prefix_icon=ft.Icons.SEARCH, dense=True, width=240)
+    stock_search.on_change = stock_search.on_submit = lambda _e: render_stock_view()
     stock_refresh_button = ft.Button("Обновить", icon=ft.Icons.REFRESH, bgcolor=PRIMARY, color="white")
     stock_body = ft.Column(spacing=14)
 
@@ -7705,13 +7760,23 @@ def main(page: ft.Page) -> None:
                                  pal["bad"] if short else pal["good"])
 
             controls.append(dpanel(ft.ResponsiveRow([
-                dash_stat("Артикулов", str(len(rows)), "с остатком или продажами"),
                 need_stat("Нужно держать FBO", "need_fbo", ("fbo", "fbo_transit"), "short_fbo"),
                 need_stat("Нужно держать FBW", "need_fbw", ("fbw", "fbw_transit"), "short_fbw"),
-                need_stat("Нужно держать FBS", "need_fbs", ("fbs",), "short_fbs"),
+                need_stat("Нужно держать FBS Ozon", "need_fbs_ozon", ("fbs_ozon",), "short_fbs_ozon"),
+                need_stat("Нужно держать FBS WB", "need_fbs_wb", ("fbs_wb",), "short_fbs_wb"),
             ], spacing=24, run_spacing=12), padding=ft.Padding.symmetric(horizontal=24, vertical=16)))
 
-            columns = [("Артикул", 3), ("FBS", 2), ("FBO", 2), ("FBW", 2), ("Нужно держать FBO", 3), ("Нужно держать FBW", 3), ("Нужно держать FBS", 3)]
+            mode = str(stock_state["filter"])
+            shown = stock_overview.filter_rows(rows, stock_search.value or "", mode)
+            toolbar = ft.Row([
+                stock_search,
+                *[s_chip(label, mode == key, lambda _e, k=key: (stock_state.update(filter=k), render_stock_view()))
+                  for key, label in stock_overview.STOCK_FILTERS.items()],
+                dtext(f"Показано {len(shown)} из {len(rows)}", 12, pal["muted"]),
+            ], wrap=True, spacing=10, run_spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+            columns = [("Артикул", 3), ("FBS Ozon", 2), ("FBS WB", 2), ("FBO", 2), ("FBW", 2), ("Нужно держать FBO", 3), ("Нужно держать FBW", 3),
+                       ("Нужно держать FBS Ozon", 3), ("Нужно держать FBS WB", 3)]
 
             def cell(content: ft.Control, weight: int, right: bool = True, tooltip: str | None = None) -> ft.Control:
                 return ft.Container(expand=weight, alignment=ft.Alignment(1 if right else -1, 0), tooltip=tooltip, content=content)
@@ -7736,33 +7801,40 @@ def main(page: ft.Page) -> None:
                 content=ft.Row([cell(dtext(name, 12, pal["muted"], ft.FontWeight.W_600, text_align=ft.TextAlign.RIGHT if index else None), w, bool(index))
                                 for index, (name, w) in enumerate(columns)], spacing=14, vertical_alignment=ft.CrossAxisAlignment.END),
             )]
-            for row in rows:
-                fbs_tip = " · ".join(f"{store}: {value}" for store, value in row["fbs_by_store"].items()) or None
-                if fbs_tip and len(row["fbs_by_store"]) > 1:
-                    fbs_tip = "Свой склад, как его показывают магазины: " + fbs_tip + ". Берём наибольшее — это один и тот же товар."
+            if not shown:
+                table.append(ft.Container(padding=ft.Padding.symmetric(vertical=12),
+                                          content=dtext("Под фильтр ничего не подходит.", 13, pal["muted"])))
+            for row in shown:
                 table.append(ft.Container(
                     padding=ft.Padding.symmetric(vertical=9), data="preserve_excel_fill",
                     border=ft.Border.only(top=ft.BorderSide(1, pal["separator"])),
                     content=ft.Row([
                         cell(dtext(row["article"], 13, weight=ft.FontWeight.W_700), 3, right=False),
-                        cell(stock_text(row["fbs"], need=row["need_fbs"]), 2, tooltip=fbs_tip),
+                        cell(stock_text(row["fbs_ozon"], need=row["need_fbs_ozon"]), 2),
+                        cell(stock_text(row["fbs_wb"], need=row["need_fbs_wb"]), 2),
                         cell(stock_text(row["fbo"], row["fbo_transit"], row["need_fbo"]), 2,
                              tooltip=f"В пути и в заявках на склады Ozon: {row['fbo_transit']} шт." if row["fbo_transit"] else None),
                         cell(stock_text(row["fbw"], row["fbw_transit"], row["need_fbw"]), 2,
                              tooltip=f"Возвраты в пути на склады WB: {row['fbw_transit']} шт." if row["fbw_transit"] else None),
                         cell(need_text(row["need_fbo"], row["short_fbo"]), 3),
                         cell(need_text(row["need_fbw"], row["short_fbw"]), 3),
-                        cell(need_text(row["need_fbs"], row["short_fbs"]), 3,
-                             tooltip=f"Спрос на своём складе за 30 дней: {row['fbs_demand']:g} шт. (Ozon и WB вместе)" if row["fbs_demand"] else None),
+                        cell(need_text(row["need_fbs_ozon"], row["short_fbs_ozon"]), 3,
+                             tooltip=f"Спрос Ozon на своём складе за 30 дней: {row['fbs_demand_ozon']:g} шт." if row["fbs_demand_ozon"] else None),
+                        cell(need_text(row["need_fbs_wb"], row["short_fbs_wb"]), 3,
+                             tooltip=f"Спрос WB на своём складе за 30 дней: {row['fbs_demand_wb']:g} шт." if row["fbs_demand_wb"] else None),
                     ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ))
             notes = [dtext("«Нужно держать» считается так же, как в «Поставках», только на ближайшие 30 дней без срока поставки. "
                            "FBO и FBW — склады маркетплейсов, FBS — ваш склад: туда идёт спрос, который не покроют FBO и FBW. "
+                           "На своём складе товар зарезервирован отдельно под Ozon и под WB, поэтому FBS Ozon и FBS WB "
+                           "считаются раздельно: товар WB не закрывает нехватку Ozon и наоборот. "
                            "Красным — не хватает с учётом товара в пути.", 12, pal["muted"])]
             notes += [dtext(note, 12, pal["muted"]) for note in data.get("notes") or []]
             controls.append(dpanel(ft.Column([
                 dtext("Товары", 15, weight=ft.FontWeight.W_700),
                 *notes,
+                ft.Container(height=4),
+                toolbar,
                 ft.Container(height=4),
                 ft.Column(table, spacing=0),
             ], spacing=4), padding=ft.Padding.only(left=20, right=20, top=14, bottom=10)))
@@ -8341,20 +8413,47 @@ def main(page: ft.Page) -> None:
     views = [dash, ai_view, reports, pricing, actions, ads_view, analysis_view, search_view_section, supply, stock_view, settings, file_view]
     active_store = {"value": "ozon"}
     store_sections = {"ozon": 0, "wb": 0}
+    # Разделы меню каждого магазина (индексы в views): у WB только то, что уже работает.
+    store_nav = {
+        "ozon": list(range(len(views))),
+        "wb": [views.index(view) for view in (dash, pricing, actions, supply, stock_view, settings)],
+    }
     section_names = ["Бизнес-сводка", "AI-ассистент", "ABC/XYZ-анализ", "Цены и скидки", "Акции", "Реклама", "Анализ", "Поиск", "Поставки", "Остатки", "Настройки", "Файлы"]
 
-    wb_dashboard = build_wb_dashboard(
-        months=MONTHS, metric=metric, hero_metric=hero_metric, card=card,
-        text_color=TEXT, muted_color=MUTED,
-        primary=PRIMARY, accent=ACCENT, surface=semantic_surface("neutral", dark=False),
-        page=page, root=ROOT, reveal=reveal_path,
+    DASHBOARD_HELP.update(WB_DASHBOARD_HELP)
+    wb_dash = WbDashboard(
+        root=ROOT, page=page, months=MONTHS,
+        ui=SimpleNamespace(dpanel=dpanel, dtext=dtext, dash_stat=dash_stat, dash_stats_panel=dash_stats_panel,
+                           dash_list=dash_list, dash_section_title=dash_section_title, dash_pal=dash_pal,
+                           money=dash_money, percent=_format_percent, number=_format_number, primary=PRIMARY),
         log=lambda message: ui_queue.put(("log_append", message)),
-        theme=lambda control: apply_control_theme(control, current_dark["value"]),
+        reveal=reveal_path, set_sync=set_dashboard_sync, toast=toast,
+        on_change=lambda: render_dashboard() if is_wb_store() and host.controls and host.controls[0] is dash else None,
+    )
+
+    wb_prices_view = WbPricesView(
+        root=ROOT, page=page, log=lambda message: ui_queue.put(("log_append", message)), reveal=reveal_path, toast=toast,
+        ui=SimpleNamespace(dpanel=dpanel, dtext=dtext, dash_stat=dash_stat, dash_pal=dash_pal, money=dash_money,
+                           percent=_format_percent, primary=PRIMARY, title_color=TEXT, muted_color=MUTED,
+                           cell=lambda column, payload, expand: _build_costs_cell(column, payload, current_dark["value"], expand)),
+    )
+
+    wb_promotions_view = WbPromotionsView(
+        root=ROOT, page=page, log=lambda message: ui_queue.put(("log_append", message)), toast=toast,
+        ui=SimpleNamespace(dpanel=dpanel, dtext=dtext, dash_stat=dash_stat, dash_pal=dash_pal, money=dash_money,
+                           percent=_format_percent, primary=PRIMARY, title_color=TEXT, muted_color=MUTED,
+                           cell=lambda column, payload, expand: _build_costs_cell(column, payload, current_dark["value"], expand)),
     )
 
     def wb_section(index):
         if index == 0:
-            return wb_dashboard
+            return dash
+        if views[index] is actions:
+            wb_promotions_view.enter()
+            return wb_promotions_view.view
+        if views[index] is pricing:
+            wb_prices_view.enter()
+            return wb_prices_view.view
         if views[index] is settings:
             return settings
         if views[index] is supply:
@@ -8400,6 +8499,15 @@ def main(page: ft.Page) -> None:
         store_sections[active_store["value"]] = selected_index
         is_ozon = active_store["value"] == "ozon"
         host.controls = [views[selected_index] if is_ozon else wb_section(selected_index)]
+        if views[selected_index] is dash:
+            # Один экран сводки на оба магазина: при входе показываем данные выбранного магазина.
+            dashboard_more.items[2].visible = not is_ozon
+            if dashboard_state.get("store") != active_store["value"]:
+                dashboard_state["store"] = active_store["value"]
+                dashboard_chart.visible = False
+                dashboard_chart_note.value = ""
+                set_dashboard_chart_feedback("empty", "Постройте график", "Выберите метрику и период, затем постройте график.")
+            refresh_dashboard(push_update=False)
         if is_ozon and views[selected_index] is ads_view:
             ads_nav["screen"] = "types"
             render_ads_view(push_update=False)
@@ -8429,7 +8537,8 @@ def main(page: ft.Page) -> None:
             ai_apply_chat_theme()
         store_name = "Ozon" if is_ozon else "Wildberries"
         page.title = f"{store_name} — OzonReportX"
-        set_status("Раздел открыт", f"{store_name} · {section_names[selected_index]}", PRIMARY, busy=False)
+        section_name = "Цены" if not is_ozon and views[selected_index] is pricing else section_names[selected_index]
+        set_status("Раздел открыт", f"{store_name} · {section_name}", PRIMARY, busy=False)
         page.update()
         if is_ozon and views[selected_index] is pricing:
             enter_pricing_tab()
@@ -8446,11 +8555,11 @@ def main(page: ft.Page) -> None:
 
     def open_section(view) -> None:
         index = views.index(view)
-        rail.selected_index = index
+        rail.selected_index = store_nav[active_store["value"]].index(index)
         show_store_section(index)
 
     def nav_change(e: ft.ControlEvent) -> None:
-        show_store_section(e.control.selected_index)
+        show_store_section(store_nav[active_store["value"]][e.control.selected_index])
 
     theme_button = ft.IconButton(
         icon=ft.Icons.DARK_MODE_OUTLINED,
@@ -8484,8 +8593,11 @@ def main(page: ft.Page) -> None:
         if active_store["value"] == key:
             return
         active_store["value"] = key
-        rail.selected_index = store_sections[key]
-        show_store_section(rail.selected_index)
+        # У WB нет заявок на скидку — раздел называется просто «Цены».
+        rail_destinations[views.index(pricing)].label = "Цены" if key == "wb" else "Цены и скидки"
+        rail.destinations = [rail_destinations[index] for index in store_nav[key]]
+        rail.selected_index = store_nav[key].index(store_sections[key])
+        show_store_section(store_sections[key])
         style_store_tabs()
         page.update()
 
@@ -8510,6 +8622,21 @@ def main(page: ft.Page) -> None:
         content=ft.Column(list(store_buttons.values()), spacing=4),
     )
 
+    rail_destinations = [
+        ft.NavigationRailDestination(icon=ft.Icons.SPACE_DASHBOARD_OUTLINED, selected_icon=ft.Icons.SPACE_DASHBOARD, label="Бизнес-сводка"),
+        ft.NavigationRailDestination(icon=ft.Icons.AUTO_AWESOME_OUTLINED, selected_icon=ft.Icons.AUTO_AWESOME, label="AI-ассистент"),
+        ft.NavigationRailDestination(icon=ft.Icons.GRID_VIEW, selected_icon=ft.Icons.GRID_VIEW_ROUNDED, label="ABC/XYZ-анализ"),
+        ft.NavigationRailDestination(icon=ft.Icons.LOCAL_OFFER_OUTLINED, selected_icon=ft.Icons.LOCAL_OFFER, label="Цены и скидки"),
+        ft.NavigationRailDestination(icon=ft.Icons.LOCAL_ACTIVITY_OUTLINED, selected_icon=ft.Icons.LOCAL_ACTIVITY, label="Акции"),
+        ft.NavigationRailDestination(icon=ft.Icons.CAMPAIGN_OUTLINED, selected_icon=ft.Icons.CAMPAIGN, label="Реклама"),
+        ft.NavigationRailDestination(icon=ft.Icons.INSIGHTS_OUTLINED, selected_icon=ft.Icons.INSIGHTS, label="Анализ"),
+        ft.NavigationRailDestination(icon=ft.Icons.MANAGE_SEARCH_OUTLINED, selected_icon=ft.Icons.MANAGE_SEARCH, label="Поиск"),
+        ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2_OUTLINED, selected_icon=ft.Icons.INVENTORY_2, label="Поставки"),
+        ft.NavigationRailDestination(icon=ft.Icons.WAREHOUSE_OUTLINED, selected_icon=ft.Icons.WAREHOUSE, label="Остатки"),
+        ft.NavigationRailDestination(icon=ft.Icons.SETTINGS_OUTLINED, selected_icon=ft.Icons.SETTINGS, label="Settings"),
+        ft.NavigationRailDestination(icon=ft.Icons.FOLDER_OPEN_OUTLINED, selected_icon=ft.Icons.FOLDER_OPEN, label="Files"),
+    ]
+
     rail = ft.NavigationRail(
         selected_index=0,
         extended=True,
@@ -8524,20 +8651,7 @@ def main(page: ft.Page) -> None:
             content=rail_brand_card,
             padding=ft.Padding.only(bottom=12),
         ),
-        destinations=[
-            ft.NavigationRailDestination(icon=ft.Icons.SPACE_DASHBOARD_OUTLINED, selected_icon=ft.Icons.SPACE_DASHBOARD, label="Бизнес-сводка"),
-            ft.NavigationRailDestination(icon=ft.Icons.AUTO_AWESOME_OUTLINED, selected_icon=ft.Icons.AUTO_AWESOME, label="AI-ассистент"),
-            ft.NavigationRailDestination(icon=ft.Icons.GRID_VIEW, selected_icon=ft.Icons.GRID_VIEW_ROUNDED, label="ABC/XYZ-анализ"),
-            ft.NavigationRailDestination(icon=ft.Icons.LOCAL_OFFER_OUTLINED, selected_icon=ft.Icons.LOCAL_OFFER, label="Цены и скидки"),
-            ft.NavigationRailDestination(icon=ft.Icons.LOCAL_ACTIVITY_OUTLINED, selected_icon=ft.Icons.LOCAL_ACTIVITY, label="Акции"),
-            ft.NavigationRailDestination(icon=ft.Icons.CAMPAIGN_OUTLINED, selected_icon=ft.Icons.CAMPAIGN, label="Реклама"),
-            ft.NavigationRailDestination(icon=ft.Icons.INSIGHTS_OUTLINED, selected_icon=ft.Icons.INSIGHTS, label="Анализ"),
-            ft.NavigationRailDestination(icon=ft.Icons.MANAGE_SEARCH_OUTLINED, selected_icon=ft.Icons.MANAGE_SEARCH, label="Поиск"),
-            ft.NavigationRailDestination(icon=ft.Icons.INVENTORY_2_OUTLINED, selected_icon=ft.Icons.INVENTORY_2, label="Поставки"),
-            ft.NavigationRailDestination(icon=ft.Icons.WAREHOUSE_OUTLINED, selected_icon=ft.Icons.WAREHOUSE, label="Остатки"),
-            ft.NavigationRailDestination(icon=ft.Icons.SETTINGS_OUTLINED, selected_icon=ft.Icons.SETTINGS, label="Settings"),
-            ft.NavigationRailDestination(icon=ft.Icons.FOLDER_OPEN_OUTLINED, selected_icon=ft.Icons.FOLDER_OPEN, label="Files"),
-        ],
+        destinations=list(rail_destinations),
     )
 
     # NavigationRail не умеет прокручиваться сам: даём ему естественную высоту
@@ -8666,6 +8780,8 @@ def main(page: ft.Page) -> None:
         render_dashboard(push_update=False)
         render_abc_view(push_update=False)
         render_wb_supply_results(push_update=False)
+        wb_prices_view.render(push_update=False)
+        wb_promotions_view.render(push_update=False)
         render_auto_panel(push_update=False)
         render_limit_panel(push_update=False)
         render_stock_view(push_update=False)
@@ -8703,7 +8819,7 @@ def main(page: ft.Page) -> None:
         rail.extended = not collapsed
         rail.label_type = ft.NavigationRailLabelType.NONE if collapsed else ft.NavigationRailLabelType.ALL
         rail.min_width = 56 if collapsed else 92
-        for destination in rail.destinations:
+        for destination in rail_destinations:
             destination.tooltip = destination.label if collapsed else None
         rail_shell.padding = 6 if collapsed else 12
         rail_brand_card.width = 56 if collapsed else 216

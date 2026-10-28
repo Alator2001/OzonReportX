@@ -48,11 +48,27 @@ class WBFinanceTests(unittest.TestCase):
         self.assertEqual(result["returns"], 1)
         self.assertIsNone(result["margin"])
 
-    def test_missing_cost_or_prior_period_return_blocks_profit(self):
+    def test_missing_cost_blocks_profit(self):
         self.assertIsNone(wb.summarize(data(), {})["profit"])
-        result = wb.summarize(data([detail(operation="Возврат")]), {"123": Decimal(100)})
-        self.assertIsNone(result["profit"])
-        self.assertTrue(result["notes"])
+
+    def test_return_takes_money_back(self):
+        # У возврата WB пишет forPay положительным, но забирает его: в выплате месяца он с минусом.
+        from scripts import wb_report_design as design
+        back = detail(2, "Возврат", srid="old", forPay="847.37", retailAmount="837")
+        rows, _residual = wb.order_rows(data([back]), {"123": Decimal(250)})
+        self.assertEqual(rows[0]["Сумма начисления"], -847.37)
+        self.assertEqual(rows[0]["Прибыль"], -847.37 + 250)
+        self.assertEqual(design.effect(back), -847.37)
+
+    def test_prior_period_return_puts_cost_back(self):
+        # Товар продан в прошлом месяце и вернулся на склад: себестоимость этого месяца уменьшается на 100.
+        payload = data([detail(operation="Возврат")])
+        result = wb.summarize(payload, {"123": Decimal(100)})
+        self.assertEqual(result["costs"], -100)
+        self.assertEqual(result["profit"], Decimal(600) + 100)
+        self.assertIn("вернулся на склад", result["notes"][0])
+        rows, _residual = wb.order_rows(payload, {"123": Decimal(100)})
+        self.assertEqual((rows[0]["Количество шт."], rows[0]["Себестоимость"]), (-1, 100))
 
     def test_logistics_rows_are_not_sales_even_with_sale_document_type(self):
         result = wb.summarize(data([detail(), detail(2, "Логистика", docTypeName="Продажа", quantity=0)]), {"123": Decimal(100)})
@@ -131,7 +147,7 @@ class WBFinanceTests(unittest.TestCase):
         self.assertEqual(output_file.name, "WB Сентябрь 2026.xlsx")
         workbook = wb.load_workbook(output_file)
         try:
-            sheet = workbook["Заказы"]
+            sheet = workbook["Данные"]
             self.assertEqual(sheet.cell(row=2, column=2).value, "order")
             self.assertEqual(sheet.cell(row=2, column=9).value, 700)
             indicators = {sheet.cell(row=r, column=16).value: sheet.cell(row=r, column=17).value
@@ -151,7 +167,7 @@ class WBFinanceTests(unittest.TestCase):
         output_file = wb_monthly_report.build(self.directory, payload, costs, returns_by_srid)
         workbook = wb.load_workbook(output_file)
         try:
-            sheet = workbook["Заказы"]
+            sheet = workbook["Данные"]
             self.assertEqual(sheet.cell(row=2, column=2).value, "order")
             self.assertEqual(sheet.cell(row=2, column=11).value, "Цвет")
             self.assertEqual(sheet.cell(row=2, column=12).value, "В пути в пвз")
@@ -165,7 +181,7 @@ class WBFinanceTests(unittest.TestCase):
         output_file = wb_monthly_report.build(self.directory, payload, {"123": Decimal(200)})
         workbook = wb.load_workbook(output_file)
         try:
-            sheet = workbook["Заказы"]
+            sheet = workbook["Данные"]
             self.assertIsNone(sheet.cell(row=2, column=11).value)
             self.assertIsNone(sheet.cell(row=2, column=12).value)
         finally:
@@ -190,8 +206,8 @@ class WBFinanceTests(unittest.TestCase):
             self.assertEqual(acceptance_sheet.cell(row=2, column=3).value, 75.0)
             storage_sheet = workbook["Хранение"]
             self.assertEqual(storage_sheet.cell(row=2, column=3).value, 12.5)
-            indicators = {workbook["Заказы"].cell(row=r, column=16).value: workbook["Заказы"].cell(row=r, column=17).value
-                          for r in range(1, workbook["Заказы"].max_row + 1) if workbook["Заказы"].cell(row=r, column=16).value}
+            indicators = {workbook["Данные"].cell(row=r, column=16).value: workbook["Данные"].cell(row=r, column=17).value
+                          for r in range(1, workbook["Данные"].max_row + 1) if workbook["Данные"].cell(row=r, column=16).value}
             self.assertEqual(indicators["Приёмка по товарам (лист «Приёмка»), сумма"], 75.0)
             self.assertEqual(indicators["Хранение по товарам (лист «Хранение»), сумма"], 12.5)
         finally:
@@ -214,8 +230,8 @@ class WBFinanceTests(unittest.TestCase):
             sheet = workbook["Воронка продаж"]
             self.assertEqual(sheet.cell(row=2, column=1).value, "123")
             self.assertEqual(sheet.cell(row=2, column=4).value, 100)
-            indicators = {workbook["Заказы"].cell(row=r, column=16).value: workbook["Заказы"].cell(row=r, column=17).value
-                          for r in range(1, workbook["Заказы"].max_row + 1) if workbook["Заказы"].cell(row=r, column=16).value}
+            indicators = {workbook["Данные"].cell(row=r, column=16).value: workbook["Данные"].cell(row=r, column=17).value
+                          for r in range(1, workbook["Данные"].max_row + 1) if workbook["Данные"].cell(row=r, column=16).value}
             self.assertEqual(indicators["Воронка продаж (лист «Воронка продаж») — просмотры"], 100)
         finally:
             workbook.close()
@@ -247,48 +263,58 @@ class WBFinanceTests(unittest.TestCase):
                 wb.save_report(self.directory, data())
         self.assertEqual(path.read_bytes(), before)
 
-    def test_desktop_summary_uses_actual_card_builders(self):
+    def test_dashboard_download_logs_progress_without_token_and_renders(self):
         import asyncio
+        from types import SimpleNamespace
         import flet as ft
         from scripts import wb_dashboard
-        from scripts.wb_dashboard import build_dashboard
-        namespace = dict(ft=ft, SURFACE="white", TEXT="black", MUTED="grey", BORDER="grey")
-        helpers = {name: technical.ui_function(name, namespace) for name in ("card", "metric", "hero_metric")}
-        logger, page = Mock(), Mock()
-        view = build_dashboard(months=[str(n) for n in range(1, 13)], **helpers,
-                               text_color="black", muted_color="grey", primary="green",
-                               accent="orange", surface="white", page=page, root=self.directory,
-                               reveal=Mock(), theme=Mock(), log=logger)
-        self.assertEqual(view.controls[0].value, "Бизнес-сводка · Wildberries")
-        self.assertEqual(len(view.controls[5].controls), 7)
-        view.controls[2].controls[0].on_click(None)
-        self.assertTrue(any("Пересчёт" in c.args[0] for c in logger.call_args_list))
+        text = lambda value, *args, **kwargs: ft.Text(str(value))  # noqa: E731
+        ui = SimpleNamespace(
+            dpanel=lambda content, **kwargs: ft.Container(content=content), dtext=text,
+            dash_stat=lambda label, value, caption="", color=None, help_key=None: ft.Container(content=ft.Text(f"{label}: {value}")),
+            dash_stats_panel=lambda stats: ft.Row(stats), dash_list=lambda title, rows, total, col=None: ft.Column(
+                [ft.Text(title)] + [ft.Text(f"{row[0]}: {row[1]}") for row in rows]),
+            dash_section_title=lambda title, caption="": ft.Text(title),
+            dash_pal=lambda: {"good": "g", "bad": "b", "warn": "w", "muted": "m"},
+            money=lambda value: f"{value} ₽", percent=lambda value: f"{value} %", number=str, primary="green")
+        logger, page, sync, changed = Mock(), Mock(), Mock(), Mock()
+        dash = wb_dashboard.WbDashboard(root=self.directory, page=page, months=[str(n) for n in range(1, 13)], ui=ui,
+                                        log=logger, reveal=Mock(), set_sync=sync, on_change=changed, toast=Mock())
+        dash.load(2026, 9)
+        empty = dash.controls(Mock())
+        self.assertIn("ещё нет", empty[0].content.controls[1].value)
 
         def client_factory(token, cancel, progress):
-            client = Mock()
+            client = Mock(token=token)
             def fetch(*args):
                 progress("Последняя страница получена")
-                return data()
+                return dict(data(), account=wb.identity(token))
             client.fetch.side_effect = fetch
+            client.list_reports.return_value = [report()]
+            client.balance.return_value = {"current": Decimal(0), "for_withdraw": Decimal(0)}
             return client
 
-        view.controls[1].controls[2].on_click(None)
-        download = page.run_task.call_args.args[0]
-        with patch.object(wb_dashboard, "read_settings", return_value={"WB_API_TOKEN": "hidden-token"}), \
-                patch.object(wb, "FinanceClient", side_effect=client_factory), \
-                patch.object(wb, "ensure_costs"), patch.object(wb, "save_report"):
-            asyncio.run(download())
-        messages = "\n".join(c.args[0] for c in logger.call_args_list)
-        self.assertIn("Последняя страница получена", messages)
-        self.assertIn("Загрузка завершена", messages)
-        self.assertIn("Внимание:", messages)
-        self.assertNotIn("hidden-token", messages)
+        settings = {"WB_API_TOKEN": "hidden-token"}
+        with patch.object(wb_dashboard, "read_settings", return_value=settings), \
+                patch.object(wb_dashboard.wb_settlement, "read_settings", return_value=settings), \
+                patch.object(wb, "read_settings", return_value=settings), \
+                patch.object(wb, "FinanceClient", side_effect=client_factory), patch.object(wb, "ensure_costs"):
+            asyncio.run(dash.download(2026, 9))
+            messages = "\n".join(c.args[0] for c in logger.call_args_list)
+            self.assertIn("Последняя страница получена", messages)
+            self.assertIn("Загрузка завершена", messages)
+            self.assertNotIn("hidden-token", messages)
+            self.assertEqual(sync.call_args.args, (False, ""))
+            self.assertTrue(changed.called)
+            self.assertIsNotNone(dash.data)
+            texts = [c.value for c in dash.controls(Mock())[0].controls for c in [c.content] if hasattr(c, "value")]
+            self.assertTrue(any(t.startswith("Выручка: ") for t in texts))
 
-        with patch.object(wb_dashboard, "read_settings", return_value={"WB_API_TOKEN": "hidden-token"}), \
+        with patch.object(wb_dashboard, "read_settings", return_value=settings), \
                 patch.object(wb, "FinanceClient", side_effect=OSError("hidden-token")):
-            asyncio.run(download())
-        self.assertIn("Ошибка загрузки", logger.call_args.args[0])
-        self.assertNotIn("hidden-token", logger.call_args.args[0])
+            asyncio.run(dash.download(2026, 9))
+        self.assertIn("Ошибка загрузки", "\n".join(c.args[0] for c in logger.call_args_list[-3:]))
+        self.assertNotIn("hidden-token", "\n".join(c.args[0] for c in logger.call_args_list))
 
 
 class OzonStatusTests(unittest.TestCase):

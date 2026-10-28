@@ -17,6 +17,7 @@ from scripts.file_lock import exclusive_file
 from scripts.marketplace_settings import read_settings
 
 BASE = "https://finance-api.wildberries.ru/api/finance/v1/sales-reports"
+BALANCE_URL = "https://finance-api.wildberries.ru/api/v1/account/balance"
 _request_lock = threading.Lock()
 _next_request = 0.0
 
@@ -101,6 +102,44 @@ class FinanceClient:
             raise FinanceError("WB ограничил запросы. Повторите позже; предыдущий отчёт сохранён.")
         finally:
             _request_lock.release()
+
+    def list_reports(self, date_from, date_to):
+        """Итоги всех ежедневных отчётов WB за период (без детализации) — для сверки выплат за всю историю."""
+        common = {"dateFrom": date_from, "dateTo": date_to + "T23:59:59", "period": "daily"}
+        reports, report_ids = [], set()
+        while True:
+            self.progress(f"Загрузка итогов WB за всё время: получено {len(reports)} отчётов")
+            page = self.request("/list", {**common, "limit": 1000, "offset": len(reports)})
+            if not page:
+                return reports
+            for row in page:
+                report_id = row.get("reportId")
+                if not isinstance(report_id, int) or report_id in report_ids:
+                    raise FinanceError("Повторный или некорректный ID отчёта WB.")
+                if row.get("currency") != "RUB":
+                    raise FinanceError("Сверка выплат WB поддерживает только отчёты в RUB.")
+                report_ids.add(report_id)
+                reports.append(row)
+            if len(page) < 1000:
+                return reports
+
+    def balance(self):
+        """Баланс продавца на WB: current — всего на балансе, for_withdraw — можно вывести сейчас."""
+        self.check_cancel()
+        try:
+            response = self.session.get(BALANCE_URL, headers={"Authorization": self.token}, timeout=(10, 60))
+        except requests.RequestException:
+            raise FinanceError("Не удалось связаться с WB. Проверьте соединение и повторите.") from None
+        if response.status_code != 200:
+            message = {401: "Токен WB недействителен или истёк.", 403: "У токена WB нет доступа к категории «Финансы».",
+                       429: "WB ограничил запросы баланса (раз в минуту). Повторите позже."}.get(
+                           response.status_code, f"WB вернул HTTP {response.status_code} на запрос баланса.")
+            raise FinanceError(message)
+        try:
+            data = response.json()
+            return {"current": number(data["current"]), "for_withdraw": number(data["for_withdraw"])}
+        except (ValueError, KeyError, TypeError):
+            raise FinanceError("WB вернул некорректный баланс.") from None
 
     def fetch(self, year, month):
         first, last = period_dates(year, month)
@@ -250,23 +289,27 @@ def summarize(data, costs):
         if not returning:
             sale_revenue += number(row["retailAmount"])
     cogs = Decimal(0)
-    unmatched_returns = False
+    restored = Decimal(0)
     for (_order, nm_id), (sold, returned) in quantities.items():
-        # A sale and its return within the report period have zero total COGS.
-        if returned > sold:
-            unmatched_returns = True
-        net = max(Decimal(0), sold - returned)
+        # A sale and its return within the report period have zero total COGS. A return of an earlier month's
+        # sale (returned > sold) puts the item back in stock — on a WB warehouse or with the seller — and it is
+        # sold again, so its cost comes back: negative COGS in the month of the return.
+        net = sold - returned
         if net:
             cost = costs.get(nm_id)
             if cost is None:
                 missing.add(nm_id)
             else:
                 cogs += cost * net
+                if net < 0:
+                    restored -= cost * net
     if missing:
         notes.append("Заполните себестоимость для nmId: " + ", ".join(sorted(missing)))
-    if unmatched_returns:
-        notes.append("Есть возвраты продаж другого периода. Прибыль не рассчитана: нужно согласовать восстановление себестоимости прошлых месяцев.")
-    complete = not missing and not unmatched_returns
+    if restored:
+        amount = f"{restored:,.2f}".replace(",", " ").replace(".", ",")
+        notes.append(f"Возвраты продаж прошлых месяцев: товар вернулся на склад, его себестоимость {amount} ₽ "
+                     "вычтена из себестоимости этого месяца.")
+    complete = not missing
     profit = payout - cogs if complete else None
     gross = revenue - cogs if complete else None
     return {"empty": False, "revenue": revenue, "payout": payout,
@@ -278,6 +321,7 @@ def summarize(data, costs):
             "logistics": total("deliveryServiceSum"), "storage": total("paidStorageSum"),
             "acceptance": total("paidAcceptanceSum"), "deductions": total("deductionSum"),
             "penalties": total("penaltySum"), "additional": total("additionalPaymentSum"),
+            "fast_withdraw": sum((number(row.get("paymentSchedule") or 0) for row in reports), Decimal(0)),
             "notes": notes, "missing": sorted(missing)}
 
 
@@ -300,10 +344,15 @@ def order_rows(data, costs):
                       "net_payout": Decimal(0), "date": None, "ops": set()}
             orders[srid] = entry
             order_seq.append(srid)
-        entry["net_payout"] += (number(row.get("forPay", 0)) - number(row.get("deliveryService", 0))
+        returning = str(row.get("sellerOperName") or "").strip().lower() == "возврат"
+        # У возврата forPay положительный, но WB его забирает (сверено с bankPaymentSum на возвратах 11.2025).
+        pay = -number(row.get("forPay", 0)) if returning else number(row.get("forPay", 0))
+        entry["net_payout"] += (pay - number(row.get("deliveryService", 0))
                                  - number(row.get("paidStorage", 0)) - number(row.get("paidAcceptance", 0))
                                  - number(row.get("deduction", 0)) - number(row.get("penalty", 0))
-                                 + number(row.get("additionalPayment", 0)))
+                                 + number(row.get("additionalPayment", 0))
+                                 # Плата за досрочный вывод денег: WB вычитает её из «Итого к оплате».
+                                 - number(row.get("paymentSchedule") or 0))
         operation = str(row.get("sellerOperName") or "").strip().lower()
         if operation in ("продажа", "возврат"):
             entry["ops"].add(operation)
@@ -332,7 +381,8 @@ def order_rows(data, costs):
         nm_ids = set(entry["sold"]) | set(entry["returned"])
         quantity, cost_total, cost_known = Decimal(0), Decimal(0), True
         for nm_id in nm_ids:
-            net = max(Decimal(0), entry["sold"][nm_id] - entry["returned"][nm_id])
+            # Возврат продажи прошлого месяца — отрицательное количество: себестоимость возвращается (как в summarize).
+            net = entry["sold"][nm_id] - entry["returned"][nm_id]
             quantity += net
             if net:
                 cost = costs.get(nm_id)

@@ -56,7 +56,7 @@ OzonReportX/
 
 | Модуль | Назначение |
 |---|---|
-| `Monthly_sales_report.py` | Месячный отчёт: заказы FBS/FBO, начисления, баланс, реклама → `reports/<Месяц> <Год>.xlsx` |
+| `Monthly_sales_report.py` | Месячный отчёт: заказы FBS/FBO, начисления, баланс, реклама → `reports/Ozon/<Год>/<Месяц> <Год>.xlsx` |
 | `report_http.py` | `ReportSession` и `create_session()`: темп запросов и повторы при 429 для Seller API |
 | `balance_report.py` | `/v1/finance/balance`: звёздные товары, хранение FBO, выплаты; выгрузка в `balance reports/` |
 | `performance_api.py` | Performance API (реклама): токен, кампании, статистика — для месячного отчёта |
@@ -189,7 +189,7 @@ Python — **3.14** (`.python-version`). Ключевые библиотеки: 
 | `.env` | мастер настройки | Ключи API |
 | `costs.xlsx` | пользователь + синхронизация цен | Себестоимость, рассчитанные и текущие цены, лист «Акции». Главный справочник товаров |
 | `margin_settings.json` | «Цены и скидки» | Минимальная и желаемая маржа |
-| `reports/<Месяц> <Год>.xlsx` | месячный отчёт | Лист «Заказы» + блок показателей P/Q, «Расходы вне заказов», «Кампании» |
+| `reports/Ozon/<Год>/<Месяц> <Год>.xlsx` | месячный отчёт | Лист «Заказы» + блок показателей P/Q, «Расходы вне заказов», «Кампании» |
 | `ABC&XYZ reports/` | ABC/XYZ | `<Месяц Год>-<Месяц Год>.xlsx` |
 | `stocks reports/` | планы поставок | Отчёты FBO/WB, кэш заказов `.orders_cache/`, кэш продаж WB `.wb_sales_cache/` |
 | `balance reports/` | консольное меню (`balance_report.py`) | JSON и Excel баланса за период |

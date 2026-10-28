@@ -38,12 +38,48 @@ class SeasonTests(unittest.TestCase):
         rows += daily(window_from, 30, qty=1)                            # +1 в день в окне — итого вдвое больше
         result = wb.season_factor(history(rows), TODAY, TODAY + timedelta(days=14), TODAY + timedelta(days=44))
         self.assertEqual(result["method"], "season")
+        self.assertAlmostEqual(result["raw"], 2.0, delta=0.15)
+        # Истории чуть больше года — коэффициент ослаблен вдвое: 1 + (2 − 1) / 2.
+        self.assertEqual(result["weight"], 0.5)
+        self.assertAlmostEqual(result["factor"], 1.5, delta=0.08)
+
+    def test_full_season_after_two_years_of_history(self):
+        shift = timedelta(days=364)
+        rows = daily(TODAY - timedelta(days=760), 2)                      # история с двух лет назад
+        base_from = TODAY - timedelta(days=90) - shift
+        rows += daily(base_from, 90 + 14 + 30, qty=1)
+        rows += daily(TODAY + timedelta(days=14) - shift, 30, qty=1)
+        result = wb.season_factor(history(rows), TODAY, TODAY + timedelta(days=14), TODAY + timedelta(days=44))
+        self.assertEqual(result["weight"], 1.0)
         self.assertAlmostEqual(result["factor"], 2.0, delta=0.15)
 
     def test_without_last_year_history_factor_is_one(self):
         rows = daily(TODAY - timedelta(days=60), 60)
         result = wb.season_factor(history(rows), TODAY, TODAY + timedelta(days=14), TODAY + timedelta(days=44))
         self.assertEqual((result["method"], result["factor"]), ("none", 1.0))
+
+
+class RateTests(unittest.TestCase):
+    def test_rate_uses_days_wb_returned_not_90(self):
+        # WB отдал заказы только за 40 дней (как метод статистики на деле): 1 заказ в день, а не 40 / 90.
+        recent = orders([(TODAY - timedelta(days=i), "A", 1, False, False) for i in range(40)])
+        rates = wb.order_rate(recent, TODAY)
+        self.assertEqual(rates["days"], 40)
+        self.assertAlmostEqual(rates["rate"], 1.0)
+
+    def test_rate_is_average_of_last_30_days_and_whole_period(self):
+        # 90 дней: первые 60 — по 1 заказу в день, последние 30 — по 3 (рост продаж).
+        rows = [(TODAY - timedelta(days=i), "A", 3 if i < 30 else 1, False, False) for i in range(90)]
+        rates = wb.order_rate(orders(rows), TODAY)
+        self.assertAlmostEqual(rates["rate_recent"], 3.0)
+        self.assertAlmostEqual(rates["rate_all"], 150 / 90)
+        self.assertAlmostEqual(rates["rate"], (3.0 + 150 / 90) / 2)
+
+    def test_cancelled_orders_count_for_period_but_not_for_rate(self):
+        rows = [(TODAY - timedelta(days=9), "A", 1, True, False), (TODAY, "A", 1, False, False)]
+        rates = wb.order_rate(orders(rows), TODAY)
+        self.assertEqual(rates["days"], 10)
+        self.assertAlmostEqual(rates["rate"], 0.1)
 
 
 class PlanTests(unittest.TestCase):

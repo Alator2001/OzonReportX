@@ -10,6 +10,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 try:
+    from scripts.report_book import data_sheet_name, is_designed
+except ModuleNotFoundError:
+    from report_book import data_sheet_name, is_designed
+try:
     from scripts.file_io import excel_writer, atomic_output_path
 except ModuleNotFoundError:
     from file_io import excel_writer, atomic_output_path
@@ -170,11 +174,13 @@ def merge_folder(
     report_missing = []   # листы, где нет всех нужных колонок
     report_partial = []   # листы, где нашли часть колонок
 
+    # Отчёты лежат по годам (reports/Ozon/2026/…): ищем во вложенных папках, пути — относительно input_dir.
     all_files = [
-        f for f in os.listdir(input_dir)
-        if os.path.isfile(os.path.join(input_dir, f))
-        and os.path.splitext(f)[1].lower() in EXCEL_EXT
-        and not f.startswith(("~$", "~tmp_"))
+        os.path.relpath(os.path.join(folder, f), input_dir)
+        for folder, _dirs, names in os.walk(input_dir)
+        for f in names
+        if os.path.splitext(f)[1].lower() in EXCEL_EXT
+        and not f.startswith(("~$", "~tmp_", "WB "))
     ]
     # Фильтр по диапазону месяцев: только файлы «Месяц Год.xlsx» в [from_..to_]
     if from_month is not None and from_year is not None and to_month is not None and to_year is not None:
@@ -182,7 +188,7 @@ def merge_folder(
         to_ym = (to_year, to_month)
         files = sorted(
             f for f in all_files
-            if (parsed := parse_filename_to_month_year(os.path.splitext(f)[0])) is not None
+            if (parsed := parse_filename_to_month_year(os.path.splitext(os.path.basename(f))[0])) is not None
             and from_ym <= parsed <= to_ym
         )
     else:
@@ -197,7 +203,7 @@ def merge_folder(
         os.makedirs(output_dir, exist_ok=True)
         date_range: List[Tuple[int, int]] = []
         for f in files:
-            stem = os.path.splitext(f)[0]
+            stem = os.path.splitext(os.path.basename(f))[0]
             parsed = parse_filename_to_month_year(stem)
             if parsed:
                 date_range.append(parsed)
@@ -222,7 +228,10 @@ def merge_folder(
 
         try:
             # Обрабатываем только листы заказов; «Кампании» и прочие листы пропускаем
-            for sheet_name in (s for s in xls.sheet_names if s in ORDER_SHEET_NAMES):
+            # Отчёт нового вида: заказы на скрытом листе «Данные», видимые «Заказы» — оформление (report_book).
+            order_sheets = ([data_sheet_name(xls.sheet_names)] if is_designed(xls.sheet_names)
+                            else [s for s in xls.sheet_names if s in ORDER_SHEET_NAMES])
+            for sheet_name in order_sheets:
                 try:
                     df = xls.parse(sheet_name)
                 except Exception as e:
@@ -273,7 +282,7 @@ def merge_folder(
                         sub[num_col] = pd.to_numeric(sub[num_col], errors="coerce")
 
                 # Добавим источник
-                sub["Источник файл"] = fname
+                sub["Источник файл"] = os.path.basename(fname)
                 sub["Лист"] = sheet_name
 
                 rows.append(sub)
@@ -729,7 +738,7 @@ def merge_folder(
 
 def main(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(description="Собрать заказы из всех Excel-отчётов папки в один файл для ABC&XYZ-анализа.")
-    parser.add_argument("-i", "--input_dir", default="./reports", help="Папка с входными Excel отчётами (по умолчанию ./reports)")
+    parser.add_argument("-i", "--input_dir", default="./reports/Ozon", help="Папка с месячными отчётами Ozon, включая папки по годам (по умолчанию ./reports/Ozon)")
     parser.add_argument("-o", "--output", default=None, help="Путь к выходному файлу (если не задан и задан --output_dir, имя берётся по диапазону месяцев)")
     parser.add_argument("--output_dir", default=None, help='Папка для сохранения (например "ABC&XYZ reports"). Имя файла: «Ранний месяц год-Поздний месяц год.xlsx»')
     parser.add_argument("--from-month", type=int, default=None, metavar="M", help="Месяц начала диапазона (1–12); вместе с --from-year/--to-month/--to-year ограничивает обрабатываемые файлы")

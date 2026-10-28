@@ -1,4 +1,4 @@
-"""Offline checks for the «Остатки» section: same planners as «Поставки», 30 days, one FBS for both stores."""
+"""Offline checks for the «Остатки» section: same planners as «Поставки», 30 days, FBS counted per store."""
 import sys
 import unittest
 from datetime import date, timedelta
@@ -45,16 +45,32 @@ class NeedsTests(unittest.TestCase):
 
 
 class RowsTests(unittest.TestCase):
-    def test_one_fbs_for_both_stores(self):
+    def test_fbs_is_counted_separately_for_each_store(self):
         ozon = source({"A": {"need_fbo": 14, "fbs_demand": 6.0}}, own={"A": 3}, stock={"A": 5}, transit={"A": 2})
-        wb = source({"A": {"need_fbw": 4, "fbs_demand": 4.0}}, own={"A": 1}, stock={"A": 4})
+        wb = source({"A": {"need_fbw": 4, "fbs_demand": 4.0}}, own={"A": 9}, stock={"A": 4})
         row = so.build_rows(ozon, wb, 0.9)[0]
-        # FBS — один склад: берём наибольший остаток, спрос Ozon и WB складываем → квантиль Пуассона(10) = 14.
-        self.assertEqual((row["fbs"], row["fbs_by_store"]), (3, {"Ozon": 3, "WB": 1}))
-        self.assertEqual((row["need_fbs"], row["short_fbs"]), (14, 11))
+        # Товар на своём складе зарезервирован под каждый магазин отдельно: квантиль Пуассона от спроса своего магазина,
+        # и лишние 9 шт. WB не закрывают нехватку Ozon.
+        q6, q4 = ozon_plan.poisson_quantile(6.0, 0.9), ozon_plan.poisson_quantile(4.0, 0.9)
+        self.assertEqual((row["need_fbs_ozon"], row["short_fbs_ozon"]), (q6, q6 - 3))
+        self.assertEqual((row["need_fbs_wb"], row["short_fbs_wb"]), (q4, max(0, q4 - 9)))
+        self.assertEqual(row["fbs"], 12)
         # FBO: нужно 14, есть 5 + 2 в пути → не хватает 7. FBW: нужно 4, есть 4.
         self.assertEqual((row["need_fbo"], row["short_fbo"]), (14, 7))
         self.assertEqual((row["need_fbw"], row["short_fbw"]), (4, 0))
+
+    def test_fbs_of_each_store_in_its_own_column(self):
+        ozon = source({}, own={"A": 3, "B": 2})
+        wb = source({}, own={"A": 5})
+        rows = {row["article"]: row for row in so.build_rows(ozon, wb, 0.9)}
+        # Каждый магазин — своя колонка; артикула нет в ответе магазина → 0; fbs — всего на своём складе.
+        self.assertEqual((rows["A"]["fbs_ozon"], rows["A"]["fbs_wb"], rows["A"]["fbs"]), (3, 5, 8))
+        self.assertEqual((rows["B"]["fbs_ozon"], rows["B"]["fbs_wb"], rows["B"]["fbs"]), (2, 0, 2))
+
+    def test_fbs_column_of_store_that_did_not_load_is_empty(self):
+        row = so.build_rows(None, source({}, own={"A": 4}), 0.9)[0]
+        self.assertEqual((row["fbs_ozon"], row["fbs_wb"], row["fbs"]), (None, 4, 4))
+        self.assertEqual((row["need_fbs_ozon"], row["need_fbs_wb"]), (None, 0))
 
     def test_store_that_did_not_load_leaves_empty_columns(self):
         rows = so.build_rows(source({"A": {"need_fbo": 2, "fbs_demand": 0.0}}, own={"A": 1}), None, 0.9)
@@ -63,6 +79,29 @@ class RowsTests(unittest.TestCase):
     def test_articles_without_stock_or_need_are_hidden(self):
         rows = so.build_rows(source({"A": {"need_fbo": 0, "fbs_demand": 0.0}}, own={"A": 0}), None, 0.9)
         self.assertEqual(rows, [])
+
+
+class FilterTests(unittest.TestCase):
+    def setUp(self):
+        ozon = source({"A": {"need_fbo": 5, "fbs_demand": 0.0}, "C": {"need_fbo": 3, "fbs_demand": 0.0}},
+                      own={"A": 2, "B": 1, "C": 0}, stock={"A": 5, "B": 4})
+        wb = source({}, own={"A": 2, "B": 3})
+        self.rows = so.build_rows(ozon, wb, 0.9)
+
+    def articles(self, text="", mode="all"):
+        return [row["article"] for row in so.filter_rows(self.rows, text, mode)]
+
+    def test_filters(self):
+        self.assertEqual(self.articles(), ["A", "B", "C"])
+        self.assertEqual(self.articles(mode="fbs_in"), ["A", "B"])
+        self.assertEqual(self.articles(mode="fbs_zero"), ["C"])
+        self.assertEqual(self.articles(mode="short"), ["C"])  # A: нужно 5, есть 5; C: нужно 3, нет нигде
+        self.assertEqual(self.articles(mode="empty"), ["C"])
+        self.assertEqual(self.articles(mode="fbs_mismatch"), ["B"])  # B: Ozon 1, WB 3; у A и C магазины сходятся
+
+    def test_search_by_part_of_article_with_filter(self):
+        self.assertEqual(self.articles(" a "), ["A"])
+        self.assertEqual(self.articles("b", "fbs_zero"), [])
 
 
 class ForecastNoteTests(unittest.TestCase):

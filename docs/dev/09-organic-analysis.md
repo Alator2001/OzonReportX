@@ -32,7 +32,7 @@
 | Реклама по SKU за оба периода и рекламные заказы по неделям | `load_ads` | Performance API через `ads_cpc.PerfClient` (без ключей — источник `bad`) |
 | Свободный остаток | `ads_cpc.load_available_stock` | `/v4/product/info/stocks` |
 | Цена, индекс цен, акции | `load_prices` | `/v5/product/info/prices` |
-| Средняя цена продажи по периодам | `load_price_history` | месячные отчёты `reports/*.xlsx` (лист «Заказы», без отмен) |
+| Средняя цена продажи по периодам | `load_price_history` | месячные отчёты `reports/Ozon/<Год>/*.xlsx` (лист «Заказы», без отмен) |
 | Контент-рейтинг и что добавить | `load_content_rating` | `/v1/product/rating-by-sku` |
 | Доставка из кластера покупателя | `load_locality` | `/v1/analytics/local-sale/items-clusters/info` |
 | Поиск: позиции, «увидели», запросы | `load_search` | `/v1/analytics/product-queries` (+ `/details`). Без Premium — пусто или 403 |

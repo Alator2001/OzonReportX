@@ -22,6 +22,7 @@ script_dir = Path(__file__).resolve().parent
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 from app_paths import DATA_ROOT, SCRIPTS_DIR, python_executable  # noqa: E402
+from report_paths import ozon_report_path, ozon_reports_dir  # noqa: E402
 repo_root = DATA_ROOT
 
 MONTHS_RU = [
@@ -30,7 +31,6 @@ MONTHS_RU = [
 ]
 
 ABC_XYZ_DIR = "ABC&XYZ reports"
-REPORTS_DIR = "reports"
 STOCKS_REPORTS_DIR = "stocks reports"
 
 
@@ -61,8 +61,7 @@ def _ensure_abc_xyz_report(repo_root: Path, from_month: int, from_year: int, to_
     if expected_path.exists():
         return expected_path
     # Запуск построения ABC&XYZ
-    reports_dir = repo_root / REPORTS_DIR
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir = ozon_reports_dir(repo_root)
     main_script = SCRIPTS_DIR / "Monthly_sales_report.py"
     abc_script = SCRIPTS_DIR / "ABC_XYZ_analytics_report.py"
     venv_python = python_executable()
@@ -77,8 +76,7 @@ def _ensure_abc_xyz_report(repo_root: Path, from_month: int, from_year: int, to_
                 break
             months_need.append((y, m))
     for y, m in months_need:
-        fname = f"{MONTHS_RU[m - 1]} {y}.xlsx"
-        if not (reports_dir / fname).exists() and main_script.exists():
+        if not ozon_report_path(repo_root, y, m).exists() and main_script.exists():
             subprocess.run(
                 [str(venv_python), str(main_script), "--month", str(m), "--year", str(y)],
                 cwd=repo_root,

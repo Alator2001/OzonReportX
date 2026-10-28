@@ -7,10 +7,11 @@
 окно — [сегодня, сегодня + 30 дней).
 - FBO: fbo_supply_plan.build_plan — прогноз магазина (то же окно год назад × рост) × доля артикула × доля зоны
   склада; по каждому складу FBO цель = квантиль Пуассона (уровень сервиса); «нужно держать FBO» — сумма целей.
-- FBW: wb_supply_plan.build_wb_plan — темп заказов WB за 90 дней × сезонность × доля артикула; цель FBW только
-  для артикулов, которые продаются не меньше wb_fbw_min_monthly шт. в месяц.
-- FBS: один свой склад на оба магазина. Спрос FBS = спрос Ozon, который не покроет FBO (регионы без склада FBO,
-  мелкий спрос зон) + спрос WB, который не покроет FBW; нужно = квантиль Пуассона от суммы.
+- FBW: wb_supply_plan.build_wb_plan — темп заказов WB (среднее за 30 дней и за весь отданный период) × сезонность
+  × доля артикула; цель FBW только для артикулов, которые продаются не меньше wb_fbw_min_monthly шт. в месяц.
+- FBS: свой склад, но товар на нём зарезервирован отдельно под Ozon и под WB — это разные штуки, поэтому и считаем
+  отдельно. FBS Ozon: спрос Ozon, который не покроет FBO (регионы без склада FBO, мелкий спрос зон); FBS WB: спрос WB,
+  который не покроет FBW; нужно = квантиль Пуассона от спроса своего магазина.
 Только чтение: ничего не отправляется и отчёты не пишутся (кэши заказов — общие с планами поставок).
 """
 
@@ -64,7 +65,8 @@ def build_rows(ozon: Optional[Dict[str, Any]], wb: Optional[Dict[str, Any]], lev
     """
     ozon / wb: {"needs": ozon_needs/wb_needs, "own": {артикул: FBS}, "stock": {артикул: на складе}, "transit": {артикул: в пути}}
     или None, если магазин не загрузился (его колонки будут пустыми).
-    FBS — один склад: остаток — наибольший из показанных Ozon и WB (это один и тот же товар).
+    FBS Ozon и FBS WB — разные штуки (резерв под каждый магазин): свой остаток, своё «нужно» и своё «не хватает».
+    fbs — всего на своём складе (Ozon + WB), для фильтров. None — магазин не загрузился.
     """
     articles = set()
     for source in (ozon, wb):
@@ -74,29 +76,63 @@ def build_rows(ozon: Optional[Dict[str, Any]], wb: Optional[Dict[str, Any]], lev
     for article in sorted(articles, key=ozon_plan._article_sort_key):
         o_need = (ozon or {}).get("needs", {}).get(article, {})
         w_need = (wb or {}).get("needs", {}).get(article, {})
-        fbs_by_store = {name: int(source["own"][article]) for name, source in (("Ozon", ozon), ("WB", wb))
-                        if source and source["own"].get(article) is not None}
-        fbs_demand = float(o_need.get("fbs_demand", 0.0)) + float(w_need.get("fbs_demand", 0.0))
+        demand_ozon = float(o_need.get("fbs_demand", 0.0))
+        demand_wb = float(w_need.get("fbs_demand", 0.0))
         row = {
             "article": article,
-            "fbs": max(fbs_by_store.values()) if fbs_by_store else 0,
-            "fbs_by_store": fbs_by_store,
+            "fbs_ozon": int(ozon["own"].get(article) or 0) if ozon else None,
+            "fbs_wb": int(wb["own"].get(article) or 0) if wb else None,
             "fbo": int(ozon["stock"].get(article, 0)) if ozon else None,
             "fbo_transit": int(ozon["transit"].get(article, 0)) if ozon else 0,
             "fbw": int(wb["stock"].get(article, 0)) if wb else None,
             "fbw_transit": int(wb["transit"].get(article, 0)) if wb else 0,
             "need_fbo": int(o_need.get("need_fbo", 0)) if ozon else None,
             "need_fbw": int(w_need.get("need_fbw", 0)) if wb else None,
-            "fbs_demand": round(fbs_demand, 1),
-            "need_fbs": ozon_plan.poisson_quantile(fbs_demand, level) if fbs_demand > 0 else 0,
+            "fbs_demand_ozon": round(demand_ozon, 1),
+            "fbs_demand_wb": round(demand_wb, 1),
+            "need_fbs_ozon": (ozon_plan.poisson_quantile(demand_ozon, level) if demand_ozon > 0 else 0) if ozon else None,
+            "need_fbs_wb": (ozon_plan.poisson_quantile(demand_wb, level) if demand_wb > 0 else 0) if wb else None,
         }
+        row["fbs"] = (row["fbs_ozon"] or 0) + (row["fbs_wb"] or 0)
         row["short_fbo"] = max(0, (row["need_fbo"] or 0) - (row["fbo"] or 0) - row["fbo_transit"])
         row["short_fbw"] = max(0, (row["need_fbw"] or 0) - (row["fbw"] or 0) - row["fbw_transit"])
-        row["short_fbs"] = max(0, row["need_fbs"] - row["fbs"])
-        if not any(row[key] for key in ("fbs", "fbo", "fbo_transit", "fbw", "fbw_transit", "need_fbo", "need_fbw", "need_fbs")):
+        row["short_fbs_ozon"] = max(0, (row["need_fbs_ozon"] or 0) - (row["fbs_ozon"] or 0))
+        row["short_fbs_wb"] = max(0, (row["need_fbs_wb"] or 0) - (row["fbs_wb"] or 0))
+        if not any(row[key] for key in ("fbs", "fbo", "fbo_transit", "fbw", "fbw_transit",
+                                        "need_fbo", "need_fbw", "need_fbs_ozon", "need_fbs_wb")):
             continue
         rows.append(row)
     return rows
+
+
+STOCK_FILTERS = {
+    "all": "Все",
+    "fbs_in": "Есть на своём складе",
+    "fbs_zero": "Свой склад — ноль",
+    "short": "Не хватает",
+    "empty": "Нет нигде",
+    "fbs_mismatch": "FBS Ozon ≠ FBS WB",
+}
+
+
+def filter_rows(rows: List[Dict[str, Any]], text: str = "", mode: str = "all") -> List[Dict[str, Any]]:
+    """Строки таблицы по поиску (часть артикула) и фильтру из STOCK_FILTERS."""
+    text = text.strip().lower()
+
+    def keep(row: Dict[str, Any]) -> bool:
+        if mode == "fbs_in":
+            return row["fbs"] > 0
+        if mode == "fbs_zero":
+            return row["fbs"] == 0
+        if mode == "short":
+            return any(row[key] for key in ("short_fbo", "short_fbw", "short_fbs_ozon", "short_fbs_wb"))
+        if mode == "empty":
+            return not any(row[key] for key in ("fbs", "fbo", "fbo_transit", "fbw", "fbw_transit"))
+        if mode == "fbs_mismatch":
+            return row["fbs_ozon"] is not None and row["fbs_wb"] is not None and row["fbs_ozon"] != row["fbs_wb"]
+        return True
+
+    return [row for row in rows if text in str(row["article"]).lower() and keep(row)]
 
 
 def forecast_note(store: str, units: float, last_30: float, method: str = "", last_year: float = 0.0, factor: float = 1.0) -> str:

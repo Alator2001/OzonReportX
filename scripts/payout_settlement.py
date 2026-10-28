@@ -27,10 +27,16 @@ try:
     from scripts.balance_report import get_balance_report, BALANCE_REPORTS_DIR
     from scripts.file_io import save_workbook_atomic
     from scripts.app_paths import DATA_ROOT
+    from scripts.report_book import ORDERS, data_sheet, is_designed
+    from scripts.report_design import render as render_design
+    from scripts.report_paths import ozon_report_files
 except ModuleNotFoundError:
     from balance_report import get_balance_report, BALANCE_REPORTS_DIR
     from file_io import save_workbook_atomic
     from app_paths import DATA_ROOT
+    from report_book import ORDERS, data_sheet, is_designed
+    from report_design import render as render_design
+    from report_paths import ozon_report_files
 
 MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
           "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
@@ -115,10 +121,10 @@ def load_payouts(start: date, today: date, cache_path: Path, fetch=get_balance_r
 
 # ── Начисления из отчётов ────────────────────────────────────────────────────
 
-def find_reports(reports_dir: Path) -> list[tuple[date, Path]]:
-    """Месячные отчёты Ozon («Сентябрь 2026.xlsx») по порядку; отчёты WB и временные файлы пропускаются."""
+def find_reports(root: Path) -> list[tuple[date, Path]]:
+    """Месячные отчёты Ozon («Сентябрь 2026.xlsx») из reports/Ozon/<год>/ по порядку; посторонние файлы пропускаются."""
     found = []
-    for path in Path(reports_dir).glob("*.xlsx"):
+    for path in ozon_report_files(root):
         match = REPORT_NAME.match(path.name)
         if match:
             found.append((date(int(match.group(2)), MONTHS.index(match.group(1)) + 1, 1), path))
@@ -126,7 +132,7 @@ def find_reports(reports_dir: Path) -> list[tuple[date, Path]]:
 
 
 def _orders_sheet(workbook):
-    return workbook["Заказы"] if "Заказы" in workbook.sheetnames else workbook.active
+    return data_sheet(workbook, ORDERS)
 
 
 def read_obligations(path: Path) -> dict[str, int]:
@@ -217,20 +223,22 @@ def write_settlement(path: Path, amounts: dict[str, int], parts, closed: dict[st
         if unallocated:
             ws["W10"] = "Выплачено сверх начисленного по отчётам"
             _money(ws["X10"], unallocated)
+        if is_designed(workbook.sheetnames):
+            render_design(workbook, path.stem)
         save_workbook_atomic(workbook, path)
     finally:
         workbook.close()
 
 
-def update_reports(reports_dir, today: date | None = None, fetch=get_balance_report) -> dict:
-    """Пересчитывает сверку выплат во всех месячных отчётах Ozon. Возвращает итоги за всё время."""
-    reports_dir = Path(reports_dir)
+def update_reports(root, today: date | None = None, fetch=get_balance_report) -> dict:
+    """Пересчитывает сверку выплат во всех месячных отчётах Ozon. root — папка данных. Возвращает итоги за всё время."""
+    root = Path(root)
     today = today or date.today()
-    reports = find_reports(reports_dir)
+    reports = find_reports(root)
     if not reports:
         return {}
     obligations = [(month, read_obligations(path)) for month, path in reports]
-    cache_path = reports_dir.parent / BALANCE_REPORTS_DIR / "payouts.json"
+    cache_path = root / BALANCE_REPORTS_DIR / "payouts.json"
     payouts = load_payouts(reports[0][0], today, cache_path, fetch)
     parts, closed, unallocated = allocate(obligations, payouts)
     total_paid = sum(amount for _, amount in payouts)
@@ -262,9 +270,8 @@ def print_summary(summary: dict) -> None:
 
 
 def main() -> None:
-    reports_dir = DATA_ROOT / "reports"
     print("💸 Сверяем выплаты Ozon с отчётами...")
-    print_summary(update_reports(reports_dir))
+    print_summary(update_reports(DATA_ROOT))
 
 
 if __name__ == "__main__":

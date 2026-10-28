@@ -1,9 +1,17 @@
-"""Wildberries business summary backed by financial reports."""
+"""«Бизнес-сводка» Wildberries — данные и блоки для общего экрана сводки (тот же, что у Ozon, см. app_flet.py).
+
+Экран, шапка («Месяц», «Год», «Обновить», «…») и «Динамика» общие для обоих магазинов; этот модуль отвечает за
+то, что у WB своё: чтение сохранённых финансовых отчётов (wb reports/<ГГГГ-ММ>.json), загрузку месяца из WB
+(«Обновить»), сверку выплат, показатели месяца и блоки «Статусы заказов и возвраты», «Приёмка, хранение и воронка».
+
+Отдельной кнопки пересчёта нет: показатели считаются заново из сохранённого отчёта и wb_costs.xlsx при каждом
+открытии сводки и выборе месяца, а Excel перерисовывается, если себестоимость или сверка выплат новее его.
+"""
 import asyncio
 from datetime import date, datetime
-from pathlib import Path
 import queue
 import threading
+from types import SimpleNamespace
 
 import flet as ft
 from scripts import wb_acceptance
@@ -11,499 +19,473 @@ from scripts import wb_finance as finance
 from scripts import wb_funnel
 from scripts import wb_monthly_report
 from scripts import wb_orders
+from scripts import wb_report_design as design
 from scripts import wb_returns
+from scripts import wb_settlement
 from scripts import wb_storage
 from scripts.marketplace_settings import read_settings
+from scripts.report_paths import wb_report_path
+
+HELP = {
+    "WB Выручка": "Сколько заплатили покупатели за проданные товары (уже со скидкой WB) по финансовым отчётам WB за месяц.",
+    "WB Чистая прибыль": "«К выплате» от WB минус себестоимость из wb_costs.xlsx. Комиссия, логистика, хранение и прочие "
+                         "удержания WB уже вычтены из выплаты. Налоги и внешние расходы не входят.",
+    "WB Маржа": "Чистая прибыль / выручка.",
+    "WB Средний чек": "Выручка / число заказов с продажей.",
+    "WB Скидка": "Средняя скидка WB покупателю (СПП). Её оплачивает WB из своей комиссии — на вашу выплату не влияет.",
+    "WB Комиссия": "Сколько WB удержал из ваших цен со скидкой продавца по ставке комиссии (у магазина 38–41,5% "
+                   "для досок, ниже для икон и оберегов). Процент справа — средняя ставка от ваших цен, а не доля в выручке.",
+    "WB Скидка покупателям": "Скидка WB покупателям (СПП). Покупатель платит меньше вашей цены, а разницу WB оплачивает "
+                             "из своей комиссии — поэтому в расчёте она идёт плюсом. Комиссия минус эта скидка — "
+                             "сколько WB заработал на самом деле.",
+    "WB Логистика": "Доставка к покупателю и возвраты, в том числе отменённых заказов (туда и обратно).",
+    "WB Вне заказов": "Расходы, не привязанные к заказам с продажей этого месяца: логистика отмен, хранение, досрочный вывод. "
+                      "Подробно — лист «Расходы вне заказов» в отчёте.",
+    "WB Начислено": "«Итого к оплате» по финансовым отчётам WB за месяц.",
+    "WB Закрыто": "Сколько из начисленного за месяц WB уже вывел вам на счёт. Выведено = всё начисленное по отчётам с начала "
+                  "магазина − текущий баланс; деньги закрывают месяцы по порядку, сначала себестоимость.",
+    "WB Баланс": "Баланс продавца на WB на момент сверки и сколько из него можно вывести сейчас.",
+    "WB Статусы": "Order Feed и отчёт о возвратах WB — снимок за последние 31 день, не привязан к выбранному месяцу.",
+    "WB Приёмка": "Отдельные отчёты WB за выбранный месяц. Хранение грузится кусками по 8 дней — это может занять несколько минут.",
+}
 
 
-def build_dashboard(*, months, metric, hero_metric, card, text_color,
-                    muted_color, primary, accent, surface, page, root, reveal, theme, log):
-    today = date.today()
-    month = ft.Dropdown(label="Месяц сводки", value=str(today.month), width=230,
-                        options=[ft.dropdown.Option(str(i), title) for i, title in enumerate(months, 1)])
-    year = ft.Dropdown(label="Год сводки", value=str(today.year), width=170,
-                       options=[ft.dropdown.Option(str(y)) for y in range(today.year, 2024, -1)])
-    status = ft.Text("Выберите период и загрузите отчёты WB.", size=12, color=muted_color)
-    cards = ft.ResponsiveRow(spacing=14, run_spacing=14)
-    details = ft.ResponsiveRow(spacing=12, run_spacing=12)
-    notes = ft.Column(spacing=6)
-    cancel = threading.Event()
-    last_report = {"path": None}
-    chart = ft.Image(src="", visible=False, border_radius=18)
-    chart_note = ft.Text("График строится по сохранённым месяцам выбранного года.", size=12)
-    busy = {"value": False}
-    order_cards = ft.ResponsiveRow(spacing=14, run_spacing=14)
-    order_status = ft.Text("Статусы заказов и возвраты ещё не загружены.", size=12, color=muted_color)
-    order_cancel = threading.Event()
-    order_busy = {"value": False}
-    returns_cards = ft.ResponsiveRow(spacing=14, run_spacing=14)
-    returns_index = {"by_srid": {}}
-    current_data = {"value": None}
-    detail_index = {"acceptance": None, "storage": None, "funnel": None, "period": None}
-    detail_cards = ft.ResponsiveRow(spacing=14, run_spacing=14)
-    detail_status = ft.Text("Приёмка, хранение и воронка продаж ещё не загружены.", size=12, color=muted_color)
-    detail_cancel = threading.Event()
-    detail_busy = {"value": False}
+def _rub(value):
+    return float(value) if value is not None else None
 
-    def write_log(message):
-        log(f"[{datetime.now():%H:%M:%S}] [WB] {message}")
 
-    def period_title():
-        return f"{months[int(month.value) - 1]} {year.value}"
+class WbDashboard:
+    """ui — помощники оформления сводки из app_flet: dpanel, dtext, dash_stat, dash_stats_panel, dash_list,
+    dash_section_title, dash_pal, money, percent, number, primary. set_sync(active, text) — заглушка над показателями
+    на время загрузки (как у Ozon), on_change() — перерисовать сводку, reveal(path, label) — открыть файл."""
 
-    def fmt(value, suffix=" ₽"):
-        return "—" if value is None else f"{value:,.2f}".replace(",", " ") + suffix
+    def __init__(self, *, root, page, months, ui, log, reveal, set_sync, on_change, toast):
+        self.root, self.page, self.months, self.ui = root, page, months, ui
+        self.log, self.reveal, self.set_sync, self.on_change, self.toast = log, reveal, set_sync, on_change, toast
+        self.period = None
+        self.data = self.summary = self.rows = self.settlement = None
+        self.error = None
+        self.busy = False
+        self.cancel_event = threading.Event()
+        self.orders = SimpleNamespace(busy=False, cancel=threading.Event(), summary=None, returns=None,
+                                      by_srid={}, text="Ещё не загружены.")
+        self.details = SimpleNamespace(busy=False, cancel=threading.Event(), period=None, acceptance=None,
+                                       storage=None, funnel=None, text="Ещё не загружены за этот месяц.")
 
-    def render(data=None):
-        result = finance.summarize(data, finance.read_costs(root)) if data else {"empty": True}
-        cards.controls = [
-            hero_metric("Выручка", fmt(result.get("revenue")), "По финансовым отчётам WB", surface, primary, col=4),
-            hero_metric("Прибыль по отчёту", fmt(result.get("profit")), "Итог к выплате минус себестоимость", surface, primary, col=4),
-            hero_metric("Себестоимость", fmt(result.get("costs")), "Отдельный справочник wb_costs.xlsx", surface, accent, col=4),
-            metric("Net Margin", fmt(result.get("margin"), " %"), "Прибыль / выручка × 100%", surface, col=3),
-            metric("Средний чек продажи", fmt(result.get("average")), "Сумма продаж / уникальные srid продаж", surface, col=3),
-            metric("Продажи", str(result.get("sales", "—")), "Уникальные srid продаж за период", surface, col=3),
-            metric("Возвраты", str(result.get("returns", "—")), "По операциям возврата WB", surface, col=3),
-        ]
-        def lines(items):
-            return [ft.Text(f"{label}: {fmt(result.get(key))}", size=13) for label, key in items]
-        details.controls = [
-            card("Прибыль", "", lines([("Итог WB к выплате", "payout"), ("Валовая прибыль", "gross"),
-                                       ("Операционные расходы", "operating")]), col=4),
-            card("Доставка и хранение", "", lines([("Логистика", "logistics"), ("Хранение", "storage"),
-                                                       ("Приёмка", "acceptance")]), col=4),
-            card("Прочие операции WB", "", lines([("Удержания", "deductions"), ("Штрафы", "penalties"),
-                                                     ("Доплаты", "additional")]), col=4),
-        ]
-        notes.controls = [ft.Text(message, color=accent, size=13) for message in result.get("notes", [])]
-        current_data["value"] = data
-        if data:
-            status.value = f"{months[data['month'] - 1]} {data['year']} · Обновлено: {data['fetched_at']} · Отчётов: {len(data['reports'])}"
-            if not result.get("empty"):
-                export_report(data)
-        theme(view)
+    # ── данные ───────────────────────────────────────────────────────────
 
-    def export_report(data):
-        same_period = detail_index["period"] == (data["year"], data["month"])
+    def write_log(self, message):
+        self.log(f"[{datetime.now():%H:%M:%S}] [WB] {message}")
+
+    def title(self, year=None, month=None):
+        year, month = (year, month) if year else self.period
+        return f"{self.months[month - 1]} {year}"
+
+    def load(self, year, month):
+        """Прочитать сохранённый отчёт месяца, пересчитать показатели и при необходимости перерисовать Excel."""
+        self.period = (year, month)
+        self.data = self.summary = self.rows = None
+        self.error = None
         try:
-            report_file = wb_monthly_report.build(
-                root, data, finance.read_costs(root), returns_index["by_srid"],
-                detail_index["acceptance"] if same_period else None,
-                detail_index["storage"] if same_period else None,
-                detail_index["funnel"] if same_period else None)
-            last_report["path"] = report_file
-            open_report_button.disabled = False
-            write_log(f"Excel-отчёт WB обновлён: {report_file.name}")
+            data = finance.load_report(self.root, year, month)
+            costs = finance.read_costs(self.root)
+            self.settlement = wb_settlement.settle(self.root, costs)
+            if data and data.get("reports"):
+                self.data, self.summary = data, finance.summarize(data, costs)
+                self.rows = design.orders(data, costs)
+                self._refresh_excel_if_stale(data, costs)
         except Exception as exc:
-            write_log(f"Не удалось сформировать Excel-отчёт WB: {exc}")
+            self.error = str(exc) if isinstance(exc, finance.FinanceError) else \
+                "Не удалось прочитать отчёт WB или wb_costs.xlsx. Закройте файлы в Excel и откройте сводку снова."
+            self.write_log(f"Ошибка чтения: {self.error}")
 
-    def refresh(_e=None):
-        write_log(f"Пересчёт сводки из файлов: {period_title()}.")
-        try:
-            data = finance.load_report(root, int(year.value), int(month.value))
-            render(data)
-            if not data:
-                status.value = "За выбранный месяц нет сохранённых отчётов этого токена WB."
-            write_log(status.value)
-            for note in notes.controls:
-                write_log(f"Внимание: {note.value}")
-            chart.visible = False
-        except Exception as exc:
-            status.value = str(exc) if isinstance(exc, finance.FinanceError) else "Не удалось прочитать отчёт или wb_costs.xlsx. Проверьте файлы."
-            write_log(f"Ошибка пересчёта: {status.value}")
-            cards.controls = []
-            details.controls = []
-            notes.controls = []
-        page.update()
-
-    async def download():
-        if busy["value"]:
-            write_log("Повторная загрузка не запущена: предыдущая операция ещё выполняется.")
+    def _refresh_excel_if_stale(self, data, costs):
+        path = wb_report_path(self.root, data["year"], data["month"])
+        sources = [finance.report_path(self.root, data["year"], data["month"]), self.root / "wb_costs.xlsx",
+                   self.root / wb_settlement.SETTLEMENT_FILE]
+        newest = max((p.stat().st_mtime for p in sources if p.exists()), default=0)
+        if path.exists() and path.stat().st_mtime >= newest:
             return
-        busy["value"] = True
-        cancel.clear()
-        token = ""
-        selected_year, selected_month = int(year.value), int(month.value)
-        for control in (month, year, download_button, recalculate_button, costs_button, chart_button):
-            control.disabled = True
-        cancel_button.disabled = False
-        progress = queue.Queue()
-        status.value = "Подключение к финансовым отчётам WB…"
-        write_log(f"Начало загрузки финансовых отчётов: {period_title()}.")
-        page.update()
-        def fetch():
-            client = finance.FinanceClient(token, cancel, progress.put)
+        try:
+            wb_monthly_report.refresh_month(self.root, data, costs, self.settlement)
+            self.write_log(f"Excel-отчёт WB обновлён по себестоимости и сверке выплат: {path.name}")
+        except Exception as exc:
+            self.write_log(f"Не удалось обновить Excel-отчёт WB (закройте его в Excel): {exc}")
+
+    def freshness(self):
+        if not self.period:
+            return "—"
+        if not self.data:
+            return f"{self.title()} · отчёта ещё нет"
+        fetched = str(self.data.get("fetched_at") or "")
+        fresh = f" · обновлено {fetched[8:10]}.{fetched[5:7]} в {fetched[11:16]}" if len(fetched) >= 16 else ""
+        return self.title() + fresh
+
+    def report_path(self, year, month):
+        return wb_report_path(self.root, year, month)
+
+    def chart_data(self, periods):
+        """(подписи, выручка, прибыль, маржа %, время самого свежего источника) по сохранённым месяцам WB."""
+        labels, revenue, profit, margin, newest = [], [], [], [], 0.0
+        costs = finance.read_costs(self.root)
+        for month, year in periods:
+            data = finance.load_report(self.root, year, month)
+            if not data or not data.get("reports"):
+                continue
+            summary = finance.summarize(data, costs)
+            if summary.get("empty"):
+                continue
+            newest = max(newest, finance.report_path(self.root, year, month).stat().st_mtime)
+            labels.append(f"{self.months[month - 1][:3]} {str(year)[-2:]}")
+            revenue.append(float(summary["revenue"] or 0))
+            profit.append(float(summary["profit"]) if summary["profit"] is not None else 0.0)
+            margin.append(float(summary["margin"]) if summary["margin"] is not None else 0.0)
+        return labels, revenue, profit, margin, newest
+
+    def open_costs(self):
+        try:
+            self.reveal(finance.ensure_costs(self.root), "Себестоимость WB")
+        except Exception:
+            self.toast("Не удалось открыть wb_costs.xlsx. Закройте файл в Excel и повторите.", True)
+
+    # ── «Обновить»: загрузка месяца из WB ─────────────────────────────────
+
+    def cancel(self):
+        if self.busy and not self.cancel_event.is_set():
+            self.write_log("Запрошена отмена загрузки WB. Ожидание завершения текущего запроса.")
+            self.cancel_event.set()
+
+    async def _run(self, work, progress, on_message):
+        task = asyncio.create_task(asyncio.to_thread(work))
+        while not task.done():
+            self._drain(progress, on_message)
+            await asyncio.sleep(0.25)
+        self._drain(progress, on_message)
+        return await task
+
+    def _drain(self, progress, on_message):
+        while True:
             try:
-                return client.fetch(selected_year, selected_month)
+                message = progress.get_nowait()
+            except queue.Empty:
+                return
+            self.write_log(message)
+            on_message(message)
+
+    async def download(self, year, month):
+        if self.busy:
+            self.toast("Загрузка WB уже идёт.", True)
+            return
+        self.busy = True
+        self.cancel_event.clear()
+        progress = queue.Queue()
+        sync = lambda text: self.set_sync(True, text)  # noqa: E731
+        sync(f"Обновляю отчёт: загружаю продажи, расходы и выплаты из WB за {self.title(year, month).lower()}…")
+        self.write_log(f"Начало загрузки финансовых отчётов: {self.title(year, month)}.")
+        token = read_settings(self.root).get("WB_API_TOKEN") or ""
+
+        def fetch():
+            client = finance.FinanceClient(token, self.cancel_event, progress.put)
+            try:
+                return client.fetch(year, month)
             finally:
                 client.session.close()
-        def drain_progress():
-            while True:
-                try:
-                    message = progress.get_nowait()
-                except queue.Empty:
-                    break
-                status.value = message
-                write_log(message)
+
+        def settle():
+            client = finance.FinanceClient(token, self.cancel_event, progress.put)
+            try:
+                progress.put("Сверка выплат WB: итоги отчётов за всё время и баланс…")
+                wb_settlement.refresh(self.root, client)
+            finally:
+                client.session.close()
 
         try:
-            token = read_settings(root).get("WB_API_TOKEN") or ""
-            task = asyncio.create_task(asyncio.to_thread(fetch))
-            while not task.done():
-                drain_progress()
-                page.update()
-                await asyncio.sleep(0.25)
-            data = await task
-            drain_progress()
-            if cancel.is_set():
+            data = await self._run(fetch, progress, sync)
+            if self.cancel_event.is_set():
                 raise finance.FinanceError("Загрузка отменена; предыдущий отчёт сохранён.")
-            if (read_settings(root).get("WB_API_TOKEN") or "") != token:
+            if (read_settings(self.root).get("WB_API_TOKEN") or "") != token:
                 raise finance.FinanceError("Токен WB изменился во время загрузки. Повторите запрос.")
-            finance.summarize(data, finance.read_costs(root))
-            write_log("Проверка данных завершена. Обновление справочника wb_costs.xlsx.")
-            finance.ensure_costs(root, data["details"])
-            write_log("Сохранение финансового отчёта WB.")
-            finance.save_report(root, data)
-            render(data)
-            write_log(f"Загрузка завершена: {len(data['reports'])} отчётов, {len(data['details'])} строк. {status.value}")
-            for note in notes.controls:
-                write_log(f"Внимание: {note.value}")
-            chart.visible = False
+            finance.summarize(data, finance.read_costs(self.root))
+            finance.ensure_costs(self.root, data["details"])
+            finance.save_report(self.root, data)
+            try:
+                await self._run(settle, progress, sync)
+            except Exception as exc:  # сбой сверки не отменяет сохранённый месяц
+                self.write_log(f"Сверка выплат WB не обновлена: {exc}")
+            sync("Формирую Excel-отчёт WB…")
+            await asyncio.to_thread(self._export, data)
+            await asyncio.to_thread(wb_monthly_report.refresh_saved, self.root)
+            self.write_log(f"Загрузка завершена: {len(data['reports'])} отчётов, {len(data['details'])} строк.")
+            self.toast(f"Отчёт WB за {self.title(year, month).lower()} обновлён.")
         except Exception as exc:
-            drain_progress()
-            status.value = str(exc) if isinstance(exc, finance.FinanceError) else "Не удалось загрузить или сохранить WB. Проверьте доступ к файлам; повторите запрос."
-            write_log(f"{'Отмена' if cancel.is_set() else 'Ошибка загрузки'}: {status.value}")
+            reason = str(exc) if isinstance(exc, finance.FinanceError) else \
+                "Не удалось загрузить или сохранить WB. Проверьте доступ к файлам и повторите."
+            self.write_log(f"{'Отмена' if self.cancel_event.is_set() else 'Ошибка загрузки'}: {reason}")
+            self.toast(reason, True)
         finally:
-            busy["value"] = False
-            for control in (month, year, download_button, recalculate_button, costs_button, chart_button):
-                control.disabled = False
-            cancel_button.disabled = True
-            page.update()
+            self.busy = False
+            self.set_sync(False, "")
+            if self.period == (year, month):
+                self.load(year, month)
+            self.on_change()
 
-    def open_costs(_e):
-        write_log("Открытие справочника себестоимости WB.")
-        try:
-            path = finance.ensure_costs(root)
-            write_log("Справочник wb_costs.xlsx подготовлен. Передача команды открытия файла.")
-            reveal(path, "Себестоимость WB")
-        except Exception:
-            status.value = "Не удалось открыть wb_costs.xlsx. Закройте файл в Excel и повторите."
-            write_log(f"Ошибка: {status.value}")
-            page.update()
+    def _export(self, data):
+        same = self.details.period == (data["year"], data["month"])
+        costs = finance.read_costs(self.root)
+        path = wb_monthly_report.build(self.root, data, costs, self.orders.by_srid,
+                                       self.details.acceptance if same else None,
+                                       self.details.storage if same else None,
+                                       self.details.funnel if same else None)
+        self.write_log(f"Excel-отчёт WB обновлён: {path.name}")
 
-    def open_report(_e):
-        path = last_report["path"]
-        if not path:
+    # ── статусы заказов и возвраты (31 день) ──────────────────────────────
+
+    async def load_statuses(self):
+        state = self.orders
+        if state.busy:
             return
-        write_log(f"Открытие Excel-отчёта WB: {path.name}.")
-        try:
-            reveal(path, "Отчёт WB")
-        except Exception:
-            status.value = "Не удалось открыть Excel-отчёт WB. Закройте файл в Excel и повторите."
-            write_log(f"Ошибка: {status.value}")
-            page.update()
-
-    def draw_chart(_e):
-        write_log(f"Построение графика WB за {year.value} год.")
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
-        try:
-            costs = finance.read_costs(root)
-            points = []
-            for m in range(1, 13):
-                data = finance.load_report(root, int(year.value), m)
-                if data:
-                    summary = finance.summarize(data, costs)
-                    if not summary["empty"]:
-                        points.append((m, summary))
-            if not points:
-                chart.visible = False
-                chart_note.value = "Нет сохранённых финансовых отчётов за выбранный год."
-                write_log(chart_note.value)
-            else:
-                figure = Figure(figsize=(10, 3.6), tight_layout=True)
-                FigureCanvasAgg(figure)
-                axes = figure.subplots()
-                axes.plot([p[0] for p in points], [float(p[1]["revenue"]) for p in points], marker="o", label="Выручка")
-                axes.plot([p[0] for p in points], [float(p[1]["profit"]) if p[1]["profit"] is not None else float("nan") for p in points], marker="o", label="Прибыль по отчёту")
-                axes.set_xticks([p[0] for p in points], [months[p[0]-1][:3] for p in points])
-                axes.set_ylabel("Рубли")
-                axes.grid(alpha=0.2)
-                axes.legend()
-                from uuid import uuid4
-                target = Path(root) / ".cache" / "wb" / f"trend-{uuid4().hex}.png"
-                target.parent.mkdir(parents=True, exist_ok=True)
-                figure.savefig(target)
-                chart.src = str(target.resolve())
-                chart.visible = True
-                chart_note.value = "По сохранённым месяцам; себестоимость пересчитана по текущему справочнику WB."
-                write_log(f"График построен: {len(points)} месяцев.")
-        except Exception:
-            chart.visible = False
-            chart_note.value = "Не удалось построить график. Проверьте отчёты и себестоимость WB."
-            write_log(f"Ошибка: {chart_note.value}")
-        page.update()
-
-    def cancel_download(_e):
-        if busy["value"] and not cancel.is_set():
-            write_log("Запрошена отмена загрузки WB. Ожидание завершения текущего запроса.")
-            cancel.set()
-
-    def render_orders(summary=None):
-        if not summary:
-            order_cards.controls = []
-            theme(view)
-            return
-        def group(title, bucket, col):
-            return metric(title, str(bucket["total"]),
-                          f"В пути: {bucket['in_progress']} · Доставлено: {bucket['delivered']} · Отменено: {bucket['cancelled']}",
-                          surface, col=col)
-        order_cards.controls = [
-            group("Всего заказов", summary, 4),
-            group("FBS (свой склад)", summary["fbs"], 4),
-            group("FBO (склад WB)", summary["fbo"], 4),
-        ]
-        theme(view)
-
-    def render_returns(summary=None):
-        if not summary or not summary["total"]:
-            returns_cards.controls = []
-            theme(view)
-            return
-        reasons = sorted(summary["by_reason"].items(), key=lambda item: item[1], reverse=True)[:5]
-        statuses = sorted(summary["by_status"].items(), key=lambda item: item[1], reverse=True)[:5]
-        returns_cards.controls = [
-            metric("Возвраты (движение товара)", str(summary["total"]),
-                   "Топ причин: " + ", ".join(f"{reason} ({count})" for reason, count in reasons),
-                   surface, col=6),
-            metric("По статусу логистики", str(summary["total"]),
-                   ", ".join(f"{name} ({count})" for name, count in statuses),
-                   surface, col=6),
-        ]
-        theme(view)
-
-    async def refresh_operational_data():
-        if order_busy["value"]:
-            write_log("Обновление статусов заказов и возвратов уже выполняется.")
-            return
-        order_busy["value"] = True
-        order_cancel.clear()
-        orders_button.disabled = True
+        state.busy = True
+        state.cancel.clear()
         progress = queue.Queue()
-        order_status.value = "Подключение к Order Feed WB…"
-        write_log("Начало загрузки статусов заказов и возвратов WB (последние 31 день).")
-        page.update()
-        token = read_settings(root).get("WB_API_TOKEN") or ""
-        def drain_progress():
-            while True:
-                try:
-                    message = progress.get_nowait()
-                except queue.Empty:
-                    break
-                order_status.value = message
-                write_log(message)
-        async def run(fetcher):
-            task = asyncio.create_task(asyncio.to_thread(fetcher))
-            while not task.done():
-                drain_progress()
-                page.update()
-                await asyncio.sleep(0.25)
-            drain_progress()
-            return await task
+        token = read_settings(self.root).get("WB_API_TOKEN") or ""
+
+        def message(text):
+            state.text = text
+            self.on_change()
+
+        message("Подключение к Order Feed WB…")
+
+        def fetch_orders():
+            client = wb_orders.OrderFeedClient(token, state.cancel, progress.put)
+            try:
+                return client.fetch()
+            finally:
+                client.session.close()
+
+        def fetch_returns():
+            client = wb_returns.ReturnsClient(token, state.cancel, progress.put)
+            try:
+                return client.fetch()
+            finally:
+                client.session.close()
+
         try:
-            def fetch_orders_data():
-                client = wb_orders.OrderFeedClient(token, order_cancel, progress.put)
-                try:
-                    return client.fetch()
-                finally:
-                    client.session.close()
-            orders_data = await run(fetch_orders_data)
-            order_summary = wb_orders.summarize(orders_data)
-            render_orders(order_summary)
-            write_log(f"Статусы заказов обновлены: заказов {order_summary['total']} "
-                      f"(FBS: {order_summary['fbs']['total']}, FBO: {order_summary['fbo']['total']}).")
-
-            def fetch_returns_data():
-                client = wb_returns.ReturnsClient(token, order_cancel, progress.put)
-                try:
-                    return client.fetch()
-                finally:
-                    client.session.close()
-            returns_data = await run(fetch_returns_data)
-            returns_summary = wb_returns.summarize(returns_data)
-            returns_index["by_srid"] = returns_summary["by_srid"]
-            render_returns(returns_summary)
-            write_log(f"Отчёт о возвратах обновлён: {returns_summary['total']} записей за 31 день.")
-
-            order_status.value = (f"Снимок на {orders_data['fetched_at']} · заказов: {order_summary['total']} "
-                                   f"· возвратов: {returns_summary['total']}")
-            if current_data["value"]:
-                write_log("Обновление Excel-отчёта причинами/статусами возвратов.")
-                export_report(current_data["value"])
+            orders_data = await self._run(fetch_orders, progress, message)
+            state.summary = wb_orders.summarize(orders_data)
+            returns = wb_returns.summarize(await self._run(fetch_returns, progress, message))
+            state.returns, state.by_srid = returns, returns["by_srid"]
+            state.text = (f"Снимок на {orders_data['fetched_at']} · заказов: {state.summary['total']} · "
+                          f"возвратов: {returns['total']}")
+            self.write_log(state.text)
+            if self.data:
+                await asyncio.to_thread(self._export, self.data)
         except Exception as exc:
-            drain_progress()
             known = (wb_orders.OrderFeedError, wb_returns.ReturnsError)
-            order_status.value = str(exc) if isinstance(exc, known) else "Не удалось загрузить статусы заказов или возвраты WB."
-            write_log(f"Ошибка загрузки статусов/возвратов: {order_status.value}")
+            state.text = str(exc) if isinstance(exc, known) else "Не удалось загрузить статусы заказов или возвраты WB."
+            self.write_log(f"Ошибка: {state.text}")
         finally:
-            order_busy["value"] = False
-            orders_button.disabled = False
-            page.update()
+            state.busy = False
+            self.on_change()
 
-    def render_details():
-        acceptance, storage, funnel = detail_index["acceptance"], detail_index["storage"], detail_index["funnel"]
-        if not acceptance and not storage and not funnel:
-            detail_cards.controls = []
-            theme(view)
-            return
-        controls = []
-        if acceptance is not None:
-            controls.append(metric("Приёмка по товарам", fmt(acceptance["total"]),
-                                   f"Строк отчёта: {acceptance['rows']} · товаров: {len(acceptance['by_nm'])}",
-                                   surface, col=4))
-        if storage is not None:
-            controls.append(metric("Хранение по товарам", fmt(storage["total"]),
-                                   f"Строк отчёта: {storage['rows']} · товаров: {len(storage['by_nm'])}",
-                                   surface, col=4))
-        if funnel is not None:
-            controls.append(metric("Воронка продаж (органика)",
-                                   f"{funnel['views']} просмотров",
-                                   f"В корзину: {funnel['cart']} ({funnel['add_to_cart_pct']}%) · "
-                                   f"Заказы: {funnel['orders']} ({funnel['cart_to_order_pct']}%) · "
-                                   f"Выкупы: {funnel['buyouts']} ({funnel['buyout_pct']}%)",
-                                   surface, col=4))
-        detail_cards.controls = controls
-        theme(view)
+    # ── приёмка, хранение, воронка за месяц ───────────────────────────────
 
-    async def fetch_month_details():
-        if detail_busy["value"]:
-            write_log("Загрузка приёмки/хранения/воронки уже выполняется.")
+    async def load_details(self):
+        state = self.details
+        if state.busy or not self.period:
             return
-        detail_busy["value"] = True
-        detail_cancel.clear()
-        selected_year, selected_month = int(year.value), int(month.value)
-        for control in (month, year, download_button, recalculate_button, details_button):
-            control.disabled = True
-        detail_cancel_button.disabled = False
+        state.busy = True
+        state.cancel.clear()
+        year, month = self.period
         progress = queue.Queue()
-        detail_status.value = f"Подключение к отчётам WB о приёмке, хранении и воронке продаж: {period_title()}…"
-        write_log(f"Начало загрузки приёмки, хранения и воронки продаж WB: {period_title()}.")
-        page.update()
-        token = read_settings(root).get("WB_API_TOKEN") or ""
-        date_from, date_to = finance.period_dates(selected_year, selected_month)
-        from datetime import date as date_cls
-        date_from, date_to = date_cls.fromisoformat(date_from), date_cls.fromisoformat(date_to)
-        def drain_progress():
-            while True:
+        token = read_settings(self.root).get("WB_API_TOKEN") or ""
+        first, last = (date.fromisoformat(d) for d in finance.period_dates(year, month))
+
+        def message(text):
+            state.text = text
+            self.on_change()
+
+        message(f"Загружаю приёмку, хранение и воронку за {self.title(year, month).lower()}…")
+
+        def fetcher(client_class):
+            def run():
+                client = client_class(token, state.cancel, progress.put)
                 try:
-                    message = progress.get_nowait()
-                except queue.Empty:
-                    break
-                detail_status.value = message
-                write_log(message)
-        async def run(fetcher):
-            task = asyncio.create_task(asyncio.to_thread(fetcher))
-            while not task.done():
-                drain_progress()
-                page.update()
-                await asyncio.sleep(0.25)
-            drain_progress()
-            return await task
+                    return client.fetch(first, last)
+                finally:
+                    client.session.close()
+            return run
+
         try:
-            def fetch_acceptance():
-                client = wb_acceptance.AcceptanceClient(token, detail_cancel, progress.put)
-                try:
-                    return client.fetch(date_from, date_to)
-                finally:
-                    client.session.close()
-            acceptance_data = await run(fetch_acceptance)
-            acceptance_summary = wb_acceptance.summarize(acceptance_data)
-            write_log(f"Приёмка WB загружена: {acceptance_summary['rows']} строк, {fmt(acceptance_summary['total'])}.")
-
-            def fetch_storage():
-                client = wb_storage.StorageClient(token, detail_cancel, progress.put)
-                try:
-                    return client.fetch(date_from, date_to)
-                finally:
-                    client.session.close()
-            storage_data = await run(fetch_storage)
-            storage_summary = wb_storage.summarize(storage_data)
-            write_log(f"Хранение WB загружено: {storage_summary['rows']} строк, {fmt(storage_summary['total'])}.")
-
-            def fetch_funnel():
-                client = wb_funnel.FunnelClient(token, detail_cancel, progress.put)
-                try:
-                    return client.fetch(date_from, date_to)
-                finally:
-                    client.session.close()
-            funnel_data = await run(fetch_funnel)
-            funnel_summary = wb_funnel.summarize(funnel_data)
-            write_log(f"Воронка продаж WB загружена: {funnel_summary['products']} товаров, "
-                      f"просмотров {funnel_summary['views']}, заказов {funnel_summary['orders']}.")
-
-            detail_index["acceptance"] = acceptance_summary
-            detail_index["storage"] = storage_summary
-            detail_index["funnel"] = funnel_summary
-            detail_index["period"] = (selected_year, selected_month)
-            render_details()
-            detail_status.value = (f"{period_title()} · приёмка: {fmt(acceptance_summary['total'])} · "
-                                   f"хранение: {fmt(storage_summary['total'])} · "
-                                   f"воронка: {funnel_summary['views']} просмотров, {funnel_summary['orders']} заказов")
-            if current_data["value"] and (current_data["value"]["year"], current_data["value"]["month"]) == (selected_year, selected_month):
-                write_log("Обновление Excel-отчёта детализацией приёмки/хранения/воронки.")
-                export_report(current_data["value"])
+            acceptance = wb_acceptance.summarize(await self._run(fetcher(wb_acceptance.AcceptanceClient), progress, message))
+            storage = wb_storage.summarize(await self._run(fetcher(wb_storage.StorageClient), progress, message))
+            funnel = wb_funnel.summarize(await self._run(fetcher(wb_funnel.FunnelClient), progress, message))
+            state.acceptance, state.storage, state.funnel, state.period = acceptance, storage, funnel, (year, month)
+            state.text = f"{self.title(year, month)} · загружено"
+            self.write_log(f"Приёмка, хранение и воронка WB загружены: {self.title(year, month)}.")
+            if self.data and self.period == (year, month):
+                await asyncio.to_thread(self._export, self.data)
         except Exception as exc:
-            drain_progress()
             known = (wb_acceptance.AcceptanceError, wb_storage.StorageError, wb_funnel.FunnelError)
-            detail_status.value = str(exc) if isinstance(exc, known) else "Не удалось загрузить приёмку/хранение/воронку WB."
-            write_log(f"Ошибка загрузки приёмки/хранения/воронки: {detail_status.value}")
+            state.text = str(exc) if isinstance(exc, known) else "Не удалось загрузить приёмку, хранение или воронку WB."
+            self.write_log(f"Ошибка: {state.text}")
         finally:
-            detail_busy["value"] = False
-            for control in (month, year, download_button, recalculate_button, details_button):
-                control.disabled = False
-            detail_cancel_button.disabled = True
-            page.update()
+            state.busy = False
+            self.on_change()
 
-    def cancel_details(_e):
-        if detail_busy["value"] and not detail_cancel.is_set():
-            write_log("Запрошена отмена загрузки приёмки/хранения WB.")
-            detail_cancel.set()
+    # ── показатели для экрана ─────────────────────────────────────────────
 
-    download_button = ft.Button("Загрузить из WB", on_click=lambda _e: page.run_task(download))
-    recalculate_button = ft.TextButton("Пересчитать из файлов", on_click=refresh)
-    costs_button = ft.TextButton("Себестоимость WB", on_click=open_costs)
-    open_report_button = ft.TextButton("Открыть Excel-отчёт", disabled=True, on_click=open_report)
-    chart_button = ft.TextButton("Построить график за год", on_click=draw_chart)
-    cancel_button = ft.TextButton("Отменить загрузку", disabled=True, on_click=cancel_download)
-    orders_button = ft.Button("Обновить статусы и возвраты", on_click=lambda _e: page.run_task(refresh_operational_data))
-    details_button = ft.Button("Загрузить приёмку, хранение и воронку", on_click=lambda _e: page.run_task(fetch_month_details))
-    detail_cancel_button = ft.TextButton("Отменить", disabled=True, on_click=cancel_details)
-    month.on_select = refresh
-    year.on_select = refresh
-    view = ft.Column([
-        ft.Text("Бизнес-сводка · Wildberries", size=26, weight=ft.FontWeight.W_800, color=text_color),
-        ft.Row([month, year, download_button, cancel_button], wrap=True),
-        ft.Row([recalculate_button, costs_button, open_report_button], wrap=True),
-        status, notes, cards, details,
-        card("Статусы заказов и возвраты (FBS + FBO)",
-             "Order Feed и отчёт о возвратах WB — снимок за последние 31 день, не привязан к выбранному месяцу.", [
-            ft.Row([orders_button], wrap=True), order_status, order_cards, returns_cards,
-        ]),
-        card("Приёмка, хранение и воронка продаж по товарам",
-             "Отдельные отчёты WB за выбранный месяц (не за 31 день) — можно загрузить любой прошлый месяц. Загрузка хранения идёт кусками по 8 дней и может занять несколько минут.", [
-            ft.Row([details_button, detail_cancel_button], wrap=True), detail_status, detail_cards,
-        ]),
-        card("Особенности расчёта WB", "", [
-            ft.Text("Источник — ежедневные финансовые отчёты WB за выбранный период, а не дата создания заказа. Текущий месяц может быть неполным.", size=12),
-            ft.Text("Прибыль по отчёту = итог WB к выплате − себестоимость. Удержания, логистика и другие суммы показываются отдельно и повторно не вычитаются. Внешние расходы и налоги не включены.", size=12),
-            ft.Text("Продажа с отрицательной прибылью остаётся продажей. Продажа и её возврат в одном периоде имеют нулевую итоговую себестоимость. Для возвратов прошлых периодов расчёт прибыли приостановлен до выбора правила.", size=12),
-            ft.Text("Статусы «В пути»/«Доставлено»/«Отменено» и причины возвратов берутся отдельно из Order Feed и отчёта о возвратах WB (последние 31 день) — в финансовом отчёте их нет. В Excel-отчёте причина и статус возврата проставляются только для заказов, которые попали в оба отчёта, и не влияют на суммы. Приёмка, хранение и воронка продаж по товарам — из отдельных отчётов WB за тот же месяц; суммы приёмки/хранения могут немного отличаться от строк «Приёмка»/«Хранение» выше. Воронка продаж — органический трафик (просмотры/корзина/заказы/выкупы), не реклама, ни на что не влияет. Рекламная аналитика пока не подключена: её расходы нельзя повторно вычитать без сверки с удержаниями WB.", size=12),
-        ]),
-        card("Динамика показателей", "", [chart_button, chart, chart_note]),
-    ], spacing=18)
-    try:
-        render(finance.load_report(root, int(year.value), int(month.value)))
-    except Exception:
-        render()
-        status.value = "Не удалось прочитать сохранённые данные WB. Проверьте отчёт и справочник себестоимости."
-    return view
+    def controls(self, launch_report):
+        ui = self.ui
+        pal = ui.dash_pal()
+        if self.error:
+            return [ui.dpanel(ui.dtext(self.error, 13, pal["bad"]))]
+        if not self.data:
+            return [ui.dpanel(
+                ft.Column([
+                    ft.Icon(ft.Icons.INSERT_CHART_OUTLINED, size=44, color=pal["muted"]),
+                    ui.dtext(f"Отчёта за {self.title().lower()} ещё нет", 18, weight=ft.FontWeight.W_700),
+                    ui.dtext("Сформируйте отчёт — сводка заполнится автоматически.", 13, pal["muted"]),
+                    ft.Container(height=6),
+                    ft.Button("Сформировать отчёт", icon=ft.Icons.REFRESH, bgcolor=ui.primary, color="white",
+                              on_click=lambda _e: launch_report()),
+                ], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
+                padding=48, alignment=ft.Alignment(0, 0),
+            )] + self.extra_sections()
+        summary, rows = self.summary, self.rows
+        money, percent, number = ui.money, ui.percent, ui.number
+        revenue = _rub(summary["revenue"]) or 0.0
+        profit = _rub(summary["profit"])
+        margin = _rub(summary["margin"])
+        stats = design.order_stats(self.data, rows)
+        lines = dict(design.profit_lines(summary, rows))
+        outside = sum(i["amount"] for i in design.charges(self.data))
+
+        def share(value):
+            return percent(abs(value) / revenue * 100) if value and revenue else ""
+
+        margin_color = None if margin is None else pal["good"] if margin >= 20 else pal["warn"] if margin >= 5 else pal["bad"]
+        orders_rows = [("Продано", number(stats["sales"]), "", None, None)]
+        orders_rows += [(f"  {name}", number(count), "", None, None) for name, count in stats["by_scheme"].items()]
+        orders_rows += [("Возвраты", number(stats["returns"]), "", pal["bad"] if stats["returns"] else None, None),
+                        ("Скидка WB покупателю", percent(stats["spp"] * 100) if stats["spp"] is not None else "—", "",
+                         None, "WB Скидка")]
+        cost = _rub(summary["costs"])
+        economy = [
+            ("Себестоимость", money(cost) if cost is not None else "—", share(cost), None, None),
+            ("Валовая прибыль", money(_rub(summary["gross"])) if summary["gross"] is not None else "—", "", None, None),
+            ("Операционные расходы", money(_rub(summary["operating"])) if summary["operating"] is not None else "—", "", None, None),
+            ("Чистая прибыль", money(profit) if profit is not None else "—", "",
+             None if profit is None else pal["good"] if profit >= 0 else pal["bad"], "WB Чистая прибыль"),
+        ]
+        commission_key = design.commission_label(rows)
+        rate = design.commission_rate(rows)
+        expense_keys = [("Скидка WB", "Скидка WB покупателям (оплатил WB)", "WB Скидка покупателям"),
+                        ("Комиссия", commission_key, "WB Комиссия"), ("Эквайринг", "Эквайринг", None),
+                        ("Логистика", "Логистика", "WB Логистика"), ("Хранение", "Хранение на складах WB", None),
+                        ("Приёмка", "Приёмка поставок", None), ("Штрафы и удержания", None, None),
+                        ("Досрочный вывод", "Досрочный вывод денег", None)]
+        expenses = []
+        for label, key, help_key in expense_keys:
+            value = (lines["Штрафы"] + lines["Удержания"]) if key is None else lines[key]
+            if abs(value) >= 0.005 or label in ("Комиссия", "Логистика"):
+                note = share(value)
+                if label == "Комиссия" and rate is not None:
+                    note = percent(rate * 100)  # ставка от ваших цен, а не доля в выручке — см. подсказку
+                elif label == "Скидка WB":
+                    note = "оплатил WB"
+                expenses.append((label, money(value), note, pal["good"] if value > 0 else None, help_key))
+        expenses.append(("в т. ч. вне заказов", money(outside), "", None, "WB Вне заказов"))
+        payouts = self._payout_rows(pal)
+        groups = [("Заказы", orders_rows), ("Экономика", economy), ("Расходы WB", expenses), ("Выплаты WB", payouts)]
+        rows_total = max(len(group_rows) for _title, group_rows in groups)
+        controls = [
+            ui.dash_stats_panel([
+                self._tip(ui.dash_stat("Выручка", money(revenue), f"{number(stats['sales'])} заказов"), "WB Выручка"),
+                self._tip(ui.dash_stat("Чистая прибыль", money(profit) if profit is not None else "—",
+                                       "после всех расходов" if profit is not None else "не посчитана — см. ниже",
+                                       None if profit is None else pal["good"] if profit >= 0 else pal["bad"]), "WB Чистая прибыль"),
+                self._tip(ui.dash_stat("Маржа", percent(margin) if margin is not None else "—", "чистая прибыль / выручка",
+                                       margin_color), "WB Маржа"),
+                self._tip(ui.dash_stat("Средний чек", money(_rub(summary["average"])), "выручка / заказы"), "WB Средний чек"),
+            ]),
+            ft.ResponsiveRow([ui.dash_list(title, group_rows, rows_total) for title, group_rows in groups],
+                             spacing=16, run_spacing=16),
+        ]
+        notes = list(summary.get("notes") or [])
+        losses = [o for o in rows if o["profit"] is not None and o["profit"] < 0]
+        if losses:
+            articles = ", ".join(sorted({o["article"] for o in losses}))
+            notes.append(f"Убыточных заказов: {len(losses)} на {money(-sum(o['profit'] for o in losses))} "
+                         f"(артикулы {articles}) — цена продажи не покрывает комиссию, логистику и себестоимость. "
+                         "Подробно — лист «Заказы» в отчёте.")
+        if notes:
+            controls.append(ui.dpanel(ft.Column([ui.dtext(note, 13, pal["warn"]) for note in notes], spacing=6)))
+        return controls + self.extra_sections()
+
+    def _tip(self, control, key):
+        control.tooltip = HELP.get(key)
+        return control
+
+    def _payout_rows(self, pal):
+        money = self.ui.money
+        month = (self.settlement or {}).get("months", {}).get(f"{self.period[0]}-{self.period[1]:02d}")
+        payout = _rub(self.summary["payout"])
+        if not month:
+            return [("Начислено", money(payout), "", None, "WB Начислено"),
+                    ("Сверка выплат", "ещё не проводилась", "", pal["muted"], "WB Закрыто")]
+        due = sum(month["due"].values()) / 100
+        closed = sum(month["closed"].values()) / 100
+        left = month["left"] / 100
+        return [
+            ("Начислено", money(due), "", None, "WB Начислено"),
+            ("Закрыто выплатами", money(closed), "", pal["good"] if month["done"] else None, "WB Закрыто"),
+            ("Осталось получить", money(left), "", pal["good"] if month["done"] else pal["warn"], "WB Закрыто"),
+            ("На балансе WB", money(self.settlement["balance"] / 100), "", None, "WB Баланс"),
+            ("Можно вывести", money(self.settlement["for_withdraw"] / 100), "", None, "WB Баланс"),
+        ]
+
+    def extra_sections(self):
+        ui = self.ui
+        pal = ui.dash_pal()
+        orders, details = self.orders, self.details
+        status_rows = []
+        if orders.summary:
+            for title, bucket in (("Всего", orders.summary), ("FBS (свой склад)", orders.summary["fbs"]),
+                                  ("FBO (склад WB)", orders.summary["fbo"])):
+                status_rows.append((title, self.ui.number(bucket["total"]),
+                                    f"в пути {bucket['in_progress']} · доставлено {bucket['delivered']} · "
+                                    f"отменено {bucket['cancelled']}", None, None))
+        if orders.returns and orders.returns["total"]:
+            reasons = sorted(orders.returns["by_reason"].items(), key=lambda item: item[1], reverse=True)[:3]
+            status_rows.append(("Возвраты", self.ui.number(orders.returns["total"]),
+                                ", ".join(f"{reason} ({count})" for reason, count in reasons), pal["bad"], None))
+        same = details.period == self.period
+        detail_rows = []
+        if same and details.acceptance is not None:
+            detail_rows.append(("Приёмка", ui.money(_rub(details.acceptance["total"])),
+                                f"товаров {len(details.acceptance['by_nm'])}", None, None))
+        if same and details.storage is not None:
+            detail_rows.append(("Хранение", ui.money(_rub(details.storage["total"])),
+                                f"товаров {len(details.storage['by_nm'])}", None, None))
+        if same and details.funnel is not None:
+            f = details.funnel
+            detail_rows += [("Просмотры карточек", ui.number(f["views"]), "", None, None),
+                            ("В корзину", ui.number(f["cart"]), f"{f['add_to_cart_pct']}%", None, None),
+                            ("Заказы", ui.number(f["orders"]), f"{f['cart_to_order_pct']}% из корзины", None, None),
+                            ("Выкупы", ui.number(f["buyouts"]), f"{f['buyout_pct']}%", None, None)]
+
+        def block(title, caption, help_key, state, rows, on_click):
+            button = ft.Button("Обновить", icon=ft.Icons.REFRESH, bgcolor=ui.primary, color="white",
+                               disabled=state.busy or self.busy, on_click=on_click)
+            head = ft.Row([ui.dtext(state.text, 13, pal["muted"], expand=True),
+                           ft.ProgressRing(width=18, height=18, stroke_width=2.2, visible=state.busy), button],
+                          vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            body = [head] + ([ui.dash_list("", rows, len(rows), col={"xs": 12})] if rows else [])
+            panel = ui.dpanel(ft.Column(body, spacing=10))
+            panel.tooltip = HELP.get(help_key)
+            return [ui.dash_section_title(title, caption), panel]
+
+        return (block("Статусы заказов и возвраты", "Снимок WB за последние 31 день", "WB Статусы", orders, status_rows,
+                      lambda _e: self.page.run_task(self.load_statuses))
+                + block("Приёмка, хранение и воронка продаж", "Отдельные отчёты WB за выбранный месяц", "WB Приёмка",
+                        details, detail_rows, lambda _e: self.page.run_task(self.load_details)))

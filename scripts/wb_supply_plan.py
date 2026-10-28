@@ -4,11 +4,14 @@
 свои заказы, остатки, себестоимость (wb_costs.xlsx) — с планом Ozon не смешивается, даже если склад физически один.
 
 Логика (с цифрами она же выводится на лист «Как считается» в отчёте):
-1. Темп продаж — заказы WB за последние 90 дней без отмен (статистика WB хранит заказы только 90 дней).
+1. Темп продаж — заказы WB без отмен: среднее из темпа за последние 30 дней и за весь период, который WB отдал
+   (до 90 дней; на деле метод статистики отдаёт меньше — делим на дни, за которые заказы есть, а не на 90).
+   Среднее двух темпов быстрее замечает рост и спад: на истории WB ошибка 67% против 81% у темпа за 90 дней.
 2. Сезонность — по выкупам WB из финансовых отчётов (история с первого отчёта, сейчас с 09.2025):
    продажи в день в том же окне год назад / продажи в день в те же 90 дней год назад
-   (если год назад истории меньше — по той части, что есть). Мало данных — коэффициент 1.
-3. Доля артикула — заказы за 90 дней ×2 плюс выкупы 3–12 месяцев назад (приведённые к 90 дням).
+   (если год назад истории меньше — по той части, что есть). Мало данных — коэффициент 1. Пока истории меньше
+   двух лет, коэффициент ослабляем вдвое: один год молодого магазина — скорее шум, чем сезонность.
+3. Доля артикула — заказы (приведённые к 90 дням) ×2 плюс выкупы 3–12 месяцев назад (приведённые к 90 дням).
 4. Склады WB (FBW): остатки WB отдаёт только общей суммой «Склад WB», поэтому считается общий объём без разбивки
    по складам. Возим только то, что стабильно продаётся (прогноз от N шт. в месяц).
    Цель = квантиль Пуассона от спроса за цикл; к поставке = цель − (остаток WB + возвраты в пути − спрос до прихода).
@@ -49,6 +52,9 @@ HISTORY_MONTHS = 24
 SEASON_MIN_UNITS = 8           # меньше выкупов в окне или базе год назад — сезонность WB не считаем
 SEASON_MIN_BASE_DAYS = 28      # минимум дней истории в базовом периоде год назад
 SEASON_LIMITS = (0.5, 3.0)
+SEASON_FULL_HISTORY_DAYS = 730  # меньше двух лет истории — сезонность ослабляем
+SEASON_SHRINK = 0.5
+RATE_RECENT_DAYS = 30
 TIMEOUT = 60
 
 
@@ -273,12 +279,35 @@ def season_factor(history: pd.DataFrame, today: date, start: date, end: date) ->
     if window_start < first or base_days < SEASON_MIN_BASE_DAYS or window_units < SEASON_MIN_UNITS or base_units < SEASON_MIN_UNITS:
         return {**info, "factor": 1.0, "method": "none"}
     raw = (window_units / (window_end - window_start).days) / (base_units / base_days)
-    return {**info, "factor": min(max(raw, SEASON_LIMITS[0]), SEASON_LIMITS[1]), "raw": raw, "method": "season"}
+    factor = min(max(raw, SEASON_LIMITS[0]), SEASON_LIMITS[1])
+    weight = 1.0 if (today - first).days >= SEASON_FULL_HISTORY_DAYS else SEASON_SHRINK
+    return {**info, "factor": 1 + (factor - 1) * weight, "raw": raw, "weight": weight, "method": "season"}
+
+
+def order_days(orders: pd.DataFrame, today: date) -> int:
+    """За сколько дней WB отдал заказы: от первого заказа до сегодня, не больше 90 (метод статистики отдаёт меньше)."""
+    if orders.empty:
+        return RECENT_DAYS
+    first = orders["date"].min().date()
+    return max(1, min(RECENT_DAYS, (today - first).days + 1))
+
+
+def order_rate(orders: pd.DataFrame, today: date) -> Dict[str, float]:
+    """Темп заказов в день: среднее из темпа за 30 дней и за весь отданный период."""
+    days = order_days(orders, today)
+    live = orders[~orders["cancelled"]] if len(orders) else orders
+    if live.empty:
+        return {"rate": 0.0, "rate_all": 0.0, "rate_recent": 0.0, "days": days}
+    recent_days = min(RATE_RECENT_DAYS, days)
+    rate_all = float(live["qty"].sum()) / days
+    rate_recent = _units(live, today - timedelta(days=recent_days - 1), today + timedelta(days=1)) / recent_days
+    return {"rate": (rate_all + rate_recent) / 2, "rate_all": rate_all, "rate_recent": rate_recent, "days": days}
 
 
 def article_shares(orders: pd.DataFrame, history: pd.DataFrame, today: date) -> pd.Series:
-    """Заказы за 90 дней ×2 + выкупы 3–12 месяцев назад, приведённые к 90 дням."""
+    """Заказы (приведённые к 90 дням) ×2 + выкупы 3–12 месяцев назад, приведённые к 90 дням."""
     recent = orders[~orders["cancelled"]].groupby("article")["qty"].sum() if len(orders) else pd.Series(dtype=float)
+    recent = recent * (RECENT_DAYS / order_days(orders, today))
     old_start, old_end = today - timedelta(days=365), today - timedelta(days=RECENT_DAYS)
     old = history[(history["date"] >= pd.Timestamp(old_start)) & (history["date"] < pd.Timestamp(old_end))] if len(history) else history
     older = old.groupby("article")["qty"].sum() * (RECENT_DAYS / (old_end - old_start).days) if len(old) else pd.Series(dtype=float)
@@ -302,7 +331,8 @@ def build_wb_plan(
     window = (arrival, arrival + timedelta(days=cover))
 
     live = orders[~orders["cancelled"]] if len(orders) else orders
-    rate = float(live["qty"].sum()) / RECENT_DAYS if len(live) else 0.0
+    rates = order_rate(orders, today)
+    rate = rates["rate"]
     season_window = season_factor(history, today, *window)
     season_lead = season_factor(history, today, today, arrival)
     window_units = rate * cover * season_window["factor"]
@@ -341,7 +371,7 @@ def build_wb_plan(
             note = ""
         rows.append({
             "Артикул": article,
-            "Заказов за 90 дн.": int(recent_by_article.get(article, 0)),
+            "Заказов за период": int(recent_by_article.get(article, 0)),
             "Из них со своего склада": int(own_by_article.get(article, 0)),
             "Доля артикула, %": round(share * 100, 1),
             "Спрос до прихода, шт.": round(d_lead, 1),
@@ -363,6 +393,7 @@ def build_wb_plan(
         "arrival": arrival,
         "window": window,
         "rate": rate,
+        "rates": rates,
         "recent_units": float(live["qty"].sum()) if len(live) else 0.0,
         "cancelled": int(orders["cancelled"].sum()) if len(orders) else 0,
         "own_share": float(live["own"].mean()) if len(live) else 0.0,
@@ -377,23 +408,25 @@ def build_wb_plan(
 
 
 def _explain(plan: Dict[str, Any], costs: Dict[str, Any]) -> pd.DataFrame:
-    s, sw = plan["settings"], plan["season_window"]
+    s, sw, r = plan["settings"], plan["season_window"], plan["rates"]
     w0, w1 = plan["window"]
     fmt = lambda d: d.strftime("%d.%m.%Y")
     if sw["method"] == "season":
         season = (f"Год назад в окне {fmt(sw['window_from'])}–{fmt(sw['window_to'] - timedelta(days=1))} выкупили {sw['window_last_year']:.0f} шт., "
                   f"в базовые {sw['base_days']} дн. — {sw['base_last_year']:.0f} шт.: окно в {sw['raw']:.2f} раза активнее обычного "
-                  f"(коэффициент {sw['factor']:.2f}, ограничен {SEASON_LIMITS[0]}–{SEASON_LIMITS[1]}).")
+                  f"(ограничен {SEASON_LIMITS[0]}–{SEASON_LIMITS[1]}"
+                  + (f", истории меньше двух лет — ослаблен вдвое" if sw["weight"] < 1 else "") + f"): коэффициент {sw['factor']:.2f}.")
     else:
         season = "Истории WB год назад мало для сезонности — коэффициент 1 (продажи как сейчас)."
     lines = [
         ("Параметры", f"Свои для WB: срок {s['lead_days']} дн., цикл {s['cover_days']} дн., уровень сервиса {s['service_level']:.0%}."),
         ("Окно", f"С {fmt(plan['today'])} по {fmt(w1 - timedelta(days=1))}; поставка на склады WB придёт ~{fmt(plan['arrival'])}."),
-        ("Темп продаж", f"Заказов WB за 90 дней без отмен: {plan['recent_units']:.0f} шт. ({plan['rate']:.2f} в день), отменено {plan['cancelled']}. "
-                        f"Со своего склада ушло {plan['own_share']:.0%} заказов."),
+        ("Темп продаж", f"WB отдал заказы за {r['days']} дн.: без отмен {plan['recent_units']:.0f} шт. ({r['rate_all']:.2f} в день), "
+                        f"за последние {min(RATE_RECENT_DAYS, r['days'])} дн. — {r['rate_recent']:.2f} в день, отменено {plan['cancelled']}. "
+                        f"Темп — среднее двух: {plan['rate']:.2f} в день. Со своего склада ушло {plan['own_share']:.0%} заказов."),
         ("Сезонность", season),
         ("Прогноз", f"До прихода поставки ~{plan['lead_units']:.1f} шт., в окне ~{plan['window_units']:.1f} шт."),
-        ("Доля артикула", "Заказы за 90 дней с весом 2 плюс выкупы 3–12 месяцев назад, приведённые к 90 дням."),
+        ("Доля артикула", "Заказы (приведённые к 90 дням) с весом 2 плюс выкупы 3–12 месяцев назад, приведённые к 90 дням."),
         ("Склады WB (FBW)", f"WB отдаёт остатки только общей суммой, поэтому считается общий объём на WB без разбивки по складам. "
                             f"Возим артикулы с прогнозом от {s.get('wb_fbw_min_monthly', 3):g} шт. в месяц: цель — запас под уровень сервиса, "
                             "к поставке = цель − (остаток WB + возвраты в пути − спрос до прихода)."),
@@ -402,7 +435,9 @@ def _explain(plan: Dict[str, Any], costs: Dict[str, Any]) -> pd.DataFrame:
                               "Остатки и поставки Ozon сюда не входят."),
         ("Себестоимость", f"Из wb_costs.xlsx: к поставке на WB {format_rub(costs['fbw'])}, нехватка своего склада {format_rub(costs['fbs'])}."
                           + (f" Без себестоимости: {', '.join(costs['missing'])}." if costs["missing"] else "")),
-        ("Ограничения", "Заказы WB хранятся 90 дней, а продаж мало — прогноз по отдельному артикулу грубый, страховка заметная."),
+        ("Ограничения", "WB отдаёт заказы не больше чем за 90 дней (на деле меньше), а продаж мало — прогноз грубый: на истории WB "
+                         "ошибка прогноза магазина на 30 дней — около двух третей от факта. Страховка по артикулам при этом "
+                         "откалибрована: факт не выше цели примерно с той вероятностью, что задана уровнем сервиса."),
     ]
     return pd.DataFrame(lines, columns=["Шаг", "Как считается"])
 
@@ -440,7 +475,7 @@ def summarize_plan(plan: Dict[str, Any], unit_costs: Dict[str, float]) -> Dict[s
     fbs_rows = [
         {"article": str(r["Артикул"]), "demand": float(r["Спрос на своём складе, шт."]), "need": int(r["Нужно на своём складе"]),
          "stock": None if r["Остаток FBS WB"] is None or pd.isna(r["Остаток FBS WB"]) else int(r["Остаток FBS WB"]),
-         "shortage": int(r["Не хватает FBS WB"]), "orders": int(r["Заказов за 90 дн."]),
+         "shortage": int(r["Не хватает FBS WB"]), "orders": int(r["Заказов за период"]),
          "cost": cost_of(str(r["Артикул"]), int(r["Не хватает FBS WB"]))}
         for _, r in details[(details["Нужно на своём складе"] > 0) | (details["Остаток FBS WB"].fillna(0) > 0)].iterrows()
     ]
@@ -457,7 +492,8 @@ def summarize_plan(plan: Dict[str, Any], unit_costs: Dict[str, float]) -> Dict[s
         "cancelled": plan["cancelled"],
         "own_share": plan["own_share"],
         "rate": plan["rate"],
-        "season": {"method": sw["method"], "factor": sw["factor"], "window_last_year": sw["window_last_year"],
+        "order_days": plan["rates"]["days"],
+        "season": {"method": sw["method"], "factor": sw["factor"], "weight": sw.get("weight", 1.0), "window_last_year": sw["window_last_year"],
                    "base_last_year": sw["base_last_year"], "base_days": sw["base_days"]},
         "window_units": plan["window_units"],
         "lead_units": plan["lead_units"],
@@ -479,7 +515,7 @@ def write_report(plan: Dict[str, Any], unit_costs: Dict[str, float], out_path: P
         "Поставка WB": plan["details"][plan["details"]["К поставке на WB"] > 0][
             ["Артикул", "В месяц, шт.", "Остаток на складах WB", "Возвраты в пути", "Цель FBW", "К поставке на WB"]],
         "Свой склад для WB": plan["details"][(plan["details"]["Нужно на своём складе"] > 0) | (plan["details"]["Остаток FBS WB"].fillna(0) > 0)][
-            ["Артикул", "Заказов за 90 дн.", "Спрос на своём складе, шт.", "Нужно на своём складе", "Остаток FBS WB", "Не хватает FBS WB"]],
+            ["Артикул", "Заказов за период", "Спрос на своём складе, шт.", "Нужно на своём складе", "Остаток FBS WB", "Не хватает FBS WB"]],
         "Расчёт": plan["details"],
         "Как считается": _explain(plan, plan_costs(plan, unit_costs)),
         "Выкупы WB по месяцам": pd.DataFrame({"Месяц": [p.strftime("%m.%Y") for p in monthly.index], "Выкупы, шт.": monthly.values.astype(int)}),
@@ -509,7 +545,7 @@ def run(root: Path, overrides: Optional[Dict[str, Any]] = None) -> bool:
     today = date.today()
 
     try:
-        print("· Загружаю заказы WB за 90 дней...")
+        print("· Загружаю заказы WB (до 90 дней)...")
         orders = load_recent_orders(token, today)
         history = load_sales_history(root, token, today)
         print("· Загружаю карточки и остатки (свой склад и склады WB)...")
@@ -526,7 +562,8 @@ def run(root: Path, overrides: Optional[Dict[str, Any]] = None) -> bool:
 
     plan = build_wb_plan(orders, history, own_stock, wb_stock, settings, today, articles=list(cards))
     sw = plan["season_window"]
-    print(f"· Заказов WB за 90 дней: {plan['recent_units']:.0f} шт., со своего склада {plan['own_share']:.0%}.")
+    print(f"· Заказов WB за {plan['rates']['days']} дн.: {plan['recent_units']:.0f} шт., темп {plan['rate']:.2f} в день, "
+          f"со своего склада {plan['own_share']:.0%}.")
     print("· Сезонность окна: " + (f"×{sw['factor']:.2f} (год назад в окне {sw['window_last_year']:.0f} шт.)" if sw["method"] == "season" else "истории мало, ×1"))
     details = plan["details"]
     print(f"· На склады WB: {int(details['К поставке на WB'].sum())} шт.; свой склад для WB: нужно {int(details['Нужно на своём складе'].sum())}, "
